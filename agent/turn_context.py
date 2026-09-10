@@ -576,6 +576,12 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
+    # Consume the agent-local override before any setup that may raise. It is
+    # valid for exactly one turn and never shared across agent instances.
+    _query_override_bytes = str(getattr(agent, "_memory_prefetch_query", "") or "").strip().encode("utf-8")[:8192]
+    _query_override = _query_override_bytes.decode("utf-8", errors="ignore")
+    agent._memory_prefetch_query = ""
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -1545,7 +1551,12 @@ def build_turn_context(
     ext_prefetch_cache = ""
     if agent._memory_manager:
         try:
-            _query = original_user_message if isinstance(original_user_message, str) else ""
+            # Trusted embedding surfaces may include presentation/history in
+            # the user message while external memory should search only the
+            # current utterance. Consume this bounded override exactly once.
+            _query = _query_override if _query_override else (
+                original_user_message if isinstance(original_user_message, str) else ""
+            )
             if not is_trivial_prompt(_query):
                 ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:

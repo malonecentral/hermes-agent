@@ -666,6 +666,12 @@ def init_agent(
     """
     _install_safe_stdio()
 
+    # Mobile/private child processes may provide a clean current utterance for
+    # external-memory retrieval while retaining a richer model-visible prompt.
+    # Capture it once at agent construction so concurrent turns cannot steal a
+    # process-global environment value from one another.
+    _memory_query_bytes = os.environ.pop("HERMES_MEMORY_PREFETCH_QUERY", "").strip().encode("utf-8")[:8192]
+    agent._memory_prefetch_query = _memory_query_bytes.decode("utf-8", errors="ignore")
     agent.model = model
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.

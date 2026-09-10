@@ -8,6 +8,7 @@ confirm the prologue produces the right ``TurnContext`` and applies the
 
 from __future__ import annotations
 
+import os
 import threading
 import types
 from unittest.mock import MagicMock, patch
@@ -76,6 +77,7 @@ class _FakeAgent:
         self._cached_system_prompt = "SYSTEM"
         self._memory_store = None
         self._memory_manager = None
+        self._memory_prefetch_query = ""
         self._memory_nudge_interval = 0
         self._turns_since_memory = 0
         self._user_turn_count = 0
@@ -290,6 +292,78 @@ def test_prefetch_runs_for_substantive_user_message():
     ctx = _build(agent, user_message=query)
     mm.prefetch_all.assert_called_once_with(query)
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
+
+
+def test_prefetch_consumes_one_shot_query_override():
+    agent, mm = _agent_with_memory_manager()
+    agent._memory_prefetch_query = "clean current question"
+
+    ctx = _build(agent, user_message="mobile wrapper with history and presentation instructions")
+
+    mm.prefetch_all.assert_called_once_with("clean current question")
+    assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
+    assert agent._memory_prefetch_query == ""
+
+
+def test_no_memory_manager_still_consumes_query_override():
+    no_memory_agent = _FakeAgent()
+    no_memory_agent._memory_prefetch_query = "must not leak"
+
+    _build(no_memory_agent, user_message="first turn without memory")
+
+    assert no_memory_agent._memory_prefetch_query == ""
+    memory_agent, mm = _agent_with_memory_manager()
+    _build(memory_agent, user_message="later clean question")
+    mm.prefetch_all.assert_called_once_with("later clean question")
+
+
+def test_prefetch_query_override_is_bounded_and_whitespace_falls_back():
+    bounded_agent, bounded_mm = _agent_with_memory_manager()
+    bounded_agent._memory_prefetch_query = "é" * 9000
+    _build(bounded_agent, user_message="wrapped")
+    bounded_query = bounded_mm.prefetch_all.call_args.args[0]
+    assert len(bounded_query.encode("utf-8")) <= 8192
+    assert bounded_query == "é" * 4096
+
+    fallback_agent, fallback_mm = _agent_with_memory_manager()
+    fallback_agent._memory_prefetch_query = "   "
+    _build(fallback_agent, user_message="clean fallback")
+    fallback_mm.prefetch_all.assert_called_once_with("clean fallback")
+
+
+def test_agent_constructor_captures_and_consumes_prefetch_env(monkeypatch):
+    from run_agent import AIAgent
+
+    monkeypatch.setenv("HERMES_MEMORY_PREFETCH_QUERY", "é" * 5000)
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        first = AIAgent(
+            api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+        )
+        second = AIAgent(
+            api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+        )
+
+    assert "HERMES_MEMORY_PREFETCH_QUERY" not in os.environ
+    assert getattr(first, "_memory_prefetch_query") == "é" * 4096
+    assert getattr(second, "_memory_prefetch_query") == ""
+
+    manager = MagicMock()
+    manager.prefetch_all.return_value = "REMEMBERED CONTEXT"
+    setattr(first, "_memory_manager", manager)
+    _build(first, user_message="wrapped first turn")
+    manager.prefetch_all.assert_called_once_with("é" * 4096)
+    assert getattr(first, "_memory_prefetch_query") == ""
+
+    manager.reset_mock()
+    _build(first, user_message="normal second turn")
+    manager.prefetch_all.assert_called_once_with("normal second turn")
 
 
 def test_turn_start_replaces_stale_parent_history_with_compression_child():
