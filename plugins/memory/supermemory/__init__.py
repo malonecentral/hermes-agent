@@ -1,7 +1,7 @@
 """Supermemory memory plugin using the MemoryProvider interface.
 
 Provides semantic long-term memory with profile recall, semantic search,
-explicit memory tools, cleaned turn capture, and session-end conversation ingest.
+explicit memory tools, and cleaned completed-turn conversation capture.
 """
 
 from __future__ import annotations
@@ -11,8 +11,6 @@ import logging
 import os
 import re
 import threading
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -319,7 +317,8 @@ class _SupermemoryClient:
 
     def add_memory(self, content: str, metadata: Optional[dict] = None, *,
                    entity_context: str = "", container_tag: Optional[str] = None,
-                   custom_id: Optional[str] = None) -> dict:
+                   custom_id: Optional[str] = None,
+                   task_type: Optional[str] = None) -> dict:
         tag = container_tag or self._container_tag
         kwargs: dict[str, Any] = {
             "content": content.strip(),
@@ -331,6 +330,8 @@ class _SupermemoryClient:
             kwargs["entity_context"] = _clamp_entity_context(entity_context)
         if custom_id:
             kwargs["custom_id"] = custom_id
+        if task_type:
+            kwargs["task_type"] = task_type
         result = self._client.documents.add(**kwargs)
         return {"id": getattr(result, "id", "")}
 
@@ -394,28 +395,6 @@ class _SupermemoryClient:
         self.forget_memory(memory_id, container_tag=container_tag)
         preview = (target.get("memory") or "")[:100]
         return {"success": True, "message": f'Forgot: "{preview}"', "id": memory_id}
-
-    def ingest_conversation(self, session_id: str, messages: list[dict], metadata: dict | None = None) -> None:
-        payload: dict = {
-            "conversationId": session_id,
-            "messages": messages,
-            "containerTags": [self._container_tag],
-        }
-        if metadata:
-            payload["metadata"] = self._merge_metadata(metadata)
-
-        req = urllib.request.Request(
-            f"{self._base_url}/v4/conversations",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-                "x-sm-source": "hermes",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=self._timeout + 3):
-            return
 
 
 def _resolve_container_tag_for_setup(hermes_home: str, *, identity: str = "default") -> str:
@@ -735,49 +714,73 @@ class SupermemoryMemoryProvider(MemoryProvider):
             logger.debug("Supermemory prefetch failed", exc_info=True)
             return ""
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        if not self._active or not self._auto_capture or not self._write_enabled or not self._client:
-            return
-
-        clean_user = _clean_text_for_capture(user_content)
-        clean_assistant = _clean_text_for_capture(assistant_content)
-        if not clean_user and not clean_assistant:
-            return
-
-        # Buffer every turn for the single full-session document written at end/switch/shutdown
-        self._session_turns.append({"user": clean_user, "assistant": clean_assistant})
-
-    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        if not self._active or not self._write_enabled or not self._client or not self._session_id:
-            return
-        cleaned = []
+    @staticmethod
+    def _clean_conversation(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        cleaned: List[Dict[str, str]] = []
         for message in messages or []:
-            role = message.get("role")
+            role = str(message.get("role") or "")
             if role not in {"user", "assistant"}:
                 continue
-            content = _clean_text_for_capture(str(message.get("content", "")))
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                continue
+            content = _clean_text_for_capture(content)
             if content:
                 cleaned.append({"role": role, "content": content})
+        return cleaned
+
+    @staticmethod
+    def _format_conversation(messages: List[Dict[str, str]]) -> str:
+        return "\n\n".join(
+            f"[role: {message['role']}]\n{message['content']}\n[{message['role']}:end]"
+            for message in messages
+        )
+
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
+                  messages: Optional[List[Dict[str, Any]]] = None) -> None:
+        if not self._active or not self._auto_capture or not self._write_enabled or not self._client:
+            return
+        capture_session_id = str(session_id or self._session_id).strip()
+        if not capture_session_id:
+            return
+        if capture_session_id != self._session_id:
+            self._session_id = capture_session_id
+            self._session_turns = []
+
+        if messages is not None:
+            cleaned = self._clean_conversation(messages)
+            self._session_turns = [
+                {"user": m["content"], "assistant": ""} if m["role"] == "user"
+                else {"user": "", "assistant": m["content"]}
+                for m in cleaned
+            ]
+        else:
+            clean_user = _clean_text_for_capture(user_content)
+            clean_assistant = _clean_text_for_capture(assistant_content)
+            if clean_user or clean_assistant:
+                self._session_turns.append({"user": clean_user, "assistant": clean_assistant})
+            cleaned = []
+            for turn in self._session_turns:
+                if turn.get("user"):
+                    cleaned.append({"role": "user", "content": turn["user"]})
+                if turn.get("assistant"):
+                    cleaned.append({"role": "assistant", "content": turn["assistant"]})
         if not cleaned:
             return
-        if len(cleaned) == 1 and len(cleaned[0].get("content", "")) < 20:
-            return
-        try:
-            self._client.ingest_conversation(
-                self._session_id,
-                cleaned,
-                metadata={
-                    "type": "full_session",
-                    "session_id": self._session_id,
-                    "message_count": len(cleaned),
-                },
-            )
-        except urllib.error.HTTPError:
-            logger.warning("Supermemory session ingest failed", exc_info=True)
-        except Exception:
-            logger.warning("Supermemory session ingest failed", exc_info=True)
+        self._client.add_memory(
+            self._format_conversation(cleaned),
+            metadata={
+                "type": "conversation",
+                "session_id": capture_session_id,
+                "message_count": len(cleaned),
+            },
+            entity_context=self._entity_context,
+            custom_id=f"hermes-session:{capture_session_id}",
+            task_type="memory",
+        )
 
-        # Clear buffer so shutdown() doesn't duplicate on normal exit
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        # Completed turns are already captured through MemoryManager's writer.
         self._session_turns = []
 
     def on_session_switch(
@@ -788,40 +791,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
         reset: bool = False,
         **kwargs,
     ) -> None:
-        """Flush any buffered turns from the old session as one document, then reset for the new session."""
-        if not self._active or not self._write_enabled or not self._client:
-            self._session_id = str(new_session_id or "").strip() or self._session_id
-            self._session_turns = []
-            return
-
-        old_session_id = self._session_id
-        old_turns = list(self._session_turns)
-
-        # Flush previous session via conversations ingest (with metadata)
-        if old_turns and old_session_id:
-            messages: list[dict] = []
-            for turn in old_turns:
-                if turn.get("user"):
-                    messages.append({"role": "user", "content": turn["user"]})
-                if turn.get("assistant"):
-                    messages.append({"role": "assistant", "content": turn["assistant"]})
-
-            try:
-                self._client.ingest_conversation(
-                    old_session_id,
-                    messages,
-                    metadata={
-                        "type": "full_session",
-                        "session_id": old_session_id,
-                        "message_count": len(old_turns) * 2,
-                        "partial": not reset,
-                    },
-                )
-            except Exception:
-                logger.debug("Supermemory session-switch ingest failed", exc_info=True)
-
-        # Reset for new session
-        self._session_id = str(new_session_id or "").strip() or old_session_id
+        """Rotate local capture state; completed turns need no boundary ingest."""
+        self._session_id = str(new_session_id or "").strip() or self._session_id
         self._session_turns = []
         self._turn_count = 0
 
@@ -848,31 +819,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._write_thread.start()
 
     def shutdown(self) -> None:
-        # Emergency fallback (crashes only). Buffer is cleared on normal on_session_end().
-        if self._active and self._write_enabled and self._client and self._session_turns and self._session_id:
-            logger.warning("Supermemory: Saving session via shutdown (session=%s, turns=%d)", self._session_id, len(self._session_turns))
-
-            messages: list[dict] = []
-            for turn in self._session_turns:
-                if turn.get("user"):
-                    messages.append({"role": "user", "content": turn["user"]})
-                if turn.get("assistant"):
-                    messages.append({"role": "assistant", "content": turn["assistant"]})
-
-            try:
-                self._client.ingest_conversation(
-                    self._session_id,
-                    messages,
-                    metadata={
-                        "type": "full_session",
-                        "session_id": self._session_id,
-                        "message_count": len(self._session_turns) * 2,
-                        "partial": True,
-                    },
-                )
-            except Exception:
-                logger.debug("Supermemory shutdown ingest failed", exc_info=True)
-
+        self._session_turns = []
         for attr_name in ("_prefetch_thread", "_sync_thread", "_write_thread"):
             thread = getattr(self, attr_name, None)
             if thread and thread.is_alive():

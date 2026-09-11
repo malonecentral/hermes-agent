@@ -25,6 +25,7 @@ Usage in run_agent.py:
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -774,6 +775,10 @@ class MemoryManager:
         if not clean_user_content:
             return
         user_content = clean_user_content
+        # The caller continues mutating its live history after this method
+        # returns. Freeze the completed-turn snapshot before handing it to the
+        # background executor so providers never capture a later turn by race.
+        messages = copy.deepcopy(messages) if messages is not None else None
 
         def _run() -> None:
             for provider in providers:

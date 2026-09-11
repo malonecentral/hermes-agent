@@ -32,13 +32,14 @@ class FakeClient:
         self.forget_by_query_response = {"success": True, "message": "Forgot"}
 
     def add_memory(self, content, metadata=None, *, entity_context="",
-                   container_tag=None, custom_id=None):
+                   container_tag=None, custom_id=None, task_type=None):
         self.add_calls.append({
             "content": content,
             "metadata": metadata,
             "entity_context": entity_context,
             "container_tag": container_tag,
             "custom_id": custom_id,
+            "task_type": task_type,
         })
         return {"id": "mem_123"}
 
@@ -113,32 +114,98 @@ def test_prefetch_includes_profile_on_first_turn(provider):
 
 
 def test_sync_turn_buffers_short_messages(provider):
-    # Trivial filtering is no longer applied at sync time — every non-empty turn
-    # is buffered and only the full session is written at session boundaries.
     provider.sync_turn("ok", "sure", session_id="session-1")
-    assert provider._session_turns == [{"user": "ok", "assistant": "sure"}]
-    assert provider._client.add_calls == []
+    assert len(provider._client.add_calls) == 1
 
 
-def test_on_session_end_ingests_clean_messages(provider):
+def test_sync_turn_writes_growing_clean_conversation_with_stable_id(provider):
+    messages = [
+        {"role": "system", "content": "private system prompt"},
+        {"role": "user", "content": "First ordinary user message"},
+        {"role": "assistant", "content": "First ordinary assistant reply"},
+        {"role": "tool", "content": "private tool output"},
+    ]
+    provider.sync_turn("ignored", "ignored", session_id="session-1", messages=messages)
+    first = provider._client.add_calls[-1]
+    assert first["custom_id"] == "hermes-session:session-1"
+    assert first["task_type"] == "memory"
+    assert first["entity_context"] == provider._entity_context
+    assert "private system prompt" not in first["content"]
+    assert "private tool output" not in first["content"]
+    assert "[role: user]\nFirst ordinary user message\n[user:end]" in first["content"]
+
+    messages += [
+        {"role": "user", "content": "Second message"},
+        {"role": "assistant", "content": "<supermemory-context>injected</supermemory-context>Second reply"},
+    ]
+    provider.sync_turn("ignored", "ignored", session_id="session-1", messages=messages)
+    second = provider._client.add_calls[-1]
+    assert second["custom_id"] == first["custom_id"]
+    assert first["content"] in second["content"]
+    assert "injected" not in second["content"]
+    assert second["metadata"] == {
+        "type": "conversation",
+        "session_id": "session-1",
+        "message_count": 4,
+    }
+
+
+def test_sync_turn_fallback_accumulates_turns_and_isolates_sessions(provider):
+    provider.sync_turn("session one user", "session one reply", session_id="session-1")
+    provider.on_session_switch("session-2")
+    provider.sync_turn("session two user", "session two reply", session_id="session-2")
+    assert [call["custom_id"] for call in provider._client.add_calls] == [
+        "hermes-session:session-1",
+        "hermes-session:session-2",
+    ]
+    assert "session one" not in provider._client.add_calls[-1]["content"]
+
+
+def test_resumed_session_uses_same_custom_id(provider):
+    provider.sync_turn("one", "reply one", session_id="session-1")
+    provider.initialize("session-1", hermes_home=provider._hermes_home, platform="cli")
+    provider.sync_turn("two", "reply two", session_id="session-1")
+    assert provider._client.add_calls[-1]["custom_id"] == "hermes-session:session-1"
+
+
+def test_on_session_end_does_not_duplicate_completed_turn_capture(provider):
     messages = [
         {"role": "system", "content": "skip"},
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "hi there"},
     ]
+    provider.sync_turn("hello", "hi there", session_id="session-1", messages=messages)
+    assert len(provider._client.add_calls) == 1
     provider.on_session_end(messages)
-    assert len(provider._client.ingest_calls) == 1
-    payload = provider._client.ingest_calls[0]
-    assert payload["session_id"] == "session-1"
-    assert payload["messages"] == [
-        {"role": "user", "content": "hello"},
-        {"role": "assistant", "content": "hi there"},
-    ]
-    assert payload["metadata"]["type"] == "full_session"
-    assert payload["metadata"]["session_id"] == "session-1"
-    assert payload["metadata"]["message_count"] == 2
-    # Buffer is cleared after a normal session-end ingest.
+    provider.shutdown()
+    assert len(provider._client.add_calls) == 1
+    assert provider._client.ingest_calls == []
     assert provider._session_turns == []
+
+
+def test_auto_capture_disabled_blocks_all_automatic_paths(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({"auto_capture": False}, str(tmp_path))
+    p = SupermemoryMemoryProvider()
+    p.initialize("disabled-1", hermes_home=str(tmp_path), platform="cli")
+    p.sync_turn("user", "assistant", session_id="disabled-1")
+    p.on_session_end([{"role": "user", "content": "user"}])
+    p.on_session_switch("disabled-2")
+    p.shutdown()
+    assert p._client.add_calls == []
+    assert p._client.ingest_calls == []
+
+
+def test_explicit_approved_store_is_not_blocked_by_auto_capture(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({"auto_capture": False}, str(tmp_path))
+    p = SupermemoryMemoryProvider()
+    p.initialize("s1", hermes_home=str(tmp_path), platform="cli")
+    result = json.loads(p.handle_tool_call("supermemory_store", {"content": "Approved explicit fact"}))
+    assert result["saved"] is True
+    assert len(p._client.add_calls) == 1
 
 
 def test_merge_metadata_stamps_sm_source():
@@ -158,12 +225,12 @@ def test_merge_metadata_stamps_sm_source():
     assert "source" not in merged2
 
 
-def test_shutdown_joins_threads_and_flushes_buffer(provider, monkeypatch):
+def test_shutdown_joins_threads_without_duplicate_capture(provider, monkeypatch):
     started = threading.Event()
     release = threading.Event()
 
     def slow_add_memory(content, metadata=None, *, entity_context="",
-                        container_tag=None, custom_id=None):
+                        container_tag=None, custom_id=None, task_type=None):
         started.set()
         release.wait(timeout=1)
         provider._client.add_calls.append({
@@ -175,14 +242,13 @@ def test_shutdown_joins_threads_and_flushes_buffer(provider, monkeypatch):
 
     monkeypatch.setattr(provider._client, "add_memory", slow_add_memory)
 
-    # sync_turn now only buffers — no thread is spawned.
     provider.sync_turn(
         "Please remember this request in long-term memory",
         "Absolutely, I will keep that in long-term memory.",
         session_id="session-1",
     )
     assert provider._sync_thread is None
-    assert len(provider._session_turns) == 1
+    assert len(provider._client.add_calls) == 1
 
     # on_memory_write still runs on a background thread.
     provider.on_memory_write("add", "memory", "Jordan likes concise docs")
@@ -197,13 +263,8 @@ def test_shutdown_joins_threads_and_flushes_buffer(provider, monkeypatch):
     assert provider._write_thread is None
     assert provider._prefetch_thread is None
     # Explicit memory write went through.
-    assert len(provider._client.add_calls) == 1
-    # Buffered turn was flushed as a partial full-session ingest.
-    assert len(provider._client.ingest_calls) == 1
-    payload = provider._client.ingest_calls[0]
-    assert payload["session_id"] == "session-1"
-    assert payload["metadata"]["partial"] is True
-    assert payload["metadata"]["type"] == "full_session"
+    assert len(provider._client.add_calls) == 2
+    assert provider._client.ingest_calls == []
 
 
 def test_store_tool_returns_saved_payload(provider):
@@ -297,7 +358,7 @@ def test_base_url_defaults_to_cloud(monkeypatch, tmp_path):
 
 
 def test_client_passes_custom_base_url_to_sdk(monkeypatch):
-    """SDK operations and raw conversation ingest share one normalized base URL."""
+    """SDK operations use the normalized custom base URL."""
     import sys
     import types
 
@@ -325,39 +386,18 @@ def test_client_passes_custom_base_url_to_sdk(monkeypatch):
     assert captured["base_url"] == "http://localhost:6767"
 
 
-@pytest.mark.parametrize(
-    ("base_url", "expected_url"),
-    [
-        ("https://api.supermemory.ai", "https://api.supermemory.ai/v4/conversations"),
-        ("http://localhost:6767", "http://localhost:6767/v4/conversations"),
-    ],
-)
-def test_ingest_conversation_uses_client_base_url(monkeypatch, base_url, expected_url):
-    """Raw conversation ingest follows the same endpoint as SDK operations."""
+def test_add_memory_passes_explicit_task_type_to_documents_add():
     from plugins.memory.supermemory import _SupermemoryClient
-
     client = _SupermemoryClient.__new__(_SupermemoryClient)
-    client._api_key = "test-key"
     client._container_tag = "hermes"
-    client._timeout = 1.0
-    client._base_url = base_url
-
     captured = {}
-
-    class _FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-    def fake_urlopen(req, timeout=None):
-        captured["url"] = req.full_url
-        return _FakeResponse()
-
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-    client.ingest_conversation("s1", [{"role": "user", "content": "hello there"}])
-    assert captured["url"] == expected_url
+    class Docs:
+        def add(self, **kwargs):
+            captured.update(kwargs)
+            return type("Result", (), {"id": "doc-1"})()
+    client._client = type("SDK", (), {"documents": Docs()})()
+    client.add_memory("conversation", task_type="memory")
+    assert captured["task_type"] == "memory"
 
 
 # -- Multi-container tests ----------------------------------------------------

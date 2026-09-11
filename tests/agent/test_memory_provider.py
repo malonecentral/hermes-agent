@@ -236,6 +236,24 @@ class TestMemoryManager:
 
         assert legacy_provider.synced_turns == [("user", "assistant")]
 
+    def test_sync_all_snapshots_messages_before_background_dispatch(self):
+        mgr = MemoryManager()
+        provider = MessagesMemoryProvider("external")
+        mgr.add_provider(provider)
+        completed_messages = [{"role": "user", "content": "completed turn"}]
+
+        mgr.sync_all(
+            "completed turn",
+            "response",
+            session_id="snapshot-session",
+            messages=completed_messages,
+        )
+        completed_messages.append({"role": "user", "content": "later turn"})
+        mgr.flush_pending(timeout=5)
+
+        captured = provider.synced_turns[0][3]
+        assert captured == [{"role": "user", "content": "completed turn"}]
+
     # -- Tool routing -------------------------------------------------------
 
 
