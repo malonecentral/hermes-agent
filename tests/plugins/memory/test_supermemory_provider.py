@@ -506,7 +506,12 @@ def test_owner_prefetch_malformed_reranker_fails_closed(provider, monkeypatch):
 
 
 def test_owner_reranker_uses_fixed_local_model_independent_of_answer_model(monkeypatch):
-    from plugins.memory.supermemory import _call_owner_reranker
+    from plugins.memory.supermemory import _call_owner_reranker, _OWNER_RERANK_SYSTEM
+
+    assert "usual, normal, favorite, or repeated" in _OWNER_RERANK_SYSTEM
+    assert "Next-time" in _OWNER_RERANK_SYSTEM
+    assert "may-order" in _OWNER_RERANK_SYSTEM
+    assert "another person's" in _OWNER_RERANK_SYSTEM
 
     captured = {}
 
