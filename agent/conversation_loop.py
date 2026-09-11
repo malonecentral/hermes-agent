@@ -310,6 +310,10 @@ _COMPRESSION_TIMEOUT_FINAL_RESPONSE = (
     "auxiliary.compression before retrying /compress."
 )
 
+_MEMORY_EVIDENCE_MISSING_FINAL_RESPONSE = (
+    "I couldn't find canonical evidence for that, so I won't guess."
+)
+
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -2158,6 +2162,19 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+
+    # One-shot retrieval-only callers may require selected memory evidence.
+    # Enforce that contract before the first model API call; prompt wording is
+    # not a hallucination boundary.
+    if getattr(agent, "_memory_evidence_required", False) and not _ext_prefetch_cache:
+        return {
+            "final_response": _MEMORY_EVIDENCE_MISSING_FINAL_RESPONSE,
+            "messages": messages + [{"role": "assistant", "content": _MEMORY_EVIDENCE_MISSING_FINAL_RESPONSE}],
+            "completed": True,
+            "api_calls": 0,
+            "failed": False,
+            "turn_exit_reason": "required_memory_evidence_missing",
+        }
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.

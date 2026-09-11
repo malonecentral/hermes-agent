@@ -292,6 +292,35 @@ def _restaurant_key(text: str) -> str:
     return re.sub(r"([a-z])\1+", r"\1", compact)
 
 
+def _scope_owner_named_person_results(query: str, results: list) -> list:
+    """For an explicit biography query, retain only the exact person note."""
+    match = re.search(
+        r"\b(?:tell me (?:a little (?:bit )?)?(?:more )?about|who is)\s+"
+        r"([A-Za-z][A-Za-z'’.-]*(?:\s+[A-Za-z][A-Za-z'’.-]*){1,3})\s*[?.!]*$",
+        query or "", re.IGNORECASE,
+    )
+    if not match:
+        return results
+    requested = match.group(1).strip()
+    if re.match(r"^(?:my|his|her|their|our|that)\b", requested, re.IGNORECASE):
+        return results
+
+    def tokens(value: str) -> list[str]:
+        return re.findall(r"[a-z]+", value.casefold())
+
+    wanted = tokens(requested)
+    exact = []
+    for item in results or []:
+        relative_path = str((item.get("metadata") or {}).get("relative_path") or "")
+        person = re.search(r"/People/([^/]+)\.md$", relative_path, re.IGNORECASE)
+        if not person:
+            continue
+        candidate = tokens(person.group(1))
+        if candidate == wanted or (len(wanted) == 2 and len(candidate) >= 2 and candidate[0] == wanted[0] and candidate[-1] == wanted[-1]):
+            exact.append(item)
+    return exact
+
+
 def _scope_owner_restaurant_results(query: str, results: list) -> tuple[list, bool]:
     """Keep a named venue's canonical note and its reciprocal dish notes.
 
@@ -343,8 +372,8 @@ def _owner_canonical_query(query: str) -> str:
     """
     text = (query or "").strip()
     lowered = text.lower()
-    father = bool(re.search(r"\bmy\s+(?:dad|father)\b(?!['’]s|-in-law)", lowered))
-    mother = bool(re.search(r"\bmy\s+(?:mom|mother)\b(?!['’]s|-in-law)", lowered))
+    father = bool(re.search(r"\bmy\s+(?:dad|father)\b(?!-in-law)(?!['’]s(?!\s+name\b))", lowered))
+    mother = bool(re.search(r"\bmy\s+(?:mom|mother)\b(?!-in-law)(?!['’]s(?!\s+name\b))", lowered))
     parents = bool(re.search(r"\bmy\s+parents?\b", lowered))
     if father:
         return (
@@ -361,6 +390,14 @@ def _owner_canonical_query(query: str) -> str:
             f"{text} Authenticated requester: Dennis Malone. "
             "Resolve Dennis Malone parent relationship: father, dad, mother, or mom."
         )
+    # A bare "about/from <name>" is commonly a person biography query. Only
+    # add restaurant-specific expansion when the question itself contains a
+    # food/order cue; exact restaurant notes can still scope ambiguous queries.
+    if not re.search(
+        r"\b(?:restaurant|menu|dish|food|order(?:ed|s)?|get|gets|got|eat|eats|ate|drink|drinks|favorite|usual|normally)\b",
+        lowered,
+    ):
+        return text
     venue_match = re.search(
         r"\b(?:at|about|from)\s+([A-Za-z0-9][A-Za-z0-9 &'’.-]{0,80}?)(?:\s*[?.!]|$)",
         text,
@@ -483,6 +520,10 @@ def _format_prefetch_context(
             "The authenticated Owner/requester is Dennis. Never infer that Dennis is another person merely because "
             "a retrieved result describes that person; third-party records are context, not requester identity. "
             "For identity questions, answer Dennis only when directly supported by Owner context, otherwise state uncertainty. "
+            "For factual answers, use only explicit facts below. Preserve proper names, dates, places, employers, and relationship "
+            "direction exactly as written. Do not add connective biography, motives, inferred roles, relatives, or corrected spellings. "
+            "Prefer a terse list or direct sentence over narrative prose. If the requested identity differs from the selected record, "
+            "state the mismatch rather than treating them as the same person. "
         )
     intro += "Do not force memories into the conversation."
     body = "\n\n".join(sections)
@@ -967,6 +1008,11 @@ class SupermemoryMemoryProvider(MemoryProvider):
             }
             candidates.append(candidate)
             by_id[candidate_id] = item
+        # The fixed reranker contract was benchmarked with eight bounded
+        # candidates. Deterministic authority/entity ranking has already run;
+        # do not hand a local pre-call model an unbounded contaminated pile.
+        candidates = candidates[:8]
+        by_id = {candidate["id"]: by_id[candidate["id"]] for candidate in candidates}
         if len(candidates) <= 1:
             return [by_id[candidates[0]["id"]]] if candidates else []
         result = _call_owner_reranker(query, candidates)
@@ -997,6 +1043,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             search_results = _authoritative_search_results(profile["search_results"])
             named_restaurant = False
             if canonical_owner:
+                search_results = _scope_owner_named_person_results(query, search_results)
                 search_results, named_restaurant = _scope_owner_restaurant_results(query, search_results)
                 search_results = _rank_owner_canonical_results(query, search_results)
                 conversation_results = self._client.search_memories(

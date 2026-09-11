@@ -672,6 +672,7 @@ def init_agent(
     # process-global environment value from one another.
     _memory_query_bytes = os.environ.pop("HERMES_MEMORY_PREFETCH_QUERY", "").strip().encode("utf-8")[:8192]
     agent._memory_prefetch_query = _memory_query_bytes.decode("utf-8", errors="ignore")
+    agent._memory_evidence_required = os.environ.pop("HERMES_MEMORY_REQUIRE_EVIDENCE", "").strip() == "1"
     agent.model = model
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.

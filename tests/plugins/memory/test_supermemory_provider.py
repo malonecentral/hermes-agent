@@ -252,6 +252,7 @@ def test_owner_parent_query_does_not_rewrite_indirect_relationship():
     assert _owner_canonical_query(query) == query
     query = "Who is my father-in-law?"
     assert _owner_canonical_query(query) == query
+    assert "Resolve Dennis Malone parent relationship: father or dad." in _owner_canonical_query("What is my dad's name?")
 
 
 def test_owner_mother_in_law_query_ranks_direct_profile_without_rewrite():
@@ -318,9 +319,20 @@ def test_owner_named_restaurant_query_targets_canonical_venue_records():
         "What does Courtnee normally get at Zips? Canonical restaurant venue: Zips. "
         "Prefer the exact Food/Restaurants note and reciprocal Food/Dishes records for Zips; exclude other venues."
     )
-    assert _owner_canonical_query("What did Courtnee think about Parlay?").endswith(
-        "reciprocal Food/Dishes records for Parlay; exclude other venues."
-    )
+    # Ambiguous "about <name>" text is not forced into restaurant scope.
+    assert _owner_canonical_query("What did Courtnee think about Parlay?") == "What did Courtnee think about Parlay?"
+    assert _owner_canonical_query("Tell me about Philip B Malone") == "Tell me about Philip B Malone"
+
+
+def test_owner_explicit_person_scope_requires_matching_canonical_name():
+    from plugins.memory.supermemory import _scope_owner_named_person_results
+
+    canonical = {"source": "obsidian", "authority": "canonical"}
+    phillip = {"memory": "Full name: Phillip Daniel Malone", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/People/Phillip D. Malone.md"}}
+    noise = {"memory": "Unrelated family relationship index", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/People/Malone Family Relationships.md"}}
+    assert _scope_owner_named_person_results("Tell me about Phillip D Malone", [noise, phillip]) == [phillip]
+    assert _scope_owner_named_person_results("Tell me about Philip B Malone", [noise, phillip]) == []
+    assert _scope_owner_named_person_results("Who is my dad?", [noise, phillip]) == [noise, phillip]
 
 
 def test_sync_turn_buffers_short_messages(provider):
