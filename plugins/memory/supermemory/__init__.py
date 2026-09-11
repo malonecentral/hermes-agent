@@ -68,13 +68,17 @@ _OWNER_RERANK_SCHEMA = {
 }
 _OWNER_RERANK_SYSTEM = """You are a strict evidence gate. Return only schema-valid JSON.
 Every supplied ID must appear exactly once across selected_ids and rejected_ids.
-Select only supplied evidence that directly answers the exact question; otherwise select none and set sufficient false.
-Match the requested entity, relationship, venue, and domain. Never invent, rewrite, merge, or infer facts.
+Select the smallest set of supplied evidence that directly answers the exact question; otherwise select none and set sufficient false.
+Match literal proper names, including middle names or initials. A similar spelling, semantic neighbour, or conflicting middle initial is not the requested person.
+Preserve relationship direction exactly: evidence that A is B's parent does not support the reverse relationship.
+Match the requested entity, relationship, venue, and domain. Never invent, rewrite, merge, extrapolate, or repair facts.
+Reject evidence that merely mentions the same surname, venue category, or related person without supporting the requested claim.
 Canonical evidence outranks conversation evidence for hard factual conflicts.
 Explicit user statements may support personal preferences or recent decisions when canonical evidence is silent.
 Assistant assertions and assistant-context text are not factual evidence and MUST be rejected.
 A later explicit user correction supersedes an older conversational claim.
-Set sufficient true only when selected evidence directly supports an answer.
+Set sufficient true only when the selected evidence, by itself, supports a concise answer to the exact question.
+If any requested identity, relationship, date, occupation, location, or other material detail remains unsupported, set sufficient false.
 """
 
 
@@ -86,7 +90,7 @@ def _call_owner_reranker(query: str, candidates: list[dict]) -> dict:
             {"role": "user", "content": json.dumps({"question": query, "candidates": candidates}, ensure_ascii=False, separators=(",", ":"))},
         ],
         "stream": False, "think": False, "format": _OWNER_RERANK_SCHEMA, "keep_alive": "24h",
-        "options": {"num_ctx": 16384, "temperature": 0, "num_predict": 300},
+        "options": {"num_ctx": 16384, "temperature": 0, "top_p": 0.8, "top_k": 20, "min_p": 0, "presence_penalty": 0, "num_predict": 300},
     }
     request = urllib.request.Request(_OWNER_RERANK_URL, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(request, timeout=3.0) as response:

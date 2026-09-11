@@ -478,7 +478,15 @@ def test_owner_reranker_uses_fixed_local_model_independent_of_answer_model(monke
     assert result["selected_ids"] == ["c1"]
     assert captured["payload"]["model"] == "qwen3.5:4b"
     assert captured["payload"]["think"] is False
-    assert captured["payload"]["options"] == {"num_ctx": 16384, "temperature": 0, "num_predict": 300}
+    assert captured["payload"]["options"] == {
+        "num_ctx": 16384,
+        "temperature": 0,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0,
+        "presence_penalty": 0,
+        "num_predict": 300,
+    }
     assert captured["url"] == "http://mcomen.malonecentral.com:11434/api/chat"
     assert captured["timeout"] == 3.0
 
