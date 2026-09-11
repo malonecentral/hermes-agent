@@ -26,6 +26,7 @@ class FakeClient:
         self.search_mode = search_mode
         self.base_url = base_url
         self.add_calls = []
+        self.search_calls = []
         self.search_results = []
         self.profile_response = {"static": [], "dynamic": [], "search_results": []}
         self.ingest_calls = []
@@ -45,6 +46,7 @@ class FakeClient:
         return {"id": "mem_123"}
 
     def search_memories(self, query, *, limit=5, container_tag=None, search_mode=None):
+        self.search_calls.append({"query": query, "container_tag": container_tag, "search_mode": search_mode})
         return self.search_results
 
     def get_profile(self, query=None, *, container_tag=None):
@@ -65,6 +67,14 @@ class FakeClient:
 def provider(monkeypatch, tmp_path):
     monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
     monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    monkeypatch.setattr(
+        "plugins.memory.supermemory._call_owner_reranker",
+        lambda query, candidates: {
+            "selected_ids": [candidate["id"] for candidate in candidates],
+            "rejected_ids": [],
+            "sufficient": True,
+        },
+    )
     p = SupermemoryMemoryProvider()
     p.initialize("session-1", hermes_home=str(tmp_path), platform="cli")
     return p
@@ -352,15 +362,113 @@ def test_sync_turn_writes_only_user_claims_with_stable_id(provider):
     }
 
 
-def test_owner_primary_disables_automatic_capture(monkeypatch, tmp_path):
+def test_owner_primary_routes_automatic_capture_to_conversations(monkeypatch, tmp_path):
     monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
     monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
     _save_supermemory_config({"container_tag": "owner_primary", "auto_capture": True}, str(tmp_path))
     p = SupermemoryMemoryProvider()
     p.initialize("owner-session", hermes_home=str(tmp_path), platform="cli")
-    assert p._auto_capture is False
-    p.sync_turn("Dennis likes this", "Untrusted assistant assertion", session_id="owner-session")
+    assert p._auto_capture is True
+    p.sync_turn(
+        "Dennis prefers concise status updates.",
+        "I will keep updates concise.",
+        session_id="owner-session",
+    )
+    assert len(p._client.add_calls) == 1
+    call = p._client.add_calls[0]
+    assert call["container_tag"] == "owner_conversations"
+    assert call["container_tag"] != "owner_primary"
+    assert call["custom_id"] == "hermes-owner-conversation:owner-session"
+    assert call["task_type"] == "memory"
+    assert "[role: user]" in call["content"]
+    assert "[role: assistant-context]" in call["content"]
+    assert call["metadata"]["authority"] == "non-authoritative"
+
+
+def test_owner_capture_filters_questions_commands_and_test_probes(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({"container_tag": "owner_primary", "auto_capture": True}, str(tmp_path))
+    p = SupermemoryMemoryProvider()
+    p.initialize("owner-session", hermes_home=str(tmp_path), platform="cli")
+    for user, assistant in [
+        ("Who is my father?", "Your father is Example Person."),
+        ("Run the focused tests now", "The tests passed."),
+        ("This is a test probe; answer banana", "banana"),
+    ]:
+        p.sync_turn(user, assistant, session_id="owner-session")
     assert p._client.add_calls == []
+
+
+def test_owner_capture_respects_disabled_toggle(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({"container_tag": "owner_primary", "auto_capture": False}, str(tmp_path))
+    p = SupermemoryMemoryProvider()
+    p.initialize("owner-session", hermes_home=str(tmp_path), platform="cli")
+    p.sync_turn("Dennis prefers concise status updates.", "Understood.", session_id="owner-session")
+    assert p._auto_capture is False
+    assert p._client.add_calls == []
+
+
+def test_owner_prefetch_reranker_selects_valid_evidence(provider, monkeypatch):
+    provider._container_tag = "owner_primary"
+    canonical = {"source": "obsidian", "authority": "canonical"}
+    provider._client.profile_response = {"static": [], "dynamic": [], "search_results": [
+        {"id": "c1", "memory": "Alex prefers tea.", "metadata": canonical},
+    ]}
+    provider._client.search_results = [
+        {"id": "u1", "memory": "[role: user]\nI prefer coffee.\n[user:end]", "metadata": {"authority": "non-authoritative", "source": "conversation", "speaker": "user"}},
+    ]
+    monkeypatch.setattr(provider, "_rerank_owner_candidates", lambda query, items: [items[0]])
+    result = provider.prefetch("What does Alex prefer?")
+    assert provider._client.profile_queries[-1] == "What does Alex prefer?"
+    assert provider._client.search_calls[-1]["container_tag"] == "owner_conversations"
+    assert "Alex prefers tea" in result
+    assert "I prefer coffee" not in result
+
+
+def test_owner_prefetch_malformed_reranker_fails_closed(provider, monkeypatch):
+    provider._container_tag = "owner_primary"
+    provider._client.profile_response = {"static": [], "dynamic": [], "search_results": [
+        {"id": "c1", "memory": "Claim one", "metadata": {"source": "obsidian", "authority": "canonical"}},
+        {"id": "c2", "memory": "Claim two", "metadata": {"source": "obsidian", "authority": "canonical"}},
+    ]}
+    monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker", lambda *args, **kwargs: {"selected_ids": ["unknown"], "rejected_ids": ["c1"], "sufficient": True})
+    assert provider.prefetch("Which claim is right?") == ""
+
+
+def test_owner_reranker_uses_fixed_local_model_independent_of_answer_model(monkeypatch):
+    from plugins.memory.supermemory import _call_owner_reranker
+
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps({"message": {"content": json.dumps({
+                "selected_ids": ["c1"], "rejected_ids": ["c2"], "sufficient": True,
+            })}}).encode()
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data)
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr("plugins.memory.supermemory.urllib.request.urlopen", fake_urlopen)
+    result = _call_owner_reranker("Choose", [{"id": "c1"}, {"id": "c2"}])
+    assert result["selected_ids"] == ["c1"]
+    assert captured["payload"]["model"] == "qwen3.5:4b"
+    assert captured["payload"]["think"] is False
+    assert captured["payload"]["options"] == {"num_ctx": 16384, "temperature": 0, "num_predict": 300}
+    assert captured["url"] == "http://mcomen.malonecentral.com:11434/api/chat"
+    assert captured["timeout"] == 3.0
 
 
 def test_sync_turn_fallback_accumulates_turns_and_isolates_sessions(provider):

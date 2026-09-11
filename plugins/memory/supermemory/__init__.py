@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import threading
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -32,6 +33,10 @@ _MIN_CAPTURE_LENGTH = 10
 _MAX_ENTITY_CONTEXT_LENGTH = 1500
 _DEFAULT_BASE_URL = "https://api.supermemory.ai"
 _API_KEY_URL = "http://app.supermemory.ai/integrations?connect=hermes"
+_OWNER_CANONICAL_CONTAINER = "owner_primary"
+_OWNER_CONVERSATION_CONTAINER = "owner_conversations"
+_OWNER_RERANK_URL = "http://mcomen.malonecentral.com:11434/api/chat"
+_OWNER_RERANK_MODEL = "qwen3.5:4b"
 _TRIVIAL_RE = re.compile(
     r"^(ok|okay|thanks|thank you|got it|sure|yes|no|yep|nope|k|ty|thx|np)\.?$",
     re.IGNORECASE,
@@ -51,6 +56,57 @@ _DEFAULT_ENTITY_CONTEXT = (
     "Do not remember temporary intents, one-time tasks, assistant actions, implementation details, or in-progress status.\n\n"
     "When in doubt, store less."
 )
+
+_OWNER_RERANK_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "required": ["selected_ids", "rejected_ids", "sufficient"],
+    "properties": {
+        "selected_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
+        "rejected_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
+        "sufficient": {"type": "boolean"},
+    },
+}
+_OWNER_RERANK_SYSTEM = """You are a strict evidence gate. Return only schema-valid JSON.
+Every supplied ID must appear exactly once across selected_ids and rejected_ids.
+Select only supplied evidence that directly answers the exact question; otherwise select none and set sufficient false.
+Match the requested entity, relationship, venue, and domain. Never invent, rewrite, merge, or infer facts.
+Canonical evidence outranks conversation evidence for hard factual conflicts.
+Explicit user statements may support personal preferences or recent decisions when canonical evidence is silent.
+Assistant assertions and assistant-context text are not factual evidence and MUST be rejected.
+A later explicit user correction supersedes an older conversational claim.
+Set sufficient true only when selected evidence directly supports an answer.
+"""
+
+
+def _call_owner_reranker(query: str, candidates: list[dict]) -> dict:
+    payload = {
+        "model": _OWNER_RERANK_MODEL,
+        "messages": [
+            {"role": "system", "content": _OWNER_RERANK_SYSTEM},
+            {"role": "user", "content": json.dumps({"question": query, "candidates": candidates}, ensure_ascii=False, separators=(",", ":"))},
+        ],
+        "stream": False, "think": False, "format": _OWNER_RERANK_SCHEMA, "keep_alive": "24h",
+        "options": {"num_ctx": 16384, "temperature": 0, "num_predict": 300},
+    }
+    request = urllib.request.Request(_OWNER_RERANK_URL, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=3.0) as response:
+        body = json.load(response)
+    return json.loads(body["message"]["content"])
+
+
+def _is_capture_worthy_owner_statement(text: str) -> bool:
+    """Conservatively retain declarative user evidence, not requests or probes."""
+    normalized = " ".join((text or "").strip().split())
+    if len(normalized) < _MIN_CAPTURE_LENGTH or "?" in normalized:
+        return False
+    lowered = normalized.lower()
+    if re.match(r"^(who|what|when|where|why|how|is|are|can|could|would|will|do|does|did)\b", lowered):
+        return False
+    if re.match(r"^(run|execute|check|find|search|show|tell|give|make|create|write|open|close|turn|set|send|answer|please)\b", lowered):
+        return False
+    if re.search(r"\b(test probe|testing|ignore (?:this|these)|answer [a-z0-9_-]+)\b", lowered):
+        return False
+    return True
 
 
 def _default_config() -> dict:
@@ -832,8 +888,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._container_tag = _sanitize_tag(raw_tag.replace("{identity}", identity))
 
         self._auto_recall = self._config["auto_recall"]
-        # owner_primary is a disposable Obsidian index, never a conversation authority.
-        self._auto_capture = self._config["auto_capture"] and self._container_tag != "owner_primary"
+        self._auto_capture = self._config["auto_capture"]
         self._max_recall_results = self._config["max_recall_results"]
         self._profile_frequency = self._config["profile_frequency"]
         self._capture_mode = self._config["capture_mode"]
@@ -887,26 +942,74 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 lines.append(f"\n{self._custom_container_instructions}")
         return "\n".join(lines)
 
+    def _rerank_owner_candidates(self, query: str, items: list[dict]) -> list[dict]:
+        candidates = []
+        by_id = {}
+        for index, item in enumerate(items):
+            text = str(item.get("memory") or "").strip()
+            metadata = item.get("metadata") or {}
+            canonical = _is_canonical_result(item)
+            conversation = metadata.get("source") == "conversation" or metadata.get("type") == "owner_conversation"
+            if not text or not (canonical or conversation):
+                continue
+            if conversation and "[role: user]" not in text and metadata.get("speaker") != "user":
+                continue
+            candidate_id = str(item.get("id") or f"candidate-{index}")
+            if candidate_id in by_id:
+                candidate_id = f"{candidate_id}-{index}"
+            candidate = {
+                "id": candidate_id,
+                "authority": "canonical" if canonical else "non-authoritative",
+                "source": "obsidian" if canonical else "conversation",
+                "speaker": metadata.get("speaker") or ("user-with-assistant-context" if conversation else "document"),
+                "timestamp": item.get("updated_at") or item.get("updatedAt") or "",
+                "text": text,
+            }
+            candidates.append(candidate)
+            by_id[candidate_id] = item
+        if len(candidates) <= 1:
+            return [by_id[candidates[0]["id"]]] if candidates else []
+        result = _call_owner_reranker(query, candidates)
+        if not isinstance(result, dict) or set(result) != {"selected_ids", "rejected_ids", "sufficient"}:
+            return []
+        selected = result.get("selected_ids")
+        rejected = result.get("rejected_ids")
+        sufficient = result.get("sufficient")
+        if not isinstance(selected, list) or not isinstance(rejected, list) or not isinstance(sufficient, bool):
+            return []
+        combined = selected + rejected
+        expected = set(by_id)
+        if (not all(isinstance(value, str) for value in combined)
+                or len(combined) != len(set(combined)) or set(combined) != expected):
+            return []
+        if not sufficient or not selected:
+            return []
+        return [by_id[candidate_id] for candidate_id in selected]
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if not self._active or not self._auto_recall or not self._client or not query.strip():
             return ""
         try:
-            canonical_owner = self._container_tag == "owner_primary"
+            canonical_owner = self._container_tag == _OWNER_CANONICAL_CONTAINER
             recall_query = _owner_canonical_query(query) if canonical_owner else query
             profile = self._client.get_profile(query=recall_query[:200])
             include_profile = self._turn_count <= 1 or (self._turn_count % self._profile_frequency == 0)
             search_results = _authoritative_search_results(profile["search_results"])
-            search_results, named_restaurant = _scope_owner_restaurant_results(query, search_results)
+            named_restaurant = False
+            if canonical_owner:
+                search_results, named_restaurant = _scope_owner_restaurant_results(query, search_results)
+                search_results = _rank_owner_canonical_results(query, search_results)
+                conversation_results = self._client.search_memories(
+                    query, limit=20, container_tag=_OWNER_CONVERSATION_CONTAINER, search_mode=self._search_mode
+                )
+                search_results = self._rerank_owner_candidates(query, search_results + conversation_results)
+            else:
+                search_results, named_restaurant = _scope_owner_restaurant_results(query, search_results)
             context = _format_prefetch_context(
                 static_facts=profile["static"] if include_profile and not canonical_owner else [],
                 dynamic_facts=profile["dynamic"] if include_profile and not canonical_owner else [],
                 search_results=(
-                    _rank_owner_canonical_results(
-                        query,
-                        search_results,
-                    )
-                    if canonical_owner
-                    else profile["search_results"]
+                    search_results if canonical_owner else profile["search_results"]
                 ),
                 # Recalled blocks persist in prior user messages. Keep the 8K
                 # retrieval runner below its context threshold across turns.
@@ -957,7 +1060,32 @@ class SupermemoryMemoryProvider(MemoryProvider):
             self._session_id = capture_session_id
             self._session_turns = []
 
-        if messages is not None:
+        owner_capture = self._container_tag == _OWNER_CANONICAL_CONTAINER
+        if owner_capture:
+            clean_user = _clean_text_for_capture(user_content)
+            clean_assistant = _clean_text_for_capture(assistant_content)
+            if messages is not None:
+                completed = []
+                pending_user = ""
+                for message in messages:
+                    role = str(message.get("role") or "")
+                    content = message.get("content")
+                    if not isinstance(content, str):
+                        continue
+                    if role == "user":
+                        pending_user = _clean_text_for_capture(content)
+                    elif role == "assistant" and pending_user:
+                        completed.append((pending_user, _clean_text_for_capture(content)))
+                        pending_user = ""
+                worthy = [(user, assistant) for user, assistant in completed if _is_capture_worthy_owner_statement(user)]
+            else:
+                worthy = [(clean_user, clean_assistant)] if _is_capture_worthy_owner_statement(clean_user) else []
+            cleaned = []
+            for user, assistant in worthy:
+                cleaned.append({"role": "user", "content": user})
+                if assistant:
+                    cleaned.append({"role": "assistant-context", "content": assistant})
+        elif messages is not None:
             cleaned = self._clean_conversation(messages)
             self._session_turns = [
                 {"user": m["content"], "assistant": ""} if m["role"] == "user"
@@ -976,15 +1104,22 @@ class SupermemoryMemoryProvider(MemoryProvider):
                     cleaned.append({"role": "assistant", "content": turn["assistant"]})
         if not cleaned:
             return
+        metadata = {
+            "type": "owner_conversation" if owner_capture else "user_conversation",
+            "session_id": capture_session_id,
+            "message_count": len(cleaned),
+        }
+        if owner_capture:
+            metadata.update({
+                "authority": "non-authoritative",
+                "provenance": "role-delimited; assistant-context is non-evidence",
+            })
         self._client.add_memory(
             self._format_conversation(cleaned),
-            metadata={
-                "type": "user_conversation",
-                "session_id": capture_session_id,
-                "message_count": len(cleaned),
-            },
+            metadata=metadata,
             entity_context=self._entity_context,
-            custom_id=f"hermes-session:{capture_session_id}",
+            container_tag=_OWNER_CONVERSATION_CONTAINER if owner_capture else None,
+            custom_id=(f"hermes-owner-conversation:{capture_session_id}" if owner_capture else f"hermes-session:{capture_session_id}"),
             task_type="memory",
         )
 
