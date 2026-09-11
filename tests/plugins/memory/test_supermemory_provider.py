@@ -243,20 +243,16 @@ def test_owner_parents_plural_ranks_direct_parent_evidence():
     assert _rank_owner_canonical_results("Who are my parents?", [unrelated, correct])[0] is correct
 
 
-def test_owner_parent_query_expands_spouse_parent_relationship():
+def test_owner_parent_query_does_not_rewrite_indirect_relationship():
     from plugins.memory.supermemory import _owner_canonical_query
 
-    expanded = _owner_canonical_query("Who is my wife's father?")
-    assert "Resolve Dennis Malone's wife, then that spouse's father." in expanded
-    assert "Require canonical evidence for both relationship edges." in expanded
+    query = "Who is my wife's father?"
+    assert _owner_canonical_query(query) == query
     query = "Who is my father's brother?"
     assert _owner_canonical_query(query) == query
     query = "Who is my father-in-law?"
     assert _owner_canonical_query(query) == query
     assert "Resolve Dennis Malone parent relationship: father or dad." in _owner_canonical_query("What is my dad's name?")
-    spouse_parent = _owner_canonical_query("Who is my wife's dad?")
-    assert "Resolve Dennis Malone's wife, then that spouse's father." in spouse_parent
-    assert "Require canonical evidence for both relationship edges." in spouse_parent
 
 
 def test_owner_mother_in_law_query_ranks_direct_profile_without_rewrite():

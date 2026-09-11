@@ -377,18 +377,6 @@ def _owner_canonical_query(query: str) -> str:
     """
     text = (query or "").strip()
     lowered = text.lower()
-    spouse_parent = re.search(
-        r"\bmy\s+(wife|husband|spouse)['’]s\s+(dad|father|mom|mother)\b",
-        lowered,
-    )
-    if spouse_parent:
-        spouse_term, parent_term = spouse_parent.groups()
-        parent_relation = "father" if parent_term in {"dad", "father"} else "mother"
-        return (
-            f"{text} Authenticated requester: Dennis Malone. "
-            f"Resolve Dennis Malone's {spouse_term}, then that spouse's {parent_relation}. "
-            "Require canonical evidence for both relationship edges."
-        )
     father = bool(re.search(r"\bmy\s+(?:dad|father)\b(?!-in-law)(?!['’]s(?!\s+name\b))", lowered))
     mother = bool(re.search(r"\bmy\s+(?:mom|mother)\b(?!-in-law)(?!['’]s(?!\s+name\b))", lowered))
     parents = bool(re.search(r"\bmy\s+parents?\b", lowered))
