@@ -2936,7 +2936,6 @@ def init_agent(
     )
     _allow_retrieval_qwen_below_floor = (
         str(getattr(agent, "model", "") or "").strip().lower() == "qwen3.5:4b"
-        and str(getattr(agent, "provider", "") or "").strip().lower() == "local-qwen"
         and _ctx == 8192
     )
     if (
