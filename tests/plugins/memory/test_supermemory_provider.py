@@ -262,6 +262,57 @@ def test_owner_mother_in_law_query_ranks_direct_profile_without_rewrite():
     assert _rank_owner_canonical_results(query, [generic, courtnee, mary]) == [mary, courtnee, generic]
 
 
+@pytest.mark.parametrize("query", [
+    "What does Courtnee normally get at Zips?",
+    "What does Dennis get at Zipp's?",
+    "What does the family think about Zipp’s?",
+])
+def test_owner_named_restaurant_recall_keeps_only_exact_note_and_reciprocal_dishes(provider, query):
+    provider._container_tag = "owner_primary"
+    canonical = {"source": "obsidian", "authority": "canonical"}
+    zipps = {"memory": "restaurant: Zipp's\n### Courtnee\n- Mozzarella Sticks — prefers ranch.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Restaurants/Zipp's.md"}}
+    mozzarella = {"memory": "# Mozzarella Sticks\n- [[Restaurants/Zipp's]] — Courtnee likes them with ranch.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Dishes/Mozzarella Sticks.md"}}
+    parlay = {"memory": "restaurant: Parlay\nCourtnee ordered the Honey Hot Chicken Sandwich.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Restaurants/Parlay.md"}}
+    chicken = {"memory": "# Chicken Sandwiches\n- [[Restaurants/Parlay]] — Courtnee rated it 3/5.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Dishes/Chicken Sandwiches.md"}}
+    provider._client.profile_response = {"static": [], "dynamic": [], "search_results": [parlay, chicken, mozzarella, zipps]}
+
+    result = provider.prefetch(query)
+
+    assert "prefers ranch" in result
+    assert "Mozzarella Sticks" in result
+    assert "Honey Hot Chicken Sandwich" not in result
+    assert "3/5" not in result
+    assert result.index("restaurant: Zipp's") < result.index("# Mozzarella Sticks")
+
+
+def test_owner_named_parlay_recall_excludes_zipps_person_collision(provider):
+    provider._container_tag = "owner_primary"
+    canonical = {"source": "obsidian", "authority": "canonical"}
+    provider._client.profile_response = {"static": [], "dynamic": [], "search_results": [
+        {"memory": "restaurant: Zipp's\nCourtnee likes mozzarella sticks with ranch.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Restaurants/Zipp's.md"}},
+        {"memory": "# Chicken Sandwiches\n- [[Restaurants/Parlay]] — Courtnee rated the Honey Hot Chicken Sandwich 3/5.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Dishes/Chicken Sandwiches.md"}},
+        {"memory": "restaurant: Parlay\nCourtnee liked the sweet heat but disliked the breading and bun.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Restaurants/Parlay.md"}},
+    ]}
+
+    result = provider.prefetch("What did Courtnee think about Parlay?")
+
+    assert "sweet heat" in result
+    assert "Honey Hot Chicken Sandwich" in result
+    assert "mozzarella sticks" not in result
+
+
+def test_owner_named_restaurant_query_targets_canonical_venue_records():
+    from plugins.memory.supermemory import _owner_canonical_query
+
+    assert _owner_canonical_query("What does Courtnee normally get at Zips?") == (
+        "What does Courtnee normally get at Zips? Canonical restaurant venue: Zips. "
+        "Prefer the exact Food/Restaurants note and reciprocal Food/Dishes records for Zips; exclude other venues."
+    )
+    assert _owner_canonical_query("What did Courtnee think about Parlay?").endswith(
+        "reciprocal Food/Dishes records for Parlay; exclude other venues."
+    )
+
+
 def test_sync_turn_buffers_short_messages(provider):
     provider.sync_turn("ok", "sure", session_id="session-1")
     assert len(provider._client.add_calls) == 1

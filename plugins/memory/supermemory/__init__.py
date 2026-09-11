@@ -230,6 +230,53 @@ def _authoritative_search_results(search_results: list) -> list:
     return [item for item in search_results or [] if _is_canonical_result(item)]
 
 
+def _restaurant_key(text: str) -> str:
+    """Normalize spoken punctuation and harmless doubled consonants."""
+    compact = re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+    return re.sub(r"([a-z])\1+", r"\1", compact)
+
+
+def _scope_owner_restaurant_results(query: str, results: list) -> tuple[list, bool]:
+    """Keep a named venue's canonical note and its reciprocal dish notes.
+
+    Person names recur across restaurant notes, so semantic similarity alone
+    can otherwise transfer an order from a different venue.
+    """
+    query_key = _restaurant_key(query)
+    restaurants: list[tuple[str, dict]] = []
+    for item in results or []:
+        metadata = item.get("metadata") or {}
+        relative_path = str(metadata.get("relative_path") or "")
+        match = re.search(r"/Food/Restaurants/([^/]+)\.md$", relative_path, re.IGNORECASE)
+        if match:
+            restaurants.append((match.group(1), item))
+    named = [(name, item) for name, item in restaurants if _restaurant_key(name) in query_key]
+    if not named:
+        return results, False
+
+    # Prefer the longest match if one venue name contains another.
+    venue, exact = max(named, key=lambda pair: len(_restaurant_key(pair[0])))
+    venue_key = _restaurant_key(venue)
+    reciprocal = []
+    for item in results or []:
+        metadata = item.get("metadata") or {}
+        relative_path = str(metadata.get("relative_path") or "")
+        if not re.search(r"/Food/Dishes/[^/]+\.md$", relative_path, re.IGNORECASE):
+            continue
+        memory_key = _restaurant_key(str(item.get("memory") or ""))
+        if f"restaurants{venue_key}" in memory_key:
+            reciprocal.append(item)
+    query_words = {
+        word for word in re.findall(r"\b[A-Z][a-z]+\b", query or "")
+        if word not in {"What", "Where", "When", "Who", "Does", "Did", "Tell"}
+    }
+    reciprocal.sort(key=lambda item: not any(
+        re.search(rf"\b{re.escape(word)}\b", str(item.get("memory") or ""))
+        for word in query_words
+    ))
+    return [exact, *reciprocal], True
+
+
 def _owner_canonical_query(query: str) -> str:
     """Resolve first-person parent terms against the authenticated Owner.
 
@@ -257,6 +304,19 @@ def _owner_canonical_query(query: str) -> str:
         return (
             f"{text} Authenticated requester: Dennis Malone. "
             "Resolve Dennis Malone parent relationship: father, dad, mother, or mom."
+        )
+    venue_match = re.search(
+        r"\b(?:at|about|from)\s+([A-Za-z0-9][A-Za-z0-9 &'’.-]{0,80}?)(?:\s*[?.!]|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if venue_match:
+        venue = venue_match.group(1).strip()
+        if re.match(r"^(?:my|his|her|their|our|the)\b", venue, re.IGNORECASE):
+            return text
+        return (
+            f"{text} Canonical restaurant venue: {venue}. "
+            f"Prefer the exact Food/Restaurants note and reciprocal Food/Dishes records for {venue}; exclude other venues."
         )
     return text
 
@@ -835,13 +895,15 @@ class SupermemoryMemoryProvider(MemoryProvider):
             recall_query = _owner_canonical_query(query) if canonical_owner else query
             profile = self._client.get_profile(query=recall_query[:200])
             include_profile = self._turn_count <= 1 or (self._turn_count % self._profile_frequency == 0)
+            search_results = _authoritative_search_results(profile["search_results"])
+            search_results, named_restaurant = _scope_owner_restaurant_results(query, search_results)
             context = _format_prefetch_context(
                 static_facts=profile["static"] if include_profile and not canonical_owner else [],
                 dynamic_facts=profile["dynamic"] if include_profile and not canonical_owner else [],
                 search_results=(
                     _rank_owner_canonical_results(
                         query,
-                        _authoritative_search_results(profile["search_results"]),
+                        search_results,
                     )
                     if canonical_owner
                     else profile["search_results"]
@@ -850,6 +912,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 # retrieval runner below its context threshold across turns.
                 max_results=(
                     2 if canonical_owner and re.search(r"\bmy\s+parents?\b", query, re.IGNORECASE)
+                    else 4 if canonical_owner and named_restaurant
                     else 1 if canonical_owner
                     else self._max_recall_results
                 ),
