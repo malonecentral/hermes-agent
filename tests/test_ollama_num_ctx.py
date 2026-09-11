@@ -143,7 +143,7 @@ class TestCompressorClampsToNumCtx:
     must not leave the compressor targeting the probed model window while
     requests run at the smaller served num_ctx."""
 
-    def _build_agent(self, cfg, probed_ctx):
+    def _build_agent(self, cfg, probed_ctx, *, model="gemma3:27b", provider=""):
         import agent.context_compressor as cc_mod
         with (
             patch("run_agent.get_tool_definitions", return_value=[]),
@@ -161,7 +161,8 @@ class TestCompressorClampsToNumCtx:
         ):
             from run_agent import AIAgent
             return AIAgent(
-                model="gemma3:27b",
+                model=model,
+                provider=provider,
                 api_key="ollama",
                 base_url="http://localhost:11434/v1",
                 quiet_mode=True,
@@ -187,3 +188,12 @@ class TestCompressorClampsToNumCtx:
         # num_ctx above the resolved window must not RAISE the compressor
         # window: the clamp is one-directional.
         assert agent.context_compressor.context_length == 65536
+
+    def test_pinned_retrieval_qwen_allows_8192_context(self):
+        agent = self._build_agent(
+            {"agent": {}, "model": {"ollama_num_ctx": 8192}},
+            probed_ctx=8192,
+            model="qwen3.5:4b",
+            provider="local-qwen",
+        )
+        assert agent.context_compressor.context_length == 8192

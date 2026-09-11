@@ -2934,7 +2934,17 @@ def init_agent(
         and not isinstance(agent._config_context_length, bool)
         and agent._config_context_length > 0
     )
-    if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH and not _allow_lmstudio_explicit_below_floor:
+    _allow_retrieval_qwen_below_floor = (
+        str(getattr(agent, "model", "") or "").strip().lower() == "qwen3.5:4b"
+        and str(getattr(agent, "provider", "") or "").strip().lower() == "local-qwen"
+        and _ctx == 8192
+    )
+    if (
+        _ctx
+        and _ctx < MINIMUM_CONTEXT_LENGTH
+        and not _allow_lmstudio_explicit_below_floor
+        and not _allow_retrieval_qwen_below_floor
+    ):
         raise ValueError(
             f"Model {agent.model} has a context window of {_ctx:,} tokens, "
             f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "
