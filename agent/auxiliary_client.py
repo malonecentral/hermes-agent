@@ -10575,7 +10575,7 @@ def _call_llm_impl(
             # same-provider retry for compression on a full-budget timeout and
             # fall straight through to provider/model fallback; fast blips (a
             # streaming-close or a 5xx) still retry, since those are cheap.
-            if task == "compression" and _is_timeout_error(transient_err):
+            if task in {"compression", "title_generation"} and _is_timeout_error(transient_err):
                 # A fast first-token fail (dead stream detected within the
                 # 60s no-progress window, zero output seen) is cheap — take
                 # the normal same-provider retry chain first; the provider
@@ -11404,7 +11404,7 @@ async def _async_call_llm_impl(
             # See call_llm(): compression is on the critical preflight path,
             # so skip the same-provider retry on a full-budget timeout and
             # fall straight through to fallback (issue #54465).
-            if task == "compression" and _is_timeout_error(transient_err):
+            if task in {"compression", "title_generation"} and _is_timeout_error(transient_err):
                 logger.info(
                     "Auxiliary compression (async): timeout on the critical "
                     "path; skipping same-provider retry and falling back: %s",

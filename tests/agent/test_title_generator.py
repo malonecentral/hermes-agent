@@ -46,6 +46,37 @@ class TestGenerateTitle:
         assert captured_kwargs["task"] == "title_generation"
         assert captured_kwargs["timeout"] is None
 
+    def test_same_runtime_ollama_title_generation_is_bounded(self):
+        """A background title call cannot hold Ollama's single runner slot."""
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "Bounded Local Title"
+
+        with patch("agent.title_generator.call_llm", return_value=response) as call:
+            assert generate_title(
+                "question",
+                main_runtime={
+                    "provider": "ollama",
+                    "base_url": "http://mcomen.malonecentral.com:11434/v1",
+                },
+            ) == "Bounded Local Title"
+
+        assert call.call_args.kwargs["timeout"] == 2.0
+
+    def test_same_runtime_ollama_preserves_shorter_caller_deadline(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "Shorter Local Deadline"
+
+        with patch("agent.title_generator.call_llm", return_value=response) as call:
+            generate_title(
+                "question",
+                timeout=0.5,
+                main_runtime={"base_url": "http://127.0.0.1:11434/v1"},
+            )
+
+        assert call.call_args.kwargs["timeout"] == 0.5
+
 
 
     def test_strips_think_blocks(self):
@@ -244,6 +275,32 @@ class TestAutoTitleSession:
 
 class TestMaybeAutoTitle:
     """Tests for maybe_auto_title() — the fire-and-forget entry point."""
+
+    def test_local_qwen_keeps_deterministic_title_without_auxiliary_call(self):
+        db = MagicMock()
+        db.get_session_title_source.return_value = None
+        db.set_auto_title.return_value = True
+
+        with (
+            patch("agent.title_generator._auto_title_enabled", return_value=True),
+            patch("agent.title_generator.auto_title_session") as model_title,
+            patch("agent.title_generator.threading.Thread") as thread,
+        ):
+            maybe_auto_title(
+                db,
+                "sess-local",
+                "Who am I?",
+                [],
+                main_runtime={
+                    "model": "qwen3.5:4b",
+                    "provider": "local-qwen",
+                    "base_url": "http://mcomen.malonecentral.com:11434/v1",
+                },
+            )
+
+        db.set_auto_title.assert_called_once()
+        model_title.assert_not_called()
+        thread.assert_not_called()
 
     def test_skips_if_not_first_exchange(self):
         """Should not fire once the conversation is past its opening turn."""

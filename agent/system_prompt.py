@@ -65,9 +65,12 @@ _PLUGIN_SECTION_FRAME_RE = re.compile(
 )
 
 _QWEN_FACT_RETRIEVAL_GUIDANCE = """# Local Qwen operating mode
-You are Jarvis's concise factual-retrieval model, not a creative-writing model.
+You are Jarvis, Dennis's concise factual-retrieval assistant, not a creative-writing model.
+- The authenticated user and requester is Dennis. If Dennis asks “Who am I?”, answer that he is Dennis; never substitute a retrieved third party.
 - Answer only the question asked in one sentence of at most 35 words.
 - State retrieved facts plainly. Do not repeat the same fact in an introduction, body, and summary.
+- For relationship questions, state only the relationship; never mention calendars, retrieval, records, or other provenance.
+- For food preferences, preserve the named person's attribution and explicit ranking. Never promote a merely liked item over an explicitly identified favorite.
 - Do not add stories, recommendations, marketing language, speculation, inferred enthusiasm, or unsupported conclusions.
 - Do not use emoji, decorative headings, checkmarks, blockquotes, or filler such as “Based on the provided context.”
 - Do not call tools. Answer only from automatically supplied context; if it does not contain the answer, say “I don't know.”
@@ -75,6 +78,51 @@ You are Jarvis's concise factual-retrieval model, not a creative-writing model.
 - Never turn another person's retrieved record into the requester's identity. The authenticated Owner is Dennis.
 - If the requested fact is not supported, say “I don't know” briefly rather than inventing an answer.
 """
+
+
+def _is_local_qwen(agent: Any) -> bool:
+    """Whether this agent is the pinned retrieval-only Ollama runtime."""
+    return (getattr(agent, "model", "") or "").lower() == "qwen3.5:4b"
+
+
+def _build_local_qwen_prompt_parts(agent: Any, *, context_length: Optional[int]) -> Dict[str, str]:
+    """Build the bounded retrieval prompt for the 8K local Qwen runner.
+
+    Automatic external-memory recall is attached to the current user message
+    by ``build_turn_context``. This cached prefix therefore needs only Jarvis
+    identity, canonical local memory, and the evidence contract.
+    """
+    _r = _ra()
+    home = _agent_home(agent)
+    soul = _r.load_soul_md(context_length, home_override=home)
+    if not soul and home is not None:
+        try:
+            soul = (home / "SOUL.md").read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            soul = ""
+    stable = soul or DEFAULT_AGENT_IDENTITY
+
+    memory_parts: List[str] = []
+    store = getattr(agent, "_memory_store", None)
+    if store:
+        if getattr(agent, "_memory_enabled", True):
+            block = store.format_for_system_prompt("memory")
+            if block:
+                memory_parts.append(block)
+        if getattr(agent, "_user_profile_enabled", True):
+            block = store.format_for_system_prompt("user")
+            if block:
+                memory_parts.append(block)
+
+    return {
+        "stable": stable.strip(),
+        "context": "",
+        "volatile": "\n\n".join(
+            part.strip()
+            for part in (*memory_parts, _QWEN_FACT_RETRIEVAL_GUIDANCE)
+            if part and part.strip()
+        ),
+    }
 
 
 def _ra():
@@ -477,6 +525,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         _cc_len = getattr(_cc, "context_length", None)
         if isinstance(_cc_len, int) and _cc_len > 0:
             _ctx_len = _cc_len
+
+    if _is_local_qwen(agent):
+        return _build_local_qwen_prompt_parts(agent, context_length=_ctx_len)
 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []

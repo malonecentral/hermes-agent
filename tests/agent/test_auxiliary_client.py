@@ -2083,11 +2083,9 @@ class TestTransientTransportRetry:
         assert client.chat.completions.create.call_count == 1
 
 
-    def test_compression_skips_same_provider_retry_on_timeout(self):
-        """A timeout on the critical compression path must NOT retry the same
-        provider (that doubles the user-visible stall, issue #54465) — it
-        falls straight through to the fallback chain instead.
-        """
+    @pytest.mark.parametrize("task", ["compression", "title_generation"])
+    def test_bounded_tasks_skip_same_provider_retry_on_timeout(self, task):
+        """Bounded tasks must not multiply their deadline with retries."""
         class _Timeout(Exception):
             pass
         _Timeout.__name__ = "APITimeoutError"
@@ -2112,7 +2110,7 @@ class TestTransientTransportRetry:
                 return_value=(fb_client, "fb-model", "openai"),
             ),
         ):
-            result = call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
+            result = call_llm(task=task, messages=[{"role": "user", "content": "hi"}])
         assert result == {"fallback": True}
         # Primary tried ONCE only — no same-provider timeout retry — then fallback.
         assert primary.chat.completions.create.call_count == 1

@@ -111,6 +111,37 @@ def test_prefetch_includes_profile_on_first_turn(provider):
     assert "User Profile (Persistent)" in result
     assert "Recent Context" in result
     assert "Relevant Memories" in result
+    assert "authenticated Owner/requester is Dennis" not in result
+
+
+def test_non_owner_prefetch_retains_user_conversation_evidence(provider):
+    provider._client.profile_response = {
+        "static": [],
+        "dynamic": [],
+        "search_results": [
+            {"id": "user", "memory": "Jordan likes tea.", "metadata": {"type": "user_conversation"}},
+        ],
+    }
+    result = provider.prefetch("What does Jordan like?")
+    assert "Jordan likes tea" in result
+
+
+def test_owner_primary_prefetch_uses_only_canonical_documents(provider):
+    provider._container_tag = "owner_primary"
+    provider._client.profile_response = {
+        "static": ["Assistant-derived profile claim"],
+        "dynamic": ["Assistant-derived recent claim"],
+        "search_results": [
+            {"id": "bad", "memory": "[role: assistant] Wrong wife", "metadata": {"type": "conversation"}},
+            {"id": "good", "memory": "Dennis's wife is Courtnee.", "metadata": {"source": "obsidian", "authority": "canonical"}},
+        ],
+    }
+    provider.on_turn_start(1, "start")
+    result = provider.prefetch("Who is my wife?")
+    assert "Courtnee" in result
+    assert "authenticated Owner/requester is Dennis" in result
+    assert "Assistant-derived" not in result
+    assert "Wrong wife" not in result
 
 
 def test_sync_turn_buffers_short_messages(provider):
@@ -118,7 +149,7 @@ def test_sync_turn_buffers_short_messages(provider):
     assert len(provider._client.add_calls) == 1
 
 
-def test_sync_turn_writes_growing_clean_conversation_with_stable_id(provider):
+def test_sync_turn_writes_only_user_claims_with_stable_id(provider):
     messages = [
         {"role": "system", "content": "private system prompt"},
         {"role": "user", "content": "First ordinary user message"},
@@ -133,6 +164,7 @@ def test_sync_turn_writes_growing_clean_conversation_with_stable_id(provider):
     assert "private system prompt" not in first["content"]
     assert "private tool output" not in first["content"]
     assert "[role: user]\nFirst ordinary user message\n[user:end]" in first["content"]
+    assert "First ordinary assistant reply" not in first["content"]
 
     messages += [
         {"role": "user", "content": "Second message"},
@@ -143,11 +175,23 @@ def test_sync_turn_writes_growing_clean_conversation_with_stable_id(provider):
     assert second["custom_id"] == first["custom_id"]
     assert first["content"] in second["content"]
     assert "injected" not in second["content"]
+    assert "Second reply" not in second["content"]
     assert second["metadata"] == {
-        "type": "conversation",
+        "type": "user_conversation",
         "session_id": "session-1",
-        "message_count": 4,
+        "message_count": 2,
     }
+
+
+def test_owner_primary_disables_automatic_capture(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({"container_tag": "owner_primary", "auto_capture": True}, str(tmp_path))
+    p = SupermemoryMemoryProvider()
+    p.initialize("owner-session", hermes_home=str(tmp_path), platform="cli")
+    assert p._auto_capture is False
+    p.sync_turn("Dennis likes this", "Untrusted assistant assertion", session_id="owner-session")
+    assert p._client.add_calls == []
 
 
 def test_sync_turn_fallback_accumulates_turns_and_isolates_sessions(provider):

@@ -602,6 +602,20 @@ class ChatCompletionsTransport(ProviderTransport):
         # Gemini targets and stripped for strict non-Gemini providers.
         sanitized = self.convert_messages(messages, model=model)
 
+        # Qwen3.5's Ollama chat template honors thinking suppression at the
+        # tail of the current user message. Add it only to the wire copy: the
+        # persisted/displayed user text remains untouched.
+        if (model or "").lower() == "qwen3.5:4b":
+            sanitized = list(sanitized)
+            for index in range(len(sanitized) - 1, -1, -1):
+                message = sanitized[index]
+                if message.get("role") == "user" and isinstance(message.get("content"), str):
+                    sanitized[index] = {
+                        **message,
+                        "content": message["content"].rstrip() + "\n/no_think",
+                    }
+                    break
+
         # ── Provider profile: single-path when present ──────────────────
         _profile = params.get("provider_profile")
         if _profile:

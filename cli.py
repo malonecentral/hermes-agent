@@ -5518,8 +5518,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         self.disabled_toolsets = parse_config_string_list(CLI_CONFIG["agent"].get("disabled_toolsets"))
 
-        if toolsets and "all" not in toolsets and "*" not in toolsets:
-            # Validate each toolset — MCP server names are resolved via
+        if (
+            toolsets
+            and "all" not in toolsets
+            and "*" not in toolsets
+            and (model or "").lower() != "qwen3.5:4b"
+        ):
+            # The pinned Qwen route intentionally sends no tools; configured
+            # toolsets are irrelevant there and must not emit startup warnings.
             # live registry aliases (registered during discover_mcp_tools),
             # but discovery hasn't run yet at this point, so exclude them.
             mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())

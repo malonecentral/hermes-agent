@@ -400,6 +400,15 @@ def generate_title(
     ]
 
     try:
+        # Ollama serves one runner slot by default. Its OpenAI-compatible Qwen
+        # path can ignore structured-output/max-token bounds while thinking,
+        # so an auto-title request must not monopolize the slot ahead of the
+        # real turn. Keep the upgrade best-effort and tightly bounded; the
+        # deterministic title is already persisted before this background call.
+        runtime_base = str((main_runtime or {}).get("base_url") or "").lower()
+        title_timeout = timeout
+        if "11434" in runtime_base:
+            title_timeout = min(float(timeout), 2.0) if timeout is not None else 2.0
         response = call_llm(
             task="title_generation",
             messages=messages,
@@ -407,7 +416,7 @@ def generate_title(
             # chatty model burn seconds generating prose we then threw away.
             max_tokens=64,
             temperature=0.3,
-            timeout=timeout,
+            timeout=title_timeout,
             main_runtime=main_runtime,
             extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
         )
@@ -746,6 +755,19 @@ def maybe_auto_title(
         return
 
     apply_instant_title(session_db, session_id, user_message, title_callback)
+
+    # The pinned local Qwen runtime is retrieval-only and Ollama commonly
+    # serves it through a single runner slot. The deterministic title above is
+    # already sufficient; never enqueue an auxiliary model request that can
+    # delay the user's real turn or consume most of the runner context.
+    runtime = main_runtime or {}
+    runtime_model = str(runtime.get("model") or "").lower()
+    runtime_provider = str(runtime.get("provider") or "").lower()
+    runtime_base = str(runtime.get("base_url") or "").lower()
+    if runtime_model == "qwen3.5:4b" and (
+        runtime_provider in {"local-qwen", "ollama"} or "11434" in runtime_base
+    ):
+        return
 
     thread = threading.Thread(
         target=auto_title_session,

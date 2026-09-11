@@ -18,6 +18,18 @@ def transport():
 
 
 class TestChatCompletionsBasic:
+    def test_local_qwen_sends_no_tools_and_appends_no_think_on_wire_only(self, transport):
+        original = [{"role": "user", "content": "Who am I?"}]
+        kwargs = transport.build_kwargs(
+            model="qwen3.5:4b",
+            messages=original,
+            tools=[{"type": "function", "function": {"name": "unused"}}],
+        )
+
+        assert "tools" not in kwargs
+        assert kwargs["messages"][-1]["content"] == "Who am I?\n/no_think"
+        assert original[-1]["content"] == "Who am I?"
+
     @pytest.mark.parametrize(
         "choice",
         [SimpleNamespace(message=SimpleNamespace()), SimpleNamespace()],

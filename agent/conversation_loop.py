@@ -611,6 +611,10 @@ def _image_error_max_dimension(error: Exception) -> Optional[int]:
 
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
+    # The pinned local Qwen route is retrieval-only. Its transport emits zero
+    # callable tool schemas, so the general 64K tool-use floor does not apply.
+    if (getattr(agent, "model", "") or "").lower() == "qwen3.5:4b":
+        return None
     if not getattr(agent, "tools", None):
         return None
 

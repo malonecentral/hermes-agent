@@ -220,7 +220,33 @@ def _deduplicate_recall(static_facts: list, dynamic_facts: list, search_results:
     return out_static, out_dynamic, out_search
 
 
-def _format_prefetch_context(static_facts: list, dynamic_facts: list, search_results: list, max_results: int) -> str:
+def _is_canonical_result(item: dict) -> bool:
+    metadata = item.get("metadata") or {}
+    return metadata.get("authority") == "canonical" and metadata.get("source") == "obsidian"
+
+
+def _is_conversational_result(item: dict) -> bool:
+    metadata = item.get("metadata") or {}
+    text = str(item.get("memory") or "")
+    return metadata.get("type") in {"conversation", "user_conversation"} or "[role: assistant]" in text or text.startswith("Assistant:")
+
+
+def _authoritative_search_results(search_results: list) -> list:
+    """Prefer canonical documents and never ground facts in assistant transcripts."""
+    canonical = [item for item in search_results or [] if _is_canonical_result(item)]
+    if canonical:
+        return canonical
+    return [item for item in search_results or [] if not _is_conversational_result(item)]
+
+
+def _format_prefetch_context(
+    static_facts: list,
+    dynamic_facts: list,
+    search_results: list,
+    max_results: int,
+    *,
+    owner_context: bool = False,
+) -> str:
     statics, dynamics, search = _deduplicate_recall(static_facts, dynamic_facts, search_results)
     statics = statics[:max_results]
     dynamics = dynamics[:max_results]
@@ -257,10 +283,14 @@ def _format_prefetch_context(static_facts: list, dynamic_facts: list, search_res
     if not sections:
         return ""
 
-    intro = (
-        "The following is background context from long-term memory. Use it silently when relevant. "
-        "Do not force memories into the conversation."
-    )
+    intro = "The following is background context from long-term memory. Use it silently when relevant. "
+    if owner_context:
+        intro += (
+            "The authenticated Owner/requester is Dennis. Never infer that Dennis is another person merely because "
+            "a retrieved result describes that person; third-party records are context, not requester identity. "
+            "For identity questions, answer Dennis only when directly supported by Owner context, otherwise state uncertainty. "
+        )
+    intro += "Do not force memories into the conversation."
     body = "\n\n".join(sections)
     return f"<supermemory-context>\n{intro}\n\n{body}\n</supermemory-context>"
 
@@ -348,7 +378,12 @@ class _SupermemoryClient:
         for item in (getattr(response, "results", None) or []):
             results.append({
                 "id": getattr(item, "id", ""),
-                "memory": getattr(item, "memory", "") or "",
+                "memory": (
+                    getattr(item, "memory", "")
+                    or getattr(item, "chunk", "")
+                    or getattr(item, "content", "")
+                    or ""
+                ),
                 "similarity": getattr(item, "similarity", None),
                 "updated_at": getattr(item, "updated_at", None) or getattr(item, "updatedAt", None),
                 "metadata": getattr(item, "metadata", None),
@@ -378,6 +413,22 @@ class _SupermemoryClient:
                         "updated_at": getattr(item, "updated_at", None) or getattr(item, "updatedAt", None),
                         "similarity": getattr(item, "similarity", None),
                     })
+        if query and self._search_mode in {"hybrid", "documents"}:
+            hybrid_results = self.search_memories(
+                query,
+                limit=20,
+                container_tag=tag,
+                search_mode=self._search_mode,
+            )
+            seen = {
+                str(item.get("id") or "") + "\0" + str(item.get("memory") or "")
+                for item in search_results
+            }
+            for item in hybrid_results:
+                key = str(item.get("id") or "") + "\0" + str(item.get("memory") or "")
+                if item.get("memory") and key not in seen:
+                    search_results.append(item)
+                    seen.add(key)
         return {"static": static, "dynamic": dynamic, "search_results": search_results}
 
     def forget_memory(self, memory_id: str, *, container_tag: Optional[str] = None) -> None:
@@ -643,7 +694,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._container_tag = _sanitize_tag(raw_tag.replace("{identity}", identity))
 
         self._auto_recall = self._config["auto_recall"]
-        self._auto_capture = self._config["auto_capture"]
+        # owner_primary is a disposable Obsidian index, never a conversation authority.
+        self._auto_capture = self._config["auto_capture"] and self._container_tag != "owner_primary"
         self._max_recall_results = self._config["max_recall_results"]
         self._profile_frequency = self._config["profile_frequency"]
         self._capture_mode = self._config["capture_mode"]
@@ -703,11 +755,19 @@ class SupermemoryMemoryProvider(MemoryProvider):
         try:
             profile = self._client.get_profile(query=query[:200])
             include_profile = self._turn_count <= 1 or (self._turn_count % self._profile_frequency == 0)
+            canonical_owner = self._container_tag == "owner_primary"
             context = _format_prefetch_context(
-                static_facts=profile["static"] if include_profile else [],
-                dynamic_facts=profile["dynamic"] if include_profile else [],
-                search_results=profile["search_results"],
-                max_results=self._max_recall_results,
+                static_facts=profile["static"] if include_profile and not canonical_owner else [],
+                dynamic_facts=profile["dynamic"] if include_profile and not canonical_owner else [],
+                search_results=(
+                    _authoritative_search_results(profile["search_results"])
+                    if canonical_owner
+                    else profile["search_results"]
+                ),
+                # Recalled blocks persist in prior user messages. Keep the 8K
+                # retrieval runner below its context threshold across turns.
+                max_results=1 if canonical_owner else self._max_recall_results,
+                owner_context=canonical_owner,
             )
             return context
         except Exception:
@@ -719,7 +779,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
         cleaned: List[Dict[str, str]] = []
         for message in messages or []:
             role = str(message.get("role") or "")
-            if role not in {"user", "assistant"}:
+            # Assistant replies are generated claims, not personalization evidence.
+            if role != "user":
                 continue
             content = message.get("content", "")
             if not isinstance(content, str):
@@ -756,9 +817,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
             ]
         else:
             clean_user = _clean_text_for_capture(user_content)
-            clean_assistant = _clean_text_for_capture(assistant_content)
-            if clean_user or clean_assistant:
-                self._session_turns.append({"user": clean_user, "assistant": clean_assistant})
+            if clean_user:
+                self._session_turns.append({"user": clean_user, "assistant": ""})
             cleaned = []
             for turn in self._session_turns:
                 if turn.get("user"):
@@ -770,7 +830,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._client.add_memory(
             self._format_conversation(cleaned),
             metadata={
-                "type": "conversation",
+                "type": "user_conversation",
                 "session_id": capture_session_id,
                 "message_count": len(cleaned),
             },
