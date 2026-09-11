@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import threading
+import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -376,6 +377,18 @@ def _owner_canonical_query(query: str) -> str:
     """
     text = (query or "").strip()
     lowered = text.lower()
+    spouse_parent = re.search(
+        r"\bmy\s+(wife|husband|spouse)['’]s\s+(dad|father|mom|mother)\b",
+        lowered,
+    )
+    if spouse_parent:
+        spouse_term, parent_term = spouse_parent.groups()
+        parent_relation = "father" if parent_term in {"dad", "father"} else "mother"
+        return (
+            f"{text} Authenticated requester: Dennis Malone. "
+            f"Resolve Dennis Malone's {spouse_term}, then that spouse's {parent_relation}. "
+            "Require canonical evidence for both relationship edges."
+        )
     father = bool(re.search(r"\bmy\s+(?:dad|father)\b(?!-in-law)(?!['’]s(?!\s+name\b))", lowered))
     mother = bool(re.search(r"\bmy\s+(?:mom|mother)\b(?!-in-law)(?!['’]s(?!\s+name\b))", lowered))
     parents = bool(re.search(r"\bmy\s+parents?\b", lowered))
@@ -1018,8 +1031,18 @@ class SupermemoryMemoryProvider(MemoryProvider):
         candidates = candidates[:8]
         by_id = {candidate["id"]: by_id[candidate["id"]] for candidate in candidates}
         if len(candidates) <= 1:
+            logger.info("owner reranker bypassed candidates=%d reason=%s", len(candidates), "single" if candidates else "empty")
             return [by_id[candidates[0]["id"]]] if candidates else []
+        started = time.monotonic()
+        logger.info("owner reranker request model=%s candidates=%d", _OWNER_RERANK_MODEL, len(candidates))
         result = _call_owner_reranker(query, candidates)
+        logger.info(
+            "owner reranker response candidates=%d selected=%d sufficient=%s elapsed_ms=%d",
+            len(candidates),
+            len(result.get("selected_ids") or []) if isinstance(result, dict) else 0,
+            result.get("sufficient") if isinstance(result, dict) else None,
+            round((time.monotonic() - started) * 1000),
+        )
         if not isinstance(result, dict) or set(result) != {"selected_ids", "rejected_ids", "sufficient"}:
             return []
         selected = result.get("selected_ids")
