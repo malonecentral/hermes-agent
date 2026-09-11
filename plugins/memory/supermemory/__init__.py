@@ -1019,12 +1019,12 @@ class SupermemoryMemoryProvider(MemoryProvider):
         candidates = candidates[:8]
         by_id = {candidate["id"]: by_id[candidate["id"]] for candidate in candidates}
         if len(candidates) <= 1:
-            logger.info("owner reranker bypassed candidates=%d reason=%s", len(candidates), "single" if candidates else "empty")
+            logger.warning("owner reranker bypassed candidates=%d reason=%s", len(candidates), "single" if candidates else "empty")
             return [by_id[candidates[0]["id"]]] if candidates else []
         started = time.monotonic()
-        logger.info("owner reranker request model=%s candidates=%d", _OWNER_RERANK_MODEL, len(candidates))
+        logger.warning("owner reranker request model=%s candidates=%d", _OWNER_RERANK_MODEL, len(candidates))
         result = _call_owner_reranker(query, candidates)
-        logger.info(
+        logger.warning(
             "owner reranker response candidates=%d selected=%d sufficient=%s elapsed_ms=%d",
             len(candidates),
             len(result.get("selected_ids") or []) if isinstance(result, dict) else 0,
