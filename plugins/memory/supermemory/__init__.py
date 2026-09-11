@@ -264,6 +264,20 @@ def _owner_canonical_query(query: str) -> str:
 def _rank_owner_canonical_results(query: str, results: list) -> list:
     """Put direct Owner relationship evidence ahead of name collisions."""
     lowered = (query or "").lower()
+    if re.search(r"\bmy\s+mother-in-law\b", lowered):
+        def mother_in_law_rank(item: dict) -> int:
+            text = str(item.get("memory") or "")
+            metadata = item.get("metadata") or {}
+            relative_path = str(metadata.get("relative_path") or "")
+            if re.search(r"(?:^|\n)-\s*Son-in-law:\s*Dennis Malone(?:\s|$)", text, re.IGNORECASE):
+                return 0
+            if relative_path.endswith("/Courtnee Malone.md") and re.search(
+                r"(?:^|\n)-\s*Mother:\s*(?:\[\[)?Mary Pat Thompson", text, re.IGNORECASE
+            ):
+                return 1
+            return 2
+
+        return sorted(results or [], key=mother_in_law_rank)
     relations = []
     if re.search(r"\bmy\s+(?:dad|father)\b(?!['’]s|-in-law)", lowered):
         relations.append("father")

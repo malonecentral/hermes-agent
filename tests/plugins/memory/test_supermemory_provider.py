@@ -244,6 +244,24 @@ def test_owner_parent_query_does_not_rewrite_indirect_relationship():
     assert _owner_canonical_query(query) == query
 
 
+def test_owner_mother_in_law_query_ranks_direct_profile_without_rewrite():
+    from plugins.memory.supermemory import _owner_canonical_query, _rank_owner_canonical_results
+
+    query = "Tell me about my mother-in-law"
+    assert _owner_canonical_query(query) == query
+    canonical = {"source": "obsidian", "authority": "canonical"}
+    generic = {"memory": "Generic household summary", "metadata": canonical}
+    courtnee = {
+        "memory": "## Parents\n- Mother: [[Mary Pat Thompson]]",
+        "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/People/Courtnee Malone.md"},
+    }
+    mary = {
+        "memory": "# Mary Pat Thompson\n- Son-in-law: Dennis Malone\n- She enjoyed reading and crocheting.",
+        "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/People/Mary Pat Thompson.md"},
+    }
+    assert _rank_owner_canonical_results(query, [generic, courtnee, mary]) == [mary, courtnee, generic]
+
+
 def test_sync_turn_buffers_short_messages(provider):
     provider.sync_turn("ok", "sure", session_id="session-1")
     assert len(provider._client.add_calls) == 1
