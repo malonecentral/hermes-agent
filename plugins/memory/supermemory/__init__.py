@@ -225,18 +225,82 @@ def _is_canonical_result(item: dict) -> bool:
     return metadata.get("authority") == "canonical" and metadata.get("source") == "obsidian"
 
 
-def _is_conversational_result(item: dict) -> bool:
-    metadata = item.get("metadata") or {}
-    text = str(item.get("memory") or "")
-    return metadata.get("type") in {"conversation", "user_conversation"} or "[role: assistant]" in text or text.startswith("Assistant:")
-
-
 def _authoritative_search_results(search_results: list) -> list:
-    """Prefer canonical documents and never ground facts in assistant transcripts."""
-    canonical = [item for item in search_results or [] if _is_canonical_result(item)]
-    if canonical:
-        return canonical
-    return [item for item in search_results or [] if not _is_conversational_result(item)]
+    """Fail closed: Owner facts must come from canonical Obsidian documents."""
+    return [item for item in search_results or [] if _is_canonical_result(item)]
+
+
+def _owner_canonical_query(query: str) -> str:
+    """Resolve first-person parent terms against the authenticated Owner.
+
+    Supermemory embeds a short question such as ``Who is my dad?`` too broadly:
+    corpus policy text can outrank the actual person note.  Add the known
+    speaker identity and relation vocabulary to the search query only; this
+    changes neither the cached system prompt nor canonical authority.
+    """
+    text = (query or "").strip()
+    lowered = text.lower()
+    father = bool(re.search(r"\bmy\s+(?:dad|father)\b(?!['’]s|-in-law)", lowered))
+    mother = bool(re.search(r"\bmy\s+(?:mom|mother)\b(?!['’]s|-in-law)", lowered))
+    parents = bool(re.search(r"\bmy\s+parents?\b", lowered))
+    if father:
+        return (
+            f"{text} Authenticated requester: Dennis Malone. "
+            "Resolve Dennis Malone parent relationship: father or dad."
+        )
+    if mother:
+        return (
+            f"{text} Authenticated requester: Dennis Malone. "
+            "Resolve Dennis Malone parent relationship: mother or mom."
+        )
+    if parents:
+        return (
+            f"{text} Authenticated requester: Dennis Malone. "
+            "Resolve Dennis Malone parent relationship: father, dad, mother, or mom."
+        )
+    return text
+
+
+def _rank_owner_canonical_results(query: str, results: list) -> list:
+    """Put direct Owner relationship evidence ahead of name collisions."""
+    lowered = (query or "").lower()
+    relations = []
+    if re.search(r"\bmy\s+(?:dad|father)\b(?!['’]s|-in-law)", lowered):
+        relations.append("father")
+    if re.search(r"\bmy\s+(?:mom|mother)\b(?!['’]s|-in-law)", lowered):
+        relations.append("mother")
+    if not relations and re.search(r"\bmy\s+parents?\b", lowered):
+        relations = ["father", "mother"]
+    if not relations:
+        return results
+
+    direct_patterns = [
+        re.compile(
+            rf"(?:^|\n)\s*[-*]\s+(?![^\n]*(?:\bnot\b|\bfalse\b|\buntrue\b|\bincorrect\b|\bunknown\b|\bwhether\b))"
+            rf"[^\n]{{1,100}}?\bis\s+Dennis Malone['’]s\s+{relation}(?:[.,]|$)",
+            re.IGNORECASE,
+        )
+        for relation in relations
+    ]
+
+    def evidence_rank(item: dict) -> int:
+        text = str(item.get("memory") or "")
+        metadata = item.get("metadata") or {}
+        relative_path = str(metadata.get("relative_path") or "")
+        if any(pattern.search(text) for pattern in direct_patterns):
+            return 0
+        if relative_path.endswith("/Dennis Malone.md") and any(
+            re.search(
+                rf"(?:^|\n)-\s*{relation.title()}:\s*(?![^\n]*(?:\bnot\b|\bfalse\b|\buntrue\b|\bincorrect\b|\bunknown\b|\bwhether\b))",
+                text,
+                re.IGNORECASE,
+            )
+            for relation in relations
+        ):
+            return 0
+        return 1
+
+    return sorted(results or [], key=evidence_rank)
 
 
 def _format_prefetch_context(
@@ -753,20 +817,28 @@ class SupermemoryMemoryProvider(MemoryProvider):
         if not self._active or not self._auto_recall or not self._client or not query.strip():
             return ""
         try:
-            profile = self._client.get_profile(query=query[:200])
-            include_profile = self._turn_count <= 1 or (self._turn_count % self._profile_frequency == 0)
             canonical_owner = self._container_tag == "owner_primary"
+            recall_query = _owner_canonical_query(query) if canonical_owner else query
+            profile = self._client.get_profile(query=recall_query[:200])
+            include_profile = self._turn_count <= 1 or (self._turn_count % self._profile_frequency == 0)
             context = _format_prefetch_context(
                 static_facts=profile["static"] if include_profile and not canonical_owner else [],
                 dynamic_facts=profile["dynamic"] if include_profile and not canonical_owner else [],
                 search_results=(
-                    _authoritative_search_results(profile["search_results"])
+                    _rank_owner_canonical_results(
+                        query,
+                        _authoritative_search_results(profile["search_results"]),
+                    )
                     if canonical_owner
                     else profile["search_results"]
                 ),
                 # Recalled blocks persist in prior user messages. Keep the 8K
                 # retrieval runner below its context threshold across turns.
-                max_results=1 if canonical_owner else self._max_recall_results,
+                max_results=(
+                    2 if canonical_owner and re.search(r"\bmy\s+parents?\b", query, re.IGNORECASE)
+                    else 1 if canonical_owner
+                    else self._max_recall_results
+                ),
                 owner_context=canonical_owner,
             )
             return context

@@ -20,6 +20,7 @@ class FakeClient:
     def __init__(self, api_key: str, timeout: float, container_tag: str, search_mode: str = "hybrid",
                  base_url: str = ""):
         self.api_key = api_key
+        self.profile_queries = []
         self.timeout = timeout
         self.container_tag = container_tag
         self.search_mode = search_mode
@@ -47,6 +48,7 @@ class FakeClient:
         return self.search_results
 
     def get_profile(self, query=None, *, container_tag=None):
+        self.profile_queries.append(query)
         return self.profile_response
 
     def forget_memory(self, memory_id, *, container_tag=None):
@@ -142,6 +144,104 @@ def test_owner_primary_prefetch_uses_only_canonical_documents(provider):
     assert "authenticated Owner/requester is Dennis" in result
     assert "Assistant-derived" not in result
     assert "Wrong wife" not in result
+
+
+def test_owner_primary_prefetch_resolves_speaker_relative_parent_query(provider):
+    provider._container_tag = "owner_primary"
+    provider._client.profile_response = {
+        "static": [],
+        "dynamic": [],
+        "search_results": [
+            {
+                "id": "collision",
+                "memory": "Dennis William Malone is Dennis Malone’s paternal uncle; Phillip D. Malone is his sibling.",
+                "metadata": {
+                    "source": "obsidian",
+                    "authority": "canonical",
+                    "relative_path": "Jarvis/Family Shared/People/Dennis William Malone.md",
+                },
+            },
+            {
+                "id": "father",
+                "memory": "- Phillip D. Malone is Dennis Malone’s father.",
+                "metadata": {"source": "obsidian", "authority": "canonical"},
+            }
+        ],
+    }
+
+    # Exact fourth-turn sequence from the production regression. Prior recall
+    # blocks stay in message history, so each turn must remain a one-result
+    # current-query lookup rather than growing static family context.
+    result = ""
+    for turn, query in enumerate(
+        ["Who am I?", "Who is my wife?", "What is my favorite order at Ike's?", "Who is my dad?"],
+        start=1,
+    ):
+        provider.on_turn_start(turn, query)
+        result = provider.prefetch(query)
+
+    assert provider._client.profile_queries[-1] == (
+        "Who is my dad? Authenticated requester: Dennis Malone. "
+        "Resolve Dennis Malone parent relationship: father or dad."
+    )
+    assert "Phillip D. Malone is Dennis Malone’s father" in result
+    assert result.count("## Relevant Memories") == 1
+
+
+def test_owner_primary_fails_closed_without_canonical_evidence(provider):
+    provider._container_tag = "owner_primary"
+    provider._client.profile_response = {
+        "static": ["Profile claim"],
+        "dynamic": [],
+        "search_results": [
+            {"memory": "Unmarked claim: somebody is Dennis Malone’s father."},
+            {"memory": "[role: assistant] Invented father", "metadata": {"type": "conversation"}},
+        ],
+    }
+    assert provider.prefetch("Who is my dad?") == ""
+
+
+def test_owner_parent_ranking_rejects_reversed_indirect_and_negated_claims():
+    from plugins.memory.supermemory import _rank_owner_canonical_results
+
+    canonical = {"source": "obsidian", "authority": "canonical"}
+    correct = {"memory": "- Phillip is Dennis Malone’s father.", "metadata": canonical}
+    distractors = [
+        {"memory": "- Dennis Malone is Alex’s father.", "metadata": canonical},
+        {"memory": "- Dennis Malone’s wife’s father is Robert.", "metadata": canonical},
+        {"memory": "- Dennis Malone is not the father of Alex.", "metadata": canonical},
+        {"memory": "- Robert is Dennis Malone’s father’s brother.", "metadata": canonical},
+        {"memory": "- It is false that Robert is Dennis Malone’s father.", "metadata": canonical},
+        {"memory": "- Robert D. Malone is Dennis Malone’s father, but that claim is false.", "metadata": canonical},
+        {"memory": "- It is untrue that Robert is Dennis Malone’s father.", "metadata": canonical},
+        {"memory": "- Robert is Dennis Malone’s father, which is incorrect.", "metadata": canonical},
+        {
+            "memory": "- Father: Not Robert",
+            "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/People/Dennis Malone.md"},
+        },
+    ]
+    ranked = _rank_owner_canonical_results("Who is my dad?", distractors + [correct])
+    assert ranked[0] is correct
+
+
+def test_owner_parents_plural_ranks_direct_parent_evidence():
+    from plugins.memory.supermemory import _rank_owner_canonical_results
+
+    canonical = {"source": "obsidian", "authority": "canonical"}
+    correct = {"memory": "- Phillip is Dennis Malone’s father.", "metadata": canonical}
+    unrelated = {"memory": "Canonical family retrieval policy.", "metadata": canonical}
+    assert _rank_owner_canonical_results("Who are my parents?", [unrelated, correct])[0] is correct
+
+
+def test_owner_parent_query_does_not_rewrite_indirect_relationship():
+    from plugins.memory.supermemory import _owner_canonical_query
+
+    query = "Who is my wife's father?"
+    assert _owner_canonical_query(query) == query
+    query = "Who is my father's brother?"
+    assert _owner_canonical_query(query) == query
+    query = "Who is my father-in-law?"
+    assert _owner_canonical_query(query) == query
 
 
 def test_sync_turn_buffers_short_messages(provider):
