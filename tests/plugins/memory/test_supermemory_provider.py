@@ -313,24 +313,6 @@ def test_owner_named_restaurant_query_targets_canonical_venue_records():
     )
 
 
-def test_owner_relationship_count_excludes_unrelated_food_memory(provider):
-    provider._container_tag = "owner_primary"
-    canonical = {"source": "obsidian", "authority": "canonical"}
-    provider._client.profile_response = {"static": [], "dynamic": [], "search_results": [
-        {"memory": "Courtnee prefers the Green Chili Mac.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Restaurants/Somewhere.md"}},
-        {"memory": "Lori is Courtnee Lynn Malone’s aunt.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/People/Lori Meyer.md"}},
-        {"memory": "Marg and Kathleen are Courtnee Lynn Malone’s aunts.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/People/Malone Family Relationships.md"}},
-        {"memory": "Unrelated person biography.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/People/Other.md"}},
-    ]}
-
-    result = provider.prefetch("How many aunts does Courtnee have?")
-
-    assert "Courtnee Lynn Malone’s aunts" in result
-    assert "Lori is Courtnee" not in result
-    assert "Green Chili Mac" not in result
-    assert "Unrelated person" not in result
-
-
 def test_sync_turn_buffers_short_messages(provider):
     provider.sync_turn("ok", "sure", session_id="session-1")
     assert len(provider._client.add_calls) == 1

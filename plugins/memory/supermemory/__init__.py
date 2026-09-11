@@ -277,29 +277,6 @@ def _scope_owner_restaurant_results(query: str, results: list) -> tuple[list, bo
     return [exact, *reciprocal], True
 
 
-def _scope_owner_relationship_results(query: str, results: list) -> tuple[list, bool]:
-    """Keep named-person relationship evidence out of unrelated domains."""
-    match = re.search(
-        r"\bhow many\s+(aunts?|uncles?)\s+does\s+([A-Z][A-Za-z'’.-]+(?:\s+[A-Z][A-Za-z'’.-]+){0,3})\s+have\b",
-        query or "",
-        re.IGNORECASE,
-    )
-    if not match:
-        return results, False
-    relation = match.group(1).lower().rstrip("s")
-    subject = match.group(2)
-    scoped = []
-    for item in results or []:
-        metadata = item.get("metadata") or {}
-        relative_path = str(metadata.get("relative_path") or "")
-        memory = str(item.get("memory") or "")
-        if (re.search(r"/Family Shared/People/[^/]+\.md$", relative_path, re.IGNORECASE)
-                and re.search(rf"\b{re.escape(subject)}(?:\s+Lynn\s+Malone|\s+Malone)?['’]s\s+{relation}s?\b", memory, re.IGNORECASE)):
-            scoped.append(item)
-    summaries = [item for item in scoped if str((item.get("metadata") or {}).get("relative_path") or "").endswith("/Malone Family Relationships.md")]
-    return (summaries or scoped), True
-
-
 def _owner_canonical_query(query: str) -> str:
     """Resolve first-person parent terms against the authenticated Owner.
 
@@ -327,17 +304,6 @@ def _owner_canonical_query(query: str) -> str:
         return (
             f"{text} Authenticated requester: Dennis Malone. "
             "Resolve Dennis Malone parent relationship: father, dad, mother, or mom."
-        )
-    relationship_match = re.search(
-        r"\bhow many\s+(aunts?|uncles?)\s+does\s+([A-Z][A-Za-z'’.-]+(?:\s+[A-Z][A-Za-z'’.-]+){0,3})\s+have\b",
-        text,
-        re.IGNORECASE,
-    )
-    if relationship_match:
-        relation, subject = relationship_match.group(1), relationship_match.group(2)
-        return (
-            f"{text} Canonical person relationship: count {subject}'s {relation} only from Family Shared/People evidence; "
-            "exclude food, preference, and other-domain records."
         )
     venue_match = re.search(
         r"\b(?:at|about|from)\s+([A-Za-z0-9][A-Za-z0-9 &'’.-]{0,80}?)(?:\s*[?.!]|$)",
@@ -931,7 +897,6 @@ class SupermemoryMemoryProvider(MemoryProvider):
             include_profile = self._turn_count <= 1 or (self._turn_count % self._profile_frequency == 0)
             search_results = _authoritative_search_results(profile["search_results"])
             search_results, named_restaurant = _scope_owner_restaurant_results(query, search_results)
-            search_results, named_relationship = _scope_owner_relationship_results(query, search_results)
             context = _format_prefetch_context(
                 static_facts=profile["static"] if include_profile and not canonical_owner else [],
                 dynamic_facts=profile["dynamic"] if include_profile and not canonical_owner else [],
@@ -948,7 +913,6 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 max_results=(
                     2 if canonical_owner and re.search(r"\bmy\s+parents?\b", query, re.IGNORECASE)
                     else 4 if canonical_owner and named_restaurant
-                    else 10 if canonical_owner and named_relationship
                     else 1 if canonical_owner
                     else self._max_recall_results
                 ),
