@@ -94,7 +94,7 @@ def _call_owner_reranker(query: str, candidates: list[dict]) -> dict:
         "options": {"num_ctx": 16384, "temperature": 0, "top_p": 0.8, "top_k": 20, "min_p": 0, "presence_penalty": 0, "num_predict": 300},
     }
     request = urllib.request.Request(_OWNER_RERANK_URL, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=3.0) as response:
+    with urllib.request.urlopen(request, timeout=4.0) as response:
         body = json.load(response)
     return json.loads(body["message"]["content"])
 
@@ -475,6 +475,45 @@ def _rank_owner_canonical_results(query: str, results: list) -> list:
     return sorted(results or [], key=evidence_rank)
 
 
+def _owner_query_subject(query: str) -> str:
+    """Resolve only the person explicitly requested by an Owner fact query."""
+    text = (query or "").strip()
+    if re.search(r"\b(?:my|I|me)\b", text, re.IGNORECASE):
+        return "Dennis"
+    match = re.search(
+        r"\b(?:does|did|is|was|about)\s+([A-Z][A-Za-z.'’-]+(?:\s+[A-Z][A-Za-z.'’-]+){0,2})(?:['’]s)?\b",
+        text,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def _scope_owner_person_sections(query: str, items: list[dict]) -> list[dict]:
+    """Remove sibling person sections from selected canonical evidence."""
+    subject = _owner_query_subject(query)
+    if not subject:
+        return items
+    names = {subject.casefold(), subject.split()[0].casefold()}
+    scoped = []
+    heading_re = re.compile(r"(?m)^(#{1,6})\s+(.+?)\s*$")
+    for item in items:
+        memory = str(item.get("memory") or "")
+        headings = list(heading_re.finditer(memory))
+        selected = next((heading for heading in headings if heading.group(2).strip().casefold() in names), None)
+        if selected is None:
+            scoped.append(item)
+            continue
+        level = len(selected.group(1))
+        end = len(memory)
+        for heading in headings:
+            if heading.start() > selected.start() and len(heading.group(1)) <= level:
+                end = heading.start()
+                break
+        copy = dict(item)
+        copy["memory"] = (memory[:headings[0].start()] + memory[selected.start():end]).strip()
+        scoped.append(copy)
+    return scoped
+
+
 def _format_prefetch_context(
     static_facts: list,
     dynamic_facts: list,
@@ -501,6 +540,12 @@ def _format_prefetch_context(
             memory = item.get("memory", "")
             if not memory:
                 continue
+            if owner_context:
+                memory = re.sub(
+                    r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]",
+                    lambda match: (match.group(2) or match.group(1).rsplit("/", 1)[-1]).strip(),
+                    str(memory),
+                )
             similarity = item.get("similarity")
             updated = item.get("updated_at") or item.get("updatedAt") or ""
             prefix_bits = []
@@ -528,7 +573,7 @@ def _format_prefetch_context(
             "For factual answers, use only explicit facts below. Preserve proper names, dates, places, employers, and relationship "
             "direction exactly as written. Do not add connective biography, motives, inferred roles, relatives, or corrected spellings. "
             "Prefer a terse list or direct sentence over narrative prose. If the requested identity differs from the selected record, "
-            "state the mismatch rather than treating them as the same person. "
+            "state the mismatch rather than treating them as the same person. Answer in plain text facts; never emit Obsidian wikilinks. "
         )
     intro += "Do not force memories into the conversation."
     body = "\n\n".join(sections)
@@ -1065,6 +1110,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
                     query, limit=20, container_tag=_OWNER_CONVERSATION_CONTAINER, search_mode=self._search_mode
                 )
                 search_results = self._rerank_owner_candidates(query, search_results + conversation_results)
+                search_results = _scope_owner_person_sections(query, search_results)
             else:
                 search_results, named_restaurant = _scope_owner_restaurant_results(query, search_results)
             context = _format_prefetch_context(
@@ -1125,28 +1171,19 @@ class SupermemoryMemoryProvider(MemoryProvider):
         owner_capture = self._container_tag == _OWNER_CANONICAL_CONTAINER
         if owner_capture:
             clean_user = _clean_text_for_capture(user_content)
-            clean_assistant = _clean_text_for_capture(assistant_content)
             if messages is not None:
                 completed = []
-                pending_user = ""
                 for message in messages:
                     role = str(message.get("role") or "")
                     content = message.get("content")
                     if not isinstance(content, str):
                         continue
                     if role == "user":
-                        pending_user = _clean_text_for_capture(content)
-                    elif role == "assistant" and pending_user:
-                        completed.append((pending_user, _clean_text_for_capture(content)))
-                        pending_user = ""
-                worthy = [(user, assistant) for user, assistant in completed if _is_capture_worthy_owner_statement(user)]
+                        completed.append(_clean_text_for_capture(content))
+                worthy = [user for user in completed if _is_capture_worthy_owner_statement(user)]
             else:
-                worthy = [(clean_user, clean_assistant)] if _is_capture_worthy_owner_statement(clean_user) else []
-            cleaned = []
-            for user, assistant in worthy:
-                cleaned.append({"role": "user", "content": user})
-                if assistant:
-                    cleaned.append({"role": "assistant-context", "content": assistant})
+                worthy = [clean_user] if _is_capture_worthy_owner_statement(clean_user) else []
+            cleaned = [{"role": "user", "content": user} for user in worthy]
         elif messages is not None:
             cleaned = self._clean_conversation(messages)
             self._session_turns = [
@@ -1174,7 +1211,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         if owner_capture:
             metadata.update({
                 "authority": "non-authoritative",
-                "provenance": "role-delimited; assistant-context is non-evidence",
+                "provenance": "user-authored role-delimited statement",
             })
         self._client.add_memory(
             self._format_conversation(cleaned),
@@ -1195,18 +1232,15 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 or not session_id or not request_id):
             return False
         user = _clean_text_for_capture(user_content)
-        assistant = _clean_text_for_capture(assistant_content)
         if not _is_capture_worthy_owner_statement(user):
             return False
         messages = [{"role": "user", "content": user}]
-        if assistant:
-            messages.append({"role": "assistant-context", "content": assistant})
         self._client.add_memory(
             self._format_conversation(messages),
             metadata={"type": "owner_conversation", "capture_source": "jarvis_owner_app",
                       "session_id": session_id, "request_id": request_id,
                       "message_count": len(messages), "authority": "non-authoritative",
-                      "provenance": "role-delimited; assistant-context is non-evidence"},
+                      "provenance": "user-authored role-delimited statement"},
             entity_context=self._entity_context,
             container_tag=_OWNER_CONVERSATION_CONTAINER,
             custom_id=f"jarvis-owner-app:{session_id}:{request_id}",

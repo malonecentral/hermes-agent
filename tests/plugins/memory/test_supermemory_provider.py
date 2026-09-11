@@ -112,6 +112,17 @@ def test_format_prefetch_context_deduplicates_overlap():
     assert "<supermemory-context>" in result
 
 
+def test_owner_prefetch_renders_wikilinks_as_plain_facts():
+    result = _format_prefetch_context(
+        static_facts=[], dynamic_facts=[],
+        search_results=[{"memory": "Dennis likes [[Dishes/Deli Sandwiches|B.L.T. on SDB]] at [[Zipp's]].", "similarity": 0.9}],
+        max_results=1, owner_context=True,
+    )
+    assert "Dennis likes B.L.T. on SDB at Zipp's." in result
+    assert "[[" not in result
+    assert "Dishes/Deli Sandwiches" not in result
+
+
 def test_prefetch_includes_profile_on_first_turn(provider):
     provider._client.profile_response = {
         "static": ["Jordan prefers short answers"],
@@ -296,6 +307,21 @@ def test_owner_named_restaurant_recall_keeps_only_exact_note_and_reciprocal_dish
     assert result.index("restaurant: Zipp's") < result.index("# Mozzarella Sticks")
 
 
+def test_owner_recall_keeps_only_requested_person_section(provider):
+    provider._container_tag = "owner_primary"
+    canonical = {"source": "obsidian", "authority": "canonical"}
+    provider._client.profile_response = {"static": [], "dynamic": [], "search_results": [{
+        "id": "ikes",
+        "memory": "restaurant: Ike's\n### Dennis\n- Madison Bumgarner on sourdough.\n### Lauren\n- Ike's Reuben.",
+        "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Restaurants/Ike's.md"},
+    }]}
+
+    result = provider.prefetch("What is my favorite order at Ike's?")
+
+    assert "Madison Bumgarner on sourdough" in result
+    assert "Ike's Reuben" not in result
+
+
 def test_owner_named_parlay_recall_excludes_zipps_person_collision(provider):
     provider._container_tag = "owner_primary"
     canonical = {"source": "obsidian", "authority": "canonical"}
@@ -393,7 +419,10 @@ def test_owner_primary_routes_automatic_capture_to_conversations(monkeypatch, tm
     assert call["custom_id"] == "hermes-owner-conversation:owner-session"
     assert call["task_type"] == "memory"
     assert "[role: user]" in call["content"]
-    assert "[role: assistant-context]" in call["content"]
+    assert "[role: assistant-context]" not in call["content"]
+    assert "I will keep updates concise" not in call["content"]
+    assert call["metadata"]["message_count"] == 1
+    assert call["metadata"]["provenance"] == "user-authored role-delimited statement"
     assert call["metadata"]["authority"] == "non-authoritative"
 
 
@@ -412,7 +441,10 @@ def test_capture_owner_app_turn_uses_request_scoped_id_and_existing_filters(monk
     assert call["custom_id"] == "jarvis-owner-app:app-session:request-42"
     assert call["task_type"] == "memory"
     assert "[role: user]\nI prefer aisle seats on flights.\n[user:end]" in call["content"]
-    assert "[role: assistant-context]" in call["content"]
+    assert "assistant-context" not in call["content"]
+    assert "remember that preference" not in call["content"]
+    assert call["metadata"]["message_count"] == 1
+    assert call["metadata"]["provenance"] == "user-authored role-delimited statement"
     assert call["metadata"]["capture_source"] == "jarvis_owner_app"
 
     before = len(p._client.add_calls)
@@ -511,7 +543,7 @@ def test_owner_reranker_uses_fixed_local_model_independent_of_answer_model(monke
         "num_predict": 300,
     }
     assert captured["url"] == "http://mcomen.malonecentral.com:11434/api/chat"
-    assert captured["timeout"] == 3.0
+    assert captured["timeout"] == 4.0
 
 
 def test_sync_turn_fallback_accumulates_turns_and_isolates_sessions(provider):
