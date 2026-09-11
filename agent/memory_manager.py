@@ -132,6 +132,8 @@ def memory_provider_tools_enabled(
         return False
     if "memory" in enabled_toolsets:
         return True
+    if "memory_readonly" in enabled_toolsets:
+        return True
 
     try:
         from toolsets import resolve_toolset
@@ -206,6 +208,8 @@ def inject_memory_provider_tools(agent: Any) -> int:
         agent.valid_tool_names = valid_tool_names
 
     added = 0
+    readonly = "memory_readonly" in (getattr(agent, "enabled_toolsets", None) or [])
+    readonly_names = {"supermemory_search", "supermemory_profile"}
     for raw_schema in get_schemas():
         schema = normalize_tool_schema(raw_schema)
         if schema is None:
@@ -216,6 +220,8 @@ def inject_memory_provider_tools(agent: Any) -> int:
             )
             continue
         tool_name = schema["name"]
+        if readonly and tool_name not in readonly_names:
+            continue
         if tool_name in existing_tool_names:
             continue
         tools.append({"type": "function", "function": schema})

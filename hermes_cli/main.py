@@ -13198,7 +13198,28 @@ def _try_termux_fast_tui_launch() -> bool:
 
 def cmd_memory(args):
     sub = getattr(args, "memory_command", None)
-    if sub == "off":
+    if sub == "capture-owner-turn":
+        import json
+        from hermes_constants import get_hermes_home
+        from plugins.memory import load_memory_provider
+
+        try:
+            payload = json.load(sys.stdin)
+            required = ("session_id", "request_id", "user_content", "assistant_content")
+            if not isinstance(payload, dict) or any(not isinstance(payload.get(key), str) for key in required):
+                raise ValueError("invalid capture payload")
+            provider = load_memory_provider("supermemory")
+            provider.initialize(payload["session_id"], hermes_home=str(get_hermes_home()), platform="owner-app-capture")
+            delivered = provider.capture_owner_app_turn(
+                payload["session_id"], payload["request_id"],
+                payload["user_content"], payload["assistant_content"],
+            )
+            provider.shutdown()
+            print(json.dumps({"status": "delivered" if delivered else "filtered"}, separators=(",", ":")))
+        except Exception as exc:
+            print(json.dumps({"status": "error", "error": str(exc)}, separators=(",", ":")), file=sys.stderr)
+            raise SystemExit(1) from exc
+    elif sub == "off":
         from hermes_cli.config import load_config, save_config
 
         config = load_config()

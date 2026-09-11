@@ -397,6 +397,29 @@ def test_owner_primary_routes_automatic_capture_to_conversations(monkeypatch, tm
     assert call["metadata"]["authority"] == "non-authoritative"
 
 
+def test_capture_owner_app_turn_uses_request_scoped_id_and_existing_filters(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({"container_tag": "owner_primary", "auto_capture": True}, str(tmp_path))
+    p = SupermemoryMemoryProvider()
+    p.initialize("bootstrap", hermes_home=str(tmp_path), platform="cli")
+
+    assert p.capture_owner_app_turn(
+        "app-session", "request-42", "I prefer aisle seats on flights.", "I’ll remember that preference."
+    ) is True
+    call = p._client.add_calls[-1]
+    assert call["container_tag"] == "owner_conversations"
+    assert call["custom_id"] == "jarvis-owner-app:app-session:request-42"
+    assert call["task_type"] == "memory"
+    assert "[role: user]\nI prefer aisle seats on flights.\n[user:end]" in call["content"]
+    assert "[role: assistant-context]" in call["content"]
+    assert call["metadata"]["capture_source"] == "jarvis_owner_app"
+
+    before = len(p._client.add_calls)
+    assert p.capture_owner_app_turn("app-session", "request-question", "Where am I?", "At home.") is False
+    assert len(p._client.add_calls) == before
+
+
 def test_owner_capture_filters_questions_commands_and_test_probes(monkeypatch, tmp_path):
     monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
     monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)

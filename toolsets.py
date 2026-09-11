@@ -221,6 +221,11 @@ TOOLSETS = {
         "tools": ["memory"],
         "includes": []
     },
+    "memory_readonly": {
+        "description": "Read-only external memory provider lookup tools",
+        "tools": [],
+        "includes": []
+    },
 
     "context_engine": {
         "description": "Runtime tools exposed by the active context engine",

@@ -1185,6 +1185,35 @@ class SupermemoryMemoryProvider(MemoryProvider):
             task_type="memory",
         )
 
+    def capture_owner_app_turn(self, session_id: str, request_id: str,
+                               user_content: str, assistant_content: str) -> bool:
+        """Capture one completed Owner app turn through the canonical policy."""
+        session_id = str(session_id or "").strip()
+        request_id = str(request_id or "").strip()
+        if (not self._active or not self._auto_capture or not self._write_enabled
+                or not self._client or self._container_tag != _OWNER_CANONICAL_CONTAINER
+                or not session_id or not request_id):
+            return False
+        user = _clean_text_for_capture(user_content)
+        assistant = _clean_text_for_capture(assistant_content)
+        if not _is_capture_worthy_owner_statement(user):
+            return False
+        messages = [{"role": "user", "content": user}]
+        if assistant:
+            messages.append({"role": "assistant-context", "content": assistant})
+        self._client.add_memory(
+            self._format_conversation(messages),
+            metadata={"type": "owner_conversation", "capture_source": "jarvis_owner_app",
+                      "session_id": session_id, "request_id": request_id,
+                      "message_count": len(messages), "authority": "non-authoritative",
+                      "provenance": "role-delimited; assistant-context is non-evidence"},
+            entity_context=self._entity_context,
+            container_tag=_OWNER_CONVERSATION_CONTAINER,
+            custom_id=f"jarvis-owner-app:{session_id}:{request_id}",
+            task_type="memory",
+        )
+        return True
+
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         # Completed turns are already captured through MemoryManager's writer.
         self._session_turns = []
