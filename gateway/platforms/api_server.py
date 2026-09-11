@@ -1236,6 +1236,13 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
     "api_agent_request_reservation", default=None
 )
+# Adapter-authenticated ingress evidence only. This is intentionally populated
+# from the aiohttp request's private mapping, never from client-controlled
+# headers or body fields; specialized adapters may set it after authenticating
+# their device/session binding.
+_api_trusted_request_context: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "api_trusted_request_context", default=None
+)
 
 
 def _admit_api_agent_request(handler):
@@ -1262,6 +1269,10 @@ def _admit_api_agent_request(handler):
             return draining
         reservation = {"active": True}
         token = _api_agent_request_reservation.set(reservation)
+        trusted_context = request.get("trusted_request_context")
+        if not isinstance(trusted_context, dict):
+            trusted_context = None
+        context_token = _api_trusted_request_context.set(trusted_context)
         self._pending_agent_requests += 1
         try:
             return await handler(self, request, *args, **kwargs)
@@ -1269,6 +1280,7 @@ def _admit_api_agent_request(handler):
             if reservation["active"]:
                 reservation["active"] = False
                 self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+            _api_trusted_request_context.reset(context_token)
             _api_agent_request_reservation.reset(token)
 
     return _wrapped
@@ -7439,6 +7451,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        request_trusted_context = _api_trusted_request_context.get()
         request_browser_control_principal = (
             _api_request_browser_control_principal.get()
         )
@@ -7498,6 +7511,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         user_message=user_message,
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
+                        trusted_request_context=request_trusted_context,
                     )
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,

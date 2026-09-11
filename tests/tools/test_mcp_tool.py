@@ -577,6 +577,27 @@ class TestToolHandler:
             _servers.pop("test_srv", None)
 
 
+    def test_call_forwards_request_scoped_metadata_only_to_named_server(self):
+        from agent.request_context import bind_mcp_meta
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(return_value=_make_call_result("ok", is_error=False))
+        server = _make_mock_server("family_shared_notes", session=mock_session)
+        _servers["family_shared_notes"] = server
+        try:
+            handler = _make_tool_handler("family_shared_notes", "read_shared_note", 120)
+            with bind_mcp_meta({"family_shared_notes": {"jarvisIdentityContext": "opaque"}}), self._patch_mcp_loop():
+                result = json.loads(handler({"path": "People/Dennis Malone.md"}))
+            assert result["result"] == "ok"
+            mock_session.call_tool.assert_called_once_with(
+                "read_shared_note",
+                arguments={"path": "People/Dennis Malone.md"},
+                meta={"jarvisIdentityContext": "opaque"},
+            )
+        finally:
+            _servers.pop("family_shared_notes", None)
+
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
         from tools.mcp_tool import _make_tool_handler, _servers
 
@@ -1249,6 +1270,21 @@ class TestBuildSafeEnv:
         assert "OPENAI_API_KEY" not in result
         assert "DATABASE_URL" not in result
         assert "API_SECRET" not in result
+
+    def test_explicit_subprocess_identity_is_not_replaced_by_process_env(self):
+        """Authenticated launchers pass identity through the server's scoped env."""
+        from tools.mcp_tool import _build_safe_env
+
+        with patch.dict(
+            "os.environ",
+            {"HERMES_SESSION_IDENTITY_CONTEXT": "another-request"},
+            clear=True,
+        ):
+            result = _build_safe_env(
+                {"HERMES_SESSION_IDENTITY_CONTEXT": "authenticated-mobile-request"}
+            )
+
+        assert result["HERMES_SESSION_IDENTITY_CONTEXT"] == "authenticated-mobile-request"
 
     def test_secret_source_injected_vars_are_passed(self, monkeypatch):
         """Vars tagged by an external secret source (Bitwarden/1Password) are

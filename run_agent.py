@@ -9220,6 +9220,7 @@ class AIAgent:
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         persist_user_platform_id: Optional[str] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        trusted_request_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -9251,6 +9252,7 @@ class AIAgent:
             set_conversation_context,
         )
         from agent.prompt_cache_scope import declared_conversation_scope_safe
+        from agent.request_context import reset_mcp_meta, resolve_request_mcp_meta, set_mcp_meta
         from hermes_cli.observability.relay_shared_metrics import (
             finish_task_run,
             start_task_run,
@@ -9282,6 +9284,7 @@ class AIAgent:
         durable_turn_lease_turn_active = False
         durable_turn_lease_interrupt_message = None
         token = None
+        request_mcp_meta_token = None
         # Initialized alongside `token`: the turn-lease timeout/interrupt
         # early returns leave the try block before set_affinity_scope() runs,
         # and the finally reads this name unconditionally (UnboundLocalError
@@ -9324,6 +9327,14 @@ class AIAgent:
 
         try:
             _review_queue.note_turn_started()
+            # Resolver plugins receive only adapter-owned ingress evidence. The
+            # resolved metadata is bound for this turn and reset in the outer
+            # finally, including every early-return and exception path.
+            request_mcp_meta = resolve_request_mcp_meta(
+                ingress=trusted_request_context,
+                platform=str(task_context["platform"] or ""),
+            )
+            request_mcp_meta_token = set_mcp_meta(request_mcp_meta)
             # Serialize the full load -> run -> flush region across Hermes
             # processes. Gateway's asyncio lease closes alias routing inside one
             # process; this durable lease covers Desktop, CLI resume, gateway,
@@ -9870,6 +9881,8 @@ class AIAgent:
                         reset_conversation_context(token)
                     if affinity_token is not None:
                         reset_affinity_scope(affinity_token)
+                    if request_mcp_meta_token is not None:
+                        reset_mcp_meta(request_mcp_meta_token)
                     # Balance the note_turn_started above — every exit path
                     # lands here, so the idle queue's live-turn count cannot
                     # leak upward and starve deferred reviews.

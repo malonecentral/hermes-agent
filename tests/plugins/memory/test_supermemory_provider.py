@@ -452,6 +452,34 @@ def test_capture_owner_app_turn_uses_request_scoped_id_and_existing_filters(monk
     assert len(p._client.add_calls) == before
 
 
+@pytest.mark.parametrize(
+    ("attribute", "value", "message"),
+    [
+        ("_active", False, "provider inactive"),
+        ("_auto_capture", False, "automatic capture disabled"),
+        ("_write_enabled", False, "writes disabled"),
+        ("_client", None, "client unavailable"),
+        ("_container_tag", "other", "non-canonical container"),
+    ],
+)
+def test_capture_owner_app_turn_raises_for_retryable_unavailability(
+    monkeypatch, tmp_path, attribute, value, message
+):
+    from plugins.memory.supermemory import OwnerAppCaptureUnavailable
+
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({"container_tag": "owner_primary", "auto_capture": True}, str(tmp_path))
+    provider = SupermemoryMemoryProvider()
+    provider.initialize("bootstrap", hermes_home=str(tmp_path), platform="cli")
+    setattr(provider, attribute, value)
+
+    with pytest.raises(OwnerAppCaptureUnavailable, match=message):
+        provider.capture_owner_app_turn(
+            "app-session", "request-42", "I prefer aisle seats.", "Noted."
+        )
+
+
 def test_owner_capture_filters_questions_commands_and_test_probes(monkeypatch, tmp_path):
     monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
     monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)

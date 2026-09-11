@@ -5211,6 +5211,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        trusted_request_context: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize the Hermes CLI.
@@ -5228,6 +5229,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             resume: Session ID to resume (restores conversation history from SQLite)
             pass_session_id: Include the session ID in the agent's system prompt
         """
+        # Adapter-owned evidence is carried explicitly to each turn; the CLI
+        # never re-reads ambient process state after startup.
+        self._trusted_request_context = trusted_request_context
+
         # Initialize Rich console
         self.console = Console()
         self.config = CLI_CONFIG
@@ -17304,6 +17309,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
+                        trusted_request_context=self._trusted_request_context,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
@@ -21785,6 +21791,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    trusted_request_context: Optional[Dict[str, Any]] = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -21853,6 +21860,11 @@ def main(
         print("Starting Hermes Gateway (messaging platforms)...")
         asyncio.run(start_gateway())
         return
+
+    if trusted_request_context is None:
+        from agent.request_context import consume_cli_request_context
+
+        trusted_request_context = consume_cli_request_context()
 
     # Skip worktree for list commands (they exit immediately)
     if not list_tools and not list_toolsets:
@@ -21987,6 +21999,7 @@ def main(
             checkpoints=checkpoints,
             pass_session_id=pass_session_id,
             ignore_rules=ignore_rules,
+            trusted_request_context=trusted_request_context,
         )
     except ImportError as e:
         # Direct `python cli.py` / `python -m cli` bypasses cmd_chat's

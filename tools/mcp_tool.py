@@ -117,6 +117,7 @@ from datetime import datetime
 from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
+from agent.request_context import get_mcp_meta
 from tools.registry import tool_error
 from tools.ansi_strip import strip_unicode_tags
 
@@ -768,6 +769,8 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
         ):
             env[key] = value
     if user_env:
+        # Explicit per-server values are the scoped subprocess propagation
+        # mechanism. Never replace them from process-global identity state.
         env.update(user_env)
     return env
 
@@ -6370,7 +6373,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             f"MCP stdio subprocess for '{server_name}' had "
                             f"already exited when the call was dispatched"
                         )
-                    _call_coro = server.session.call_tool(tool_name, arguments=args)
+                    # Request-scoped transport metadata is resolved at the
+                    # call boundary. It is never retained on the long-lived
+                    # MCP server/session object, so concurrent requests cannot
+                    # inherit another caller's audience or principal.
+                    meta = get_mcp_meta(server_name)
+                    call_kwargs = {"arguments": args}
+                    if meta is not None:
+                        call_kwargs["meta"] = meta
+                    _call_coro = server.session.call_tool(tool_name, **call_kwargs)
                     _watch_children = getattr(server, "_watch_stdio_children", None)
                     _watch_ok = (
                         _watch_children is not None

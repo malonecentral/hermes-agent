@@ -171,6 +171,10 @@ VALID_HOOKS: Set[str] = {
     "transform_llm_output",
     "pre_llm_call",
     "post_llm_call",
+    # Trusted ingress resolver. Runs once per admitted agent turn before tool
+    # dispatch. A plugin may return request-local per-MCP-server metadata;
+    # it never enters model tool schemas or persistent transcripts.
+    "resolve_request_context",
     # Streaming LLM output observer hooks. Fired asynchronously off the token
     # path by agent.plugin_stream_hooks; callbacks observe immutable normalized
     # text/lifecycle payloads and cannot transform the stream.

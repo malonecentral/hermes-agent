@@ -13210,11 +13210,13 @@ def cmd_memory(args):
                 raise ValueError("invalid capture payload")
             provider = load_memory_provider("supermemory")
             provider.initialize(payload["session_id"], hermes_home=str(get_hermes_home()), platform="owner-app-capture")
-            delivered = provider.capture_owner_app_turn(
-                payload["session_id"], payload["request_id"],
-                payload["user_content"], payload["assistant_content"],
-            )
-            provider.shutdown()
+            try:
+                delivered = provider.capture_owner_app_turn(
+                    payload["session_id"], payload["request_id"],
+                    payload["user_content"], payload["assistant_content"],
+                )
+            finally:
+                provider.shutdown()
             print(json.dumps({"status": "delivered" if delivered else "filtered"}, separators=(",", ":")))
         except Exception as exc:
             print(json.dumps({"status": "error", "error": str(exc)}, separators=(",", ":")), file=sys.stderr)

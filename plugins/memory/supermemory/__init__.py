@@ -23,6 +23,10 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
+
+class OwnerAppCaptureUnavailable(RuntimeError):
+    """Owner app capture cannot run and should be retried by its caller."""
+
 _DEFAULT_CONTAINER_TAG = "hermes"
 _DEFAULT_MAX_RECALL_RESULTS = 10
 _DEFAULT_PROFILE_FREQUENCY = 50
@@ -1226,13 +1230,24 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
     def capture_owner_app_turn(self, session_id: str, request_id: str,
                                user_content: str, assistant_content: str) -> bool:
-        """Capture one completed Owner app turn through the canonical policy."""
+        """Capture a turn, returning False only for terminal content filtering."""
         session_id = str(session_id or "").strip()
         request_id = str(request_id or "").strip()
-        if (not self._active or not self._auto_capture or not self._write_enabled
-                or not self._client or self._container_tag != _OWNER_CANONICAL_CONTAINER
-                or not session_id or not request_id):
-            return False
+        unavailable = []
+        if not self._active:
+            unavailable.append("provider inactive")
+        if not self._auto_capture:
+            unavailable.append("automatic capture disabled")
+        if not self._write_enabled:
+            unavailable.append("writes disabled")
+        if not self._client:
+            unavailable.append("client unavailable")
+        if self._container_tag != _OWNER_CANONICAL_CONTAINER:
+            unavailable.append("non-canonical container")
+        if not session_id or not request_id:
+            unavailable.append("missing stable identifiers")
+        if unavailable:
+            raise OwnerAppCaptureUnavailable(", ".join(unavailable))
         user = _clean_text_for_capture(user_content)
         if not _is_capture_worthy_owner_statement(user):
             return False
