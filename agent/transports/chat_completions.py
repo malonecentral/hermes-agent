@@ -633,8 +633,10 @@ class ChatCompletionsTransport(ProviderTransport):
         if timeout is not None:
             api_kwargs["timeout"] = timeout
 
-        # Tools
-        if tools:
+        # Tools. Local Qwen is intentionally retrieval-only: automatic memory
+        # context is already injected before inference, and omitting schemas
+        # keeps its 8K runner from truncating the behavioural contract.
+        if tools and (model or "").lower() != "qwen3.5:4b":
             # Moonshot/Kimi uses a stricter flavored JSON Schema.  Rewriting
             # tool parameters here keeps aggregator routes (Nous, OpenRouter,
             # etc.) compatible, in addition to direct moonshot.ai endpoints.
@@ -861,8 +863,9 @@ class ChatCompletionsTransport(ProviderTransport):
         if timeout is not None:
             api_kwargs["timeout"] = timeout
 
-        # Tools — apply Moonshot/Kimi schema sanitization regardless of path
-        if tools:
+        # Tools — apply Moonshot/Kimi schema sanitization regardless of path.
+        # Local Qwen receives automatic memory context but no callable tools.
+        if tools and (model or "").lower() != "qwen3.5:4b":
             if is_moonshot_model(model):
                 tools = sanitize_moonshot_tools(tools)
             api_kwargs["tools"] = tools

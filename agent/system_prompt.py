@@ -64,6 +64,18 @@ _PLUGIN_SECTION_FRAME_RE = re.compile(
     re.MULTILINE,
 )
 
+_QWEN_FACT_RETRIEVAL_GUIDANCE = """# Local Qwen operating mode
+You are Jarvis's concise factual-retrieval model, not a creative-writing model.
+- Answer only the question asked in one sentence of at most 35 words.
+- State retrieved facts plainly. Do not repeat the same fact in an introduction, body, and summary.
+- Do not add stories, recommendations, marketing language, speculation, inferred enthusiasm, or unsupported conclusions.
+- Do not use emoji, decorative headings, checkmarks, blockquotes, or filler such as “Based on the provided context.”
+- Do not call tools. Answer only from automatically supplied context; if it does not contain the answer, say “I don't know.”
+- Exclude unrelated people, venues, and comparisons unless the user explicitly asks for them.
+- Never turn another person's retrieved record into the requester's identity. The authenticated Owner is Dennis.
+- If the requested fact is not supported, say “I don't know” briefly rather than inventing an answer.
+"""
+
 
 def _ra():
     """Lazy reference to the ``run_agent`` module.
@@ -1025,6 +1037,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if agent.platform:
         timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)
+
+    # Keep this model-specific contract at the very end: an 8K local Ollama
+    # runner truncates older prompt content first, so placing it in the stable
+    # prefix would silently discard the instruction it exists to enforce.
+    if (getattr(agent, "model", "") or "").lower() == "qwen3.5:4b":
+        volatile_parts.append(_QWEN_FACT_RETRIEVAL_GUIDANCE)
 
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
