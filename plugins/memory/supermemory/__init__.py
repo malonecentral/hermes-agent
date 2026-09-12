@@ -13,9 +13,10 @@ import re
 import threading
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from agent.memory_provider import MemoryProvider
 from agent.secret_scope import get_secret, is_multiplex_active
@@ -40,8 +41,13 @@ _DEFAULT_BASE_URL = "https://api.supermemory.ai"
 _API_KEY_URL = "http://app.supermemory.ai/integrations?connect=hermes"
 _OWNER_CANONICAL_CONTAINER = "owner_primary"
 _OWNER_CONVERSATION_CONTAINER = "owner_conversations"
-_OWNER_RERANK_URL = "http://mcomen.malonecentral.com:11434/api/chat"
-_OWNER_RERANK_MODEL = "qwen3.5:4b"
+_OWNER_RERANK_URL = "http://mcomen.malonecentral.com:8082/rerank"
+_OWNER_RERANK_MODEL = "qwen3-reranker-0.6b-q8_0.gguf"
+_OWNER_RERANK_TIMEOUT_SECONDS = 6.0
+_OWNER_RERANK_MIN_SCORE = 0.5
+_OWNER_RERANK_CANDIDATE_LIMIT = 8
+_OWNER_RERANK_EVIDENCE_LIMIT = 4
+_OWNER_TIMEZONE = ZoneInfo("America/Phoenix")
 _TRIVIAL_RE = re.compile(
     r"^(ok|okay|thanks|thank you|got it|sure|yes|no|yep|nope|k|ty|thx|np)\.?$",
     re.IGNORECASE,
@@ -62,47 +68,135 @@ _DEFAULT_ENTITY_CONTEXT = (
     "When in doubt, store less."
 )
 
-_OWNER_RERANK_SCHEMA = {
-    "type": "object", "additionalProperties": False,
-    "required": ["selected_ids", "rejected_ids", "sufficient"],
-    "properties": {
-        "selected_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
-        "rejected_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
-        "sufficient": {"type": "boolean"},
-    },
-}
-_OWNER_RERANK_SYSTEM = """You are a strict evidence gate. Return only schema-valid JSON.
-Every supplied ID must appear exactly once across selected_ids and rejected_ids.
-Select the smallest set of supplied evidence that directly answers the exact question; otherwise select none and set sufficient false.
-For usual, normal, favorite, or repeated-behavior questions, require explicit evidence of that same status for the requested person.
-Next-time plans, want-to-try items, may-order possibilities, and another person's preference do not establish a usual or favorite; reject them and never upgrade their status.
-Match literal proper names, including middle names or initials. A similar spelling, semantic neighbour, or conflicting middle initial is not the requested person.
-Preserve relationship direction exactly: evidence that A is B's parent does not support the reverse relationship.
-Match the requested entity, relationship, venue, and domain. Never invent, rewrite, merge, extrapolate, or repair facts.
-Reject evidence that merely mentions the same surname, venue category, or related person without supporting the requested claim.
-Canonical evidence outranks conversation evidence for hard factual conflicts.
-Explicit user statements may support personal preferences or recent decisions when canonical evidence is silent.
-Assistant assertions and assistant-context text are not factual evidence and MUST be rejected.
-A later explicit user correction supersedes an older conversational claim.
-Set sufficient true only when the selected evidence, by itself, supports a concise answer to the exact question.
-If any requested identity, relationship, date, occupation, location, or other material detail remains unsupported, set sufficient false.
-"""
+def _owner_now() -> datetime:
+    """Return the Owner's wall-clock time for date resolution."""
+    return datetime.now(_OWNER_TIMEZONE)
+
+
+def _owner_expand_relative_dates(query: str, *, now: Optional[datetime] = None) -> str:
+    """Annotate simple relative dates before semantic memory retrieval."""
+    current = now or _owner_now()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=_OWNER_TIMEZONE)
+    else:
+        current = current.astimezone(_OWNER_TIMEZONE)
+    offsets = {"yesterday": -1, "today": 0, "tomorrow": 1}
+    pattern = re.compile(
+        r"\b(yesterday|today|tomorrow)\b(?!\s*\(\d{4}-\d{2}-\d{2}\))",
+        re.IGNORECASE,
+    )
+
+    def annotate(match: re.Match[str]) -> str:
+        resolved = (current.date() + timedelta(days=offsets[match.group(1).lower()])).isoformat()
+        return f"{match.group(1)} ({resolved})"
+
+    return pattern.sub(annotate, query)
+
+
+def _owner_prefetch_query(query: str) -> str:
+    """Resolve relative dates and add retrieval vocabulary for dated events."""
+    expanded = _owner_expand_relative_dates(query)
+    if expanded != query and re.search(r"\b(?:dinner|lunch|breakfast|eat|ate|restaurant)\b", query, re.IGNORECASE):
+        return f"{expanded} Dennis dining event restaurant location party ordered"
+    return expanded
+
+
+def _owner_prefetch_fallback_query(original_query: str) -> Optional[str]:
+    """Return a broad semantic query when ISO dates damage embedding recall."""
+    has_relative_date = re.search(r"\b(?:yesterday|today|tomorrow)\b", original_query, re.IGNORECASE)
+    has_dining_cue = re.search(
+        r"\b(?:dinner|lunch|breakfast|eat|ate|restaurant)\b", original_query, re.IGNORECASE
+    )
+    if has_relative_date and has_dining_cue:
+        meal = re.search(r"\b(dinner|lunch|breakfast)\b", original_query, re.IGNORECASE)
+        meal_term = meal.group(1).lower() if meal else "dining"
+        return f"Dennis {meal_term} restaurant location party ordered"
+    return None
+
+
+def _scope_owner_dated_event_results(query: str, results: list[dict]) -> list[dict]:
+    """Select records whose structured header matches the requested date and meal."""
+    dates = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", query)
+    if not dates:
+        return results
+    dated = [item for item in results if any(date in str(item.get("memory") or "") for date in dates)]
+    if not dated:
+        return results
+    meal = re.search(r"\b(dinner|lunch|breakfast)\b", query, re.IGNORECASE)
+    if meal:
+        date_pattern = "|".join(map(re.escape, dates))
+        header = re.compile(
+            rf"(?mi)^#+\s*(?:{date_pattern})[^\n]*\b{re.escape(meal.group(1))}\b"
+        )
+        meal_matches = [item for item in dated if header.search(str(item.get("memory") or ""))]
+        if meal_matches:
+            dated = meal_matches
+    unique = []
+    seen = set()
+    for item in dated:
+        identity = item.get("id") or str(item.get("memory") or "")
+        if identity not in seen:
+            seen.add(identity)
+            unique.append(item)
+    return unique
 
 
 def _call_owner_reranker(query: str, candidates: list[dict]) -> dict:
+    """Rank bounded evidence with the dedicated non-generative Qwen reranker.
+
+    Candidate text is sent only as a document. Authority remains trusted local
+    metadata and is applied after scoring, so document instructions cannot
+    promote a conversation record into the canonical partition.
+    """
     payload = {
         "model": _OWNER_RERANK_MODEL,
-        "messages": [
-            {"role": "system", "content": _OWNER_RERANK_SYSTEM},
-            {"role": "user", "content": json.dumps({"question": query, "candidates": candidates}, ensure_ascii=False, separators=(",", ":"))},
-        ],
-        "stream": False, "think": False, "format": _OWNER_RERANK_SCHEMA, "keep_alive": "24h",
-        "options": {"num_ctx": 16384, "temperature": 0, "top_p": 0.8, "top_k": 20, "min_p": 0, "presence_penalty": 0, "num_predict": 300},
+        "query": query,
+        "documents": [str(candidate.get("text") or "") for candidate in candidates],
+        "top_n": len(candidates),
     }
-    request = urllib.request.Request(_OWNER_RERANK_URL, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=4.0) as response:
+    request = urllib.request.Request(
+        _OWNER_RERANK_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=_OWNER_RERANK_TIMEOUT_SECONDS) as response:
         body = json.load(response)
-    return json.loads(body["message"]["content"])
+    results = body.get("results") if isinstance(body, dict) else None
+    if not isinstance(results, list):
+        return {}
+    scored: list[tuple[str, str, float, int]] = []
+    seen_indexes: set[int] = set()
+    for item in results:
+        if not isinstance(item, dict):
+            return {}
+        index = item.get("index")
+        score = item.get("relevance_score")
+        if not isinstance(index, int) or isinstance(index, bool) or index in seen_indexes:
+            return {}
+        if index < 0 or index >= len(candidates) or not isinstance(score, (int, float)):
+            return {}
+        seen_indexes.add(index)
+        candidate = candidates[index]
+        authority = "canonical" if candidate.get("authority") == "canonical" else "conversation"
+        scored.append((authority, str(candidate["id"]), float(score), index))
+    if len(seen_indexes) != len(candidates):
+        return {}
+
+    relevant = [item for item in scored if item[2] >= _OWNER_RERANK_MIN_SCORE]
+    canonical = [item for item in relevant if item[0] == "canonical"]
+    # Once canonical evidence clears the semantic relevance threshold, do not
+    # expose lower-authority text in the same answer context. This preserves
+    # the established canonical-wins boundary without asking candidate text or
+    # a generative model to classify its own authority.
+    eligible = canonical or [item for item in relevant if item[0] != "canonical"]
+    eligible.sort(key=lambda item: (-item[2], item[3]))
+    selected_ids = [item[1] for item in eligible[:_OWNER_RERANK_EVIDENCE_LIMIT]]
+    selected_set = set(selected_ids)
+    return {
+        "selected_ids": selected_ids,
+        "rejected_ids": [str(candidate["id"]) for candidate in candidates if str(candidate["id"]) not in selected_set],
+        "sufficient": bool(selected_ids),
+    }
 
 
 def _is_capture_worthy_owner_statement(text: str) -> bool:
@@ -346,8 +440,26 @@ def _scope_owner_restaurant_results(query: str, results: list) -> tuple[list, bo
         match = re.search(r"/Food/Restaurants/([^/]+)\.md$", relative_path, re.IGNORECASE)
         if match:
             restaurants.append((match.group(1), item))
-    named = [(name, item) for name, item in restaurants if _restaurant_key(name) in query_key]
+    def venue_keys(name: str) -> list[str]:
+        # Restaurant filenames may carry a branch suffix ("Venue - City") even
+        # when ordinary questions name only the venue. Both are canonical IDs.
+        variants = [name]
+        if " - " in name:
+            variants.append(name.split(" - ", 1)[0])
+        return [key for key in (_restaurant_key(value) for value in variants) if key]
+
+    named = [
+        (name, item)
+        for name, item in restaurants
+        if any(key in query_key for key in venue_keys(name))
+    ]
     if not named:
+        # A query that syntactically names a venue must never fall through to
+        # semantically similar records from another restaurant. Speech
+        # normalization may repair known aliases upstream; unknown names fail
+        # closed here rather than becoming someone else's order.
+        if re.search(r"\b(?:at|from)\s+(?:the\s+)?[^?.!]+", query or "", re.IGNORECASE):
+            return [], True
         return results, False
 
     # Prefer the longest match if one venue name contains another.
@@ -371,6 +483,29 @@ def _scope_owner_restaurant_results(query: str, results: list) -> tuple[list, bo
         for word in query_words
     ))
     return [exact, *reciprocal], True
+
+
+def _scope_usual_order_evidence(query: str, item: dict) -> dict:
+    """For explicit usual-order questions, expose only the recorded answer."""
+    if not re.search(r"\b(?:normally|usual(?:ly)?|typically)\b", query or "", re.IGNORECASE):
+        return item
+    memory = str(item.get("memory") or "")
+    direct = re.search(r"(?mi)^-\s*Usual order:\s*.+$", memory)
+    if direct:
+        copy = dict(item)
+        copy["memory"] = "### Dennis\n" + direct.group(0)
+        return copy
+    section = re.search(
+        r"(?mis)^##\s+Usual orders by person\s*$.*?^-\s*Dennis:\s*.+$",
+        memory,
+    )
+    if section:
+        dennis = re.search(r"(?mi)^-\s*Dennis:\s*.+$", section.group(0))
+        if dennis:
+            copy = dict(item)
+            copy["memory"] = "## Usual orders by person\n" + dennis.group(0)
+            return copy
+    return item
 
 
 def _owner_canonical_query(query: str) -> str:
@@ -578,7 +713,11 @@ def _format_prefetch_context(
             "For identity questions, answer Dennis only when directly supported by Owner context, otherwise state uncertainty. "
             "For factual answers, use only explicit facts below. Preserve proper names, dates, places, employers, and relationship "
             "direction exactly as written. Do not add connective biography, motives, inferred roles, relatives, or corrected spellings. "
-            "Prefer a terse list or direct sentence over narrative prose. If the requested identity differs from the selected record, "
+            "If canonical Obsidian evidence directly conflicts with conversation evidence, canonical evidence wins; otherwise an explicit "
+            "user-authored conversation fact may answer when canonical evidence is silent. "
+            "Prefer a terse list or direct sentence over narrative prose. If a canonical venue record says a person's usual "
+            "order is not stated, answer that no usual order is recorded; never promote liked foods, occasional choices, or "
+            "drinks into a usual order. If the requested identity differs from the selected record, "
             "state the mismatch rather than treating them as the same person. Answer in plain text facts; never emit Obsidian wikilinks. "
         )
     intro += "Do not force memories into the conversation."
@@ -681,6 +820,59 @@ class _SupermemoryClient:
             })
         return results
 
+    def search_documents(self, query: str, *, limit: int = 5,
+                         container_tag: Optional[str] = None) -> list[dict]:
+        """Search canonical superrag chunks rather than extracted memories."""
+        tag = container_tag or self._container_tag
+        response = self._client.search.documents(
+            q=query,
+            container_tags=[tag],
+            limit=limit,
+            rerank=False,
+            rewrite_query=False,
+            only_matching_chunks=True,
+        )
+        results = []
+        for document in (getattr(response, "results", None) or []):
+            document_id = (
+                getattr(document, "document_id", None)
+                or getattr(document, "documentId", None)
+                or ""
+            )
+            metadata = getattr(document, "metadata", None)
+            updated_at = (
+                getattr(document, "updated_at", None)
+                or getattr(document, "updatedAt", None)
+            )
+            chunks = getattr(document, "chunks", None) or []
+            for index, chunk in enumerate(chunks):
+                text = getattr(chunk, "content", "") or ""
+                if not text:
+                    continue
+                identity = []
+                if isinstance(metadata, dict):
+                    for key in (
+                        "canonical_path", "entity_type", "entity_name",
+                        "venue_name", "branch", "schema_version",
+                    ):
+                        value = metadata.get(key)
+                        if value not in (None, ""):
+                            identity.append(f"{key}: {value}")
+                if identity:
+                    text = "[canonical-identity]\n" + "\n".join(identity) + "\n[/canonical-identity]\n\n" + text
+                results.append({
+                    "id": f"{document_id}:{index}" if document_id else "",
+                    "memory": text,
+                    "similarity": (
+                        getattr(chunk, "score", None)
+                        if getattr(chunk, "score", None) is not None
+                        else getattr(document, "score", None)
+                    ),
+                    "updated_at": updated_at,
+                    "metadata": metadata,
+                })
+        return results[:limit]
+
     def get_profile(self, query: Optional[str] = None, *,
                     container_tag: Optional[str] = None) -> dict:
         tag = container_tag or self._container_tag
@@ -705,12 +897,19 @@ class _SupermemoryClient:
                         "similarity": getattr(item, "similarity", None),
                     })
         if query and self._search_mode in {"hybrid", "documents"}:
-            hybrid_results = self.search_memories(
-                query,
-                limit=20,
-                container_tag=tag,
-                search_mode=self._search_mode,
-            )
+            if tag == _OWNER_CANONICAL_CONTAINER:
+                hybrid_results = self.search_documents(
+                    query,
+                    limit=20,
+                    container_tag=tag,
+                )
+            else:
+                hybrid_results = self.search_memories(
+                    query,
+                    limit=20,
+                    container_tag=tag,
+                    search_mode=self._search_mode,
+                )
             seen = {
                 str(item.get("id") or "") + "\0" + str(item.get("memory") or "")
                 for item in search_results
@@ -1064,10 +1263,24 @@ class SupermemoryMemoryProvider(MemoryProvider):
             }
             candidates.append(candidate)
             by_id[candidate_id] = item
-        # The fixed reranker contract was benchmarked with eight bounded
-        # candidates. Deterministic authority/entity ranking has already run;
-        # do not hand a local pre-call model an unbounded contaminated pile.
-        candidates = candidates[:8]
+        # Deterministic authority/entity/venue gates have already run. The
+        # scorer may order eligible evidence, but its score cannot make an
+        # otherwise ineligible record authoritative.
+        # Give both eligible sources a path into the bounded reranker input.
+        # The upstream lists are independently relevance-ordered, so alternate
+        # them rather than allowing a long canonical list to starve explicit
+        # user conversation facts before scoring begins.
+        canonical_candidates = [candidate for candidate in candidates if candidate["authority"] == "canonical"]
+        conversation_candidates = [candidate for candidate in candidates if candidate["authority"] != "canonical"]
+        candidates = []
+        for index in range(max(len(canonical_candidates), len(conversation_candidates))):
+            if index < len(canonical_candidates):
+                candidates.append(canonical_candidates[index])
+            if index < len(conversation_candidates):
+                candidates.append(conversation_candidates[index])
+            if len(candidates) >= _OWNER_RERANK_CANDIDATE_LIMIT:
+                break
+        candidates = candidates[:_OWNER_RERANK_CANDIDATE_LIMIT]
         by_id = {candidate["id"]: by_id[candidate["id"]] for candidate in candidates}
         if len(candidates) <= 1:
             logger.warning("owner reranker bypassed candidates=%d reason=%s", len(candidates), "single" if candidates else "empty")
@@ -1075,13 +1288,6 @@ class SupermemoryMemoryProvider(MemoryProvider):
         started = time.monotonic()
         logger.warning("owner reranker request model=%s candidates=%d", _OWNER_RERANK_MODEL, len(candidates))
         result = _call_owner_reranker(query, candidates)
-        logger.warning(
-            "owner reranker response candidates=%d selected=%d sufficient=%s elapsed_ms=%d",
-            len(candidates),
-            len(result.get("selected_ids") or []) if isinstance(result, dict) else 0,
-            result.get("sufficient") if isinstance(result, dict) else None,
-            round((time.monotonic() - started) * 1000),
-        )
         if not isinstance(result, dict) or set(result) != {"selected_ids", "rejected_ids", "sufficient"}:
             return []
         selected = result.get("selected_ids")
@@ -1096,27 +1302,100 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return []
         if not sufficient or not selected:
             return []
+        selected = selected[:_OWNER_RERANK_EVIDENCE_LIMIT]
+        logger.warning(
+            "owner reranker response candidates=%d selected=%d sufficient=%s elapsed_ms=%d",
+            len(candidates), len(selected), sufficient,
+            round((time.monotonic() - started) * 1000),
+        )
         return [by_id[candidate_id] for candidate_id in selected]
+
+    @staticmethod
+    def _owner_tool_query(query: str) -> str:
+        """Resolve first-person Owner tool queries before canonical scoping."""
+        if re.search(r"\b(?:I|my|mine|myself)\b|(?<!tell )\bme\b", query, re.IGNORECASE) and not re.search(
+            r"\bDennis(?:\s+Malone)?\b", query, re.IGNORECASE
+        ):
+            return f"Authenticated Owner is Dennis. Dennis asks about himself: {query}"
+        return query
+
+    def _search_owner_evidence(self, query: str, *, limit: int) -> list[dict]:
+        """Apply prefetch's authority, venue, person, and rerank gates to tools."""
+        owner_query = self._owner_tool_query(query)
+        if self._client is None:
+            return []
+        recall_query = _owner_canonical_query(owner_query)
+        results = self._client.search_documents(
+            recall_query[:511], limit=20, container_tag=_OWNER_CANONICAL_CONTAINER,
+        )
+        results = _authoritative_search_results(results)
+        results = _scope_owner_named_person_results(owner_query, results)
+        results, named_restaurant = _scope_owner_restaurant_results(owner_query, results)
+        venue_record = results[0] if named_restaurant and results else None
+        results = _rank_owner_canonical_results(owner_query, results)
+        conversations = [] if named_restaurant else self._client.search_memories(
+            owner_query, limit=20, container_tag=_OWNER_CONVERSATION_CONTAINER,
+            search_mode=self._search_mode,
+        )
+        results = self._rerank_owner_candidates(owner_query, results + conversations)
+        if venue_record is not None:
+            scoped_venue = _scope_usual_order_evidence(owner_query, venue_record)
+            if scoped_venue is not venue_record:
+                results = [scoped_venue]
+            else:
+                venue_id = venue_record.get("id")
+                results = [
+                    item for item in results
+                    if item is not venue_record and (not venue_id or item.get("id") != venue_id)
+                ]
+                results = [venue_record] + results[:max(0, limit - 1)]
+        return _scope_owner_person_sections(owner_query, results)[:limit]
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if not self._active or not self._auto_recall or not self._client or not query.strip():
             return ""
         try:
             canonical_owner = self._container_tag == _OWNER_CANONICAL_CONTAINER
-            recall_query = _owner_canonical_query(query) if canonical_owner else query
+            retrieval_query = _owner_prefetch_query(query) if canonical_owner else query
+            recall_query = _owner_canonical_query(retrieval_query) if canonical_owner else retrieval_query
             profile = self._client.get_profile(query=recall_query[:200])
             include_profile = self._turn_count <= 1 or (self._turn_count % self._profile_frequency == 0)
-            search_results = _authoritative_search_results(profile["search_results"])
+            profile_results = profile["search_results"]
+            if canonical_owner:
+                profile_results = profile_results + self._client.search_documents(
+                    recall_query[:511], limit=20, container_tag=_OWNER_CANONICAL_CONTAINER,
+                )
+                fallback_query = _owner_prefetch_fallback_query(query)
+                if fallback_query:
+                    profile_results = profile_results + self._client.search_documents(
+                        fallback_query, limit=20, container_tag=_OWNER_CANONICAL_CONTAINER,
+                    )
+            search_results = _authoritative_search_results(profile_results)
             named_restaurant = False
             if canonical_owner:
-                search_results = _scope_owner_named_person_results(query, search_results)
-                search_results, named_restaurant = _scope_owner_restaurant_results(query, search_results)
-                search_results = _rank_owner_canonical_results(query, search_results)
-                conversation_results = self._client.search_memories(
-                    query, limit=20, container_tag=_OWNER_CONVERSATION_CONTAINER, search_mode=self._search_mode
+                search_results = _scope_owner_named_person_results(retrieval_query, search_results)
+                search_results, named_restaurant = _scope_owner_restaurant_results(retrieval_query, search_results)
+                venue_record = search_results[0] if named_restaurant and search_results else None
+                search_results = _rank_owner_canonical_results(retrieval_query, search_results)
+                conversation_results = [] if named_restaurant else self._client.search_memories(
+                    retrieval_query, limit=20, container_tag=_OWNER_CONVERSATION_CONTAINER, search_mode=self._search_mode
                 )
-                search_results = self._rerank_owner_candidates(query, search_results + conversation_results)
-                search_results = _scope_owner_person_sections(query, search_results)
+                candidates = _scope_owner_dated_event_results(
+                    retrieval_query, search_results + conversation_results,
+                )
+                search_results = self._rerank_owner_candidates(retrieval_query, candidates)
+                if venue_record is not None:
+                    scoped_venue = _scope_usual_order_evidence(retrieval_query, venue_record)
+                    if scoped_venue is not venue_record:
+                        search_results = [scoped_venue]
+                    else:
+                        venue_id = venue_record.get("id")
+                        search_results = [
+                            item for item in search_results
+                            if item is not venue_record and (not venue_id or item.get("id") != venue_id)
+                        ]
+                        search_results = [venue_record] + search_results[:3]
+                search_results = _scope_owner_person_sections(retrieval_query, search_results)
             else:
                 search_results, named_restaurant = _scope_owner_restaurant_results(query, search_results)
             context = _format_prefetch_context(
@@ -1129,8 +1408,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 # retrieval runner below its context threshold across turns.
                 max_results=(
                     2 if canonical_owner and re.search(r"\bmy\s+parents?\b", query, re.IGNORECASE)
-                    else 4 if canonical_owner and named_restaurant
-                    else 1 if canonical_owner
+                    else _OWNER_RERANK_EVIDENCE_LIMIT if canonical_owner
                     else self._max_recall_results
                 ),
                 owner_context=canonical_owner,
@@ -1401,7 +1679,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
         except Exception:
             limit = 5
         try:
-            results = self._client.search_memories(query, limit=limit, container_tag=tag)
+            if self._container_tag == _OWNER_CANONICAL_CONTAINER and tag in {None, _OWNER_CANONICAL_CONTAINER}:
+                results = self._search_owner_evidence(query, limit=limit)
+            else:
+                results = self._client.search_memories(query, limit=limit, container_tag=tag)
             formatted = []
             for item in results:
                 entry: dict[str, Any] = {"id": item.get("id", ""), "content": item.get("memory", "")}
