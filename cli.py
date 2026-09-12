@@ -5519,6 +5519,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Parse and validate toolsets
         self.enabled_toolsets = toolsets
+        # This local provider is intentionally inference-only for both Owner
+        # and Family.  An explicit empty list is required: None means "all
+        # configured tools", while ``-t ''`` is normalized away by argparse.
+        # Keep this provider gate until local Qwen tool use is explicitly
+        # approved and validated.
+        if (self.requested_provider or "").strip().lower() == "local-qwen":
+            self.enabled_toolsets = []
         from agent.skill_utils import parse_config_string_list
 
         self.disabled_toolsets = parse_config_string_list(CLI_CONFIG["agent"].get("disabled_toolsets"))
@@ -5527,7 +5534,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             toolsets
             and "all" not in toolsets
             and "*" not in toolsets
-            and (model or "").lower() != "qwen3.5:4b"
+            and (self.requested_provider or "").strip().lower() != "local-qwen"
         ):
             # The pinned Qwen route intentionally sends no tools; configured
             # toolsets are irrelevant there and must not emit startup warnings.
