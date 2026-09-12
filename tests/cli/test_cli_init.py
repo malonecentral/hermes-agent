@@ -106,6 +106,17 @@ class TestVerboseAndToolProgress:
         assert cli.tool_progress_mode in {"off", "new", "all", "verbose"}
 
 
+class TestUnknownToolsetWarningOutput:
+    def test_warning_uses_stderr_and_preserves_programmatic_stdout(self, capsys):
+        _make_cli(toolsets=["stt"])
+        payload = '{"team":"Michigan Wolverines"}'
+        print(payload)
+
+        captured = capsys.readouterr()
+        assert captured.out == payload + "\n"
+        assert "Warning: Unknown toolsets: stt" in captured.err
+
+
 class TestFallbackChainInit:
     def test_merges_new_and_legacy_fallback_config(self):
         cli = _make_cli(config_overrides={
