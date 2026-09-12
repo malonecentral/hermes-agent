@@ -963,6 +963,30 @@ def init_agent(
     agent.provider_data_collection = provider_data_collection
     agent.openrouter_min_coding_score = openrouter_min_coding_score
 
+    # Capability metadata is an execution constraint, not merely picker
+    # decoration. Named custom providers resolve to the generic ``custom``
+    # transport, so consult both the original alias and its canonical
+    # ``custom:<alias>`` override key before constructing any tool schemas.
+    capability_provider = (requested_provider or provider or "").strip()
+    if capability_provider:
+        try:
+            from agent.models_dev import get_model_capabilities
+
+            model_capabilities = get_model_capabilities(capability_provider, model)
+            if model_capabilities is None and not capability_provider.startswith("custom:"):
+                model_capabilities = get_model_capabilities(
+                    f"custom:{capability_provider}", model
+                )
+            if model_capabilities is not None and not model_capabilities.supports_tools:
+                enabled_toolsets = []
+        except Exception as exc:
+            _ra().logger.debug(
+                "Could not enforce model tool capability for %s/%s: %s",
+                capability_provider,
+                model,
+                exc,
+            )
+
     # Store toolset filtering options
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
