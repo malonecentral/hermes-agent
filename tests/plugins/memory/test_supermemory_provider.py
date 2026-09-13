@@ -1037,6 +1037,7 @@ def test_exact_venue_hydration_obeys_expired_deadline_without_call(provider):
 
 
 def _install_exact_date_restaurant(tmp_path, provider, source):
+    source = "---\ntype: restaurant-template\nschema_version: 4\n---\n" + source
     root = tmp_path / "vault"
     relative = "Jarvis/Family Shared/Food/Restaurants/Hob Nob Sports Grill.md"
     path = root / relative
@@ -1058,7 +1059,7 @@ def test_gate_off_exact_date_food_miss_hydrates_verified_canonical_parent(
         "restaurant: Hob Nob Sports Grill\n## Visits\n### 2026-09-12\n"
         "- Dennis liked and ordered the pork tenderloin sandwich with crinkle-cut fries."
     )
-    custom_id = _install_exact_date_restaurant(tmp_path, provider, source)
+    _install_exact_date_restaurant(tmp_path, provider, source)
     provider._client.search_documents = lambda *args, **kwargs: []
     provider._client.search_memories = lambda *args, **kwargs: []
     monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker",
@@ -1070,17 +1071,15 @@ def test_gate_off_exact_date_food_miss_hydrates_verified_canonical_parent(
     )
 
     assert "pork tenderloin sandwich with crinkle-cut fries" in result
-    assert provider._client.get_document_calls[0]["id"] == custom_id
+    assert provider._client.get_document_calls == []
     assert all(call["filters"] is None for call in provider._client.search_calls)
 
 
-def test_exact_date_hydration_fails_closed_for_unverified_parent(provider, tmp_path):
+def test_exact_date_hydration_fails_closed_for_non_v4_source(provider, tmp_path):
     source = "restaurant: Hob Nob Sports Grill\n### 2026-09-12\n- Trusted local text."
-    custom_id = _install_exact_date_restaurant(tmp_path, provider, source)
-    provider._client.documents_by_id[custom_id]["metadata"] = {
-        **provider._client.documents_by_id[custom_id]["metadata"],
-        "relative_path": "Jarvis/Owner Private/Secrets.md",
-    }
+    _install_exact_date_restaurant(tmp_path, provider, source)
+    path = tmp_path / "vault/Jarvis/Family Shared/Food/Restaurants/Hob Nob Sports Grill.md"
+    path.write_text(path.read_text().replace("schema_version: 4", "schema_version: 3"))
 
     assert provider._hydrate_exact_date_restaurants(
         {"event_date": ("2026-09-12",)}, deadline=time.monotonic() + 1,

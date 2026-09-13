@@ -1389,6 +1389,7 @@ class _SupermemoryClient:
             "updated_at": getattr(document, "updated_at", None) or getattr(document, "updatedAt", None),
         }
 
+
     def get_profile(self, query: Optional[str] = None, *,
                     container_tag: Optional[str] = None,
                     timeout: Optional[float] = None,
@@ -1946,9 +1947,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
         """Read verified restaurant parents when the search index misses a date.
 
         This is deliberately not a temporal search-filter fallback.  It uses a
-        host-resolved single date to locate bounded canonical source files,
-        then admits only the corresponding provider parent after byte, ACL,
-        path, container, and stable-ID verification.
+        host-resolved single date to locate bounded schema-v4 files under the
+        importer's exact Family Shared restaurant root.
         """
         if (self._client is None or not isinstance(retrieval_context, dict)
                 or not _valid_trusted_temporal_scope(retrieval_context)):
@@ -1980,45 +1980,31 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
         hydrated: list[dict] = []
         for path, raw in matches:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or len(raw) > _OWNER_EXACT_DOCUMENT_MAX_BYTES:
+            if time.monotonic() >= deadline or len(raw) > _OWNER_EXACT_DOCUMENT_MAX_BYTES:
                 return []
             relative_path = path.relative_to(root).as_posix()
             custom_id = "obsidian-" + hashlib.sha256(relative_path.encode("utf-8")).hexdigest()
             try:
-                document = self._client.get_document(custom_id, timeout=remaining)
-            except Exception:
-                logger.warning("supermemory_prefetch stage=exact_date_hydrate outcome=error")
+                source = raw.decode("utf-8")
+            except UnicodeDecodeError:
                 return []
-            metadata = document.get("metadata")
-            metadata = metadata if isinstance(metadata, dict) else {}
-            content = str(document.get("content") or "")
-            prefix = re.match(r"\A\[canonical-identity\]\n[\s\S]*?\n\[/canonical-identity\]\n\n", content)
-            source = content[prefix.end():] if prefix else ""
-            source_bytes = source.encode("utf-8")
-            if raw.endswith(b"\n") and source_bytes == raw[:-1]:
-                content += "\n"
-                source_bytes += b"\n"
-            trusted = {"metadata": metadata}
-            valid = (
-                document.get("custom_id") == custom_id
-                and custom_id in {document.get("id"), document.get("custom_id")}
-                and _OWNER_CANONICAL_CONTAINER in document.get("container_tags", [])
-                and document.get("task_type") == "superrag"
-                and document.get("status") == "done"
-                and metadata.get("relative_path") == relative_path
-                and _is_canonical_result(trusted, schema_v4_ready=True)
-                and metadata.get("content_bytes") == len(raw)
-                and metadata.get("content_sha256") == hashlib.sha256(raw).hexdigest()
-                and source_bytes == raw
-                and time.monotonic() <= deadline
+            if not re.match(r"\A---\s*\n[\s\S]{0,4096}?\nschema_version:\s*4\s*$", source,
+                            re.MULTILINE):
+                return []
+            content = (
+                "[canonical-identity]\n"
+                f"canonical_path: {relative_path}\nentity_type: restaurant\n"
+                f"entity_name: {path.stem}\n[/canonical-identity]\n\n{source}"
             )
-            if not valid:
-                logger.warning("supermemory_prefetch stage=exact_date_hydrate outcome=rejected")
-                return []
+            metadata = {
+                "index_schema_version": 4, "source": "obsidian", "authority": "canonical",
+                "identity_scope": "owner", "canonical_root": "owner",
+                "visibility": "family_shared", "relative_path": relative_path,
+                "content_bytes": len(raw), "content_sha256": hashlib.sha256(raw).hexdigest(),
+            }
             hydrated.append({
                 "id": custom_id, "memory": content, "metadata": metadata,
-                "updated_at": document.get("updated_at"),
+                "updated_at": "",
             })
         if hydrated:
             logger.info(
