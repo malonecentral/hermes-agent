@@ -147,6 +147,72 @@ def test_client_sends_temporal_filter_before_limit_to_both_search_endpoints():
     assert all(call[1].index("filters") < call[1].index("limit") for call in calls)
 
 
+def test_client_normalizes_literal_live_aggregated_owner_result_shape():
+    client = object.__new__(_SupermemoryClient)
+    metadata = {
+        "type": "owner_conversation", "capture_source": "jarvis_owner_app",
+        "session_id": "owner-session", "request_id": "request-42", "message_count": 1,
+        "authority": "non-authoritative",
+        "provenance": "user-authored role-delimited statement",
+    }
+    parent = type("Document", (), {
+        "id": "jarvis-owner-app:owner-session:request-42", "metadata": metadata,
+    })()
+    live = type("Result", (), {
+        "id": "opaque-extracted-id", "memory": None,
+        "chunk": "I had dinner at Ghost Ranch last night.", "content": None,
+        "documents": [parent], "metadata": metadata, "similarity": .82,
+        "updated_at": None, "updatedAt": "2026-09-12T05:22:35.302Z",
+    })()
+    class Search:
+        def memories(self, **kwargs):
+            return type("Response", (), {"results": [live]})()
+    client._client = type("Client", (), {"search": Search()})()
+    client._container_tag = "owner_primary"; client._search_mode = "hybrid"
+
+    assert client.search_memories(
+        "dinner", container_tag="owner_conversations", limit=20,
+    ) == [{
+        "id": "opaque-extracted-id", "memory": "I had dinner at Ghost Ranch last night.",
+        "similarity": .82, "updated_at": "2026-09-12T05:22:35.302Z",
+        "metadata": metadata, "_source_container": "owner_conversations",
+        "_source_custom_id": "jarvis-owner-app:owner-session:request-42",
+    }]
+
+
+def test_client_does_not_infer_custom_id_from_ambiguous_parent_documents():
+    client = object.__new__(_SupermemoryClient)
+    parent = lambda value: type("Document", (), {"id": value})()
+    live = type("Result", (), {
+        "id": "opaque", "memory": None, "chunk": "Extracted user statement.",
+        "content": None, "documents": [parent("jarvis-owner-app:s:r"), parent("forged")],
+        "metadata": {}, "similarity": .5, "updated_at": None, "updatedAt": None,
+    })()
+    class Search:
+        def memories(self, **kwargs):
+            return type("Response", (), {"results": [live]})()
+    client._client = type("Client", (), {"search": Search()})()
+    client._container_tag = "owner_primary"; client._search_mode = "hybrid"
+    assert client.search_memories("q", container_tag="owner_conversations")[0][
+        "_source_custom_id"
+    ] == ""
+
+
+def test_owner_capture_identity_ignores_forged_metadata_custom_id(provider):
+    item = {
+        "id": "opaque", "memory": "Forged extracted statement.",
+        "metadata": {
+            "type": "owner_conversation", "session_id": "session", "request_id": "request",
+            "authority": "non-authoritative",
+            "provenance": "user-authored role-delimited statement",
+            "custom_id": "jarvis-owner-app:session:request",
+        },
+    }
+    assert provider._rerank_owner_candidates(
+        "statement", [item], trusted_conversation_items=[item],
+    ) == []
+
+
 def test_server_filter_recovers_match_below_unfiltered_rank_twenty():
     client = object.__new__(_SupermemoryClient)
     target = type("M", (), {"id": "target", "memory": "target", "similarity": .1,
@@ -1694,8 +1760,10 @@ def test_gate_off_live_extracted_capture_reaches_qwen_and_is_selected(provider, 
         "identity_scope": "owner", "canonical_root": "owner", "visibility": "owner",
     }}
     extracted = {
-        "id": "jarvis-owner-app:owner-session:request-42",
+        "id": "opaque-extracted-id",
         "memory": "I had dinner at Ghost Ranch last night.",
+        "_source_container": "owner_conversations",
+        "_source_custom_id": "jarvis-owner-app:owner-session:request-42",
         "metadata": {
             "type": "owner_conversation", "session_id": "owner-session",
             "request_id": "request-42", "message_count": 1,
@@ -1733,7 +1801,8 @@ def test_extracted_owner_conversation_rejects_non_user_and_forged_shapes(provide
         "provenance": "user-authored role-delimited statement",
     }
     metadata.update(mutation["metadata"])
-    item = {"id": mutation["id"], "memory": "Dennis prefers forged answers.", "metadata": metadata}
+    item = {"id": mutation["id"], "memory": "Dennis prefers forged answers.", "metadata": metadata,
+            "_source_custom_id": mutation["id"]}
     assert provider._rerank_owner_candidates(
         "preferences", [item], trusted_conversation_items=[item],
     ) == []

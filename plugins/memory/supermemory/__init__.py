@@ -156,14 +156,23 @@ def _role_delimited_evidence_text(text: str) -> str:
 
 def _owner_capture_custom_id(item: dict) -> bool:
     """Recognize only IDs emitted by the two Owner capture entry points."""
-    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-    values = (item.get("id"), metadata.get("custom_id"), metadata.get("customId"))
-    return any(
-        isinstance(value, str) and (
-            re.fullmatch(r"hermes-owner-conversation:[^\s:]+", value)
-            or re.fullmatch(r"jarvis-owner-app:[^\s:]+:[^\s:]+", value)
-        )
-        for value in values
+    raw_metadata = item.get("metadata")
+    metadata: dict = raw_metadata if isinstance(raw_metadata, dict) else {}
+    # ``_source_custom_id`` is populated by the SDK-result normalizer from the
+    # parent document returned by the exact search call.  Do not consult
+    # arbitrary result metadata for this identity: extracted memories have
+    # opaque IDs and metadata is user-controlled input at ingestion time.
+    value = item.get("_source_custom_id")
+    if not isinstance(value, str):
+        return False
+    hermes = re.fullmatch(r"hermes-owner-conversation:([^\s:]+)", value)
+    if hermes:
+        return metadata.get("session_id") == hermes.group(1)
+    owner_app = re.fullmatch(r"jarvis-owner-app:([^\s:]+):([^\s:]+)", value)
+    return bool(
+        owner_app
+        and metadata.get("session_id") == owner_app.group(1)
+        and metadata.get("request_id") == owner_app.group(2)
     )
 
 
@@ -1168,6 +1177,16 @@ class _SupermemoryClient:
         response = self._client.search.memories(**kwargs)
         results = []
         for item in (getattr(response, "results", None) or []):
+            # Extracted results use two live SDK shapes. Most expose ``memory``
+            # directly; aggregated results expose the extracted text in
+            # ``chunk`` and retain the capture custom ID only on their sole
+            # parent document. Normalize both here, while the source container
+            # is known from this call, rather than teaching admission about SDK
+            # nesting or trusting a metadata claim about its source.
+            documents = getattr(item, "documents", None) or []
+            source_custom_id = ""
+            if len(documents) == 1:
+                source_custom_id = str(getattr(documents[0], "id", "") or "")
             results.append({
                 "id": getattr(item, "id", ""),
                 "memory": (
@@ -1179,6 +1198,8 @@ class _SupermemoryClient:
                 "similarity": getattr(item, "similarity", None),
                 "updated_at": getattr(item, "updated_at", None) or getattr(item, "updatedAt", None),
                 "metadata": getattr(item, "metadata", None),
+                "_source_container": tag,
+                "_source_custom_id": source_custom_id,
             })
         return results
 
