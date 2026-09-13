@@ -682,11 +682,26 @@ def test_capture_owner_app_turn_uses_request_scoped_id_and_existing_filters(monk
     assert len(p._client.add_calls) == before
 
 
+def test_long_lived_provider_honors_capture_disable_without_restart(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({"container_tag": "owner_primary", "auto_capture": True}, str(tmp_path))
+    provider = SupermemoryMemoryProvider()
+    provider.initialize("owner-session", hermes_home=str(tmp_path), platform="cli")
+
+    _save_supermemory_config({"auto_capture": False}, str(tmp_path))
+    provider.sync_turn("Dennis prefers aisle seats.", "Noted.", session_id="owner-session")
+    assert provider.capture_owner_app_turn(
+        "app-session", "request-42", "I prefer aisle seats.", "Noted."
+    ) is False
+    assert provider._client is not None
+    assert getattr(provider._client, "add_calls") == []
+
+
 @pytest.mark.parametrize(
     ("attribute", "value", "message"),
     [
         ("_active", False, "provider inactive"),
-        ("_auto_capture", False, "automatic capture disabled"),
         ("_write_enabled", False, "writes disabled"),
         ("_client", None, "client unavailable"),
         ("_container_tag", "other", "non-canonical container"),

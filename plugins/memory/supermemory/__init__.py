@@ -1588,7 +1588,12 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
                   messages: Optional[List[Dict[str, Any]]] = None) -> None:
-        if not self._active or not self._auto_capture or not self._write_enabled or not self._client:
+        # A provider can outlive a config change (CLI, desktop, and gateway
+        # sessions are routinely long-running).  A capture disable must take
+        # effect immediately instead of relying on those processes to restart.
+        capture_enabled = bool(_load_supermemory_config(self._hermes_home)["auto_capture"])
+        if (not self._active or not self._auto_capture or not capture_enabled
+                or not self._write_enabled or not self._client):
             return
         capture_session_id = str(session_id or self._session_id).strip()
         if not capture_session_id:
@@ -1656,11 +1661,15 @@ class SupermemoryMemoryProvider(MemoryProvider):
         """Capture a turn, returning False only for terminal content filtering."""
         session_id = str(session_id or "").strip()
         request_id = str(request_id or "").strip()
+        # Disabled capture is a terminal policy decision, not transient
+        # provider unavailability.  Durable callers must acknowledge and stop
+        # replaying these turns while the switch is off.
+        if not self._auto_capture or not _load_supermemory_config(self._hermes_home)["auto_capture"]:
+            return False
         unavailable = []
         if not self._active:
             unavailable.append("provider inactive")
-        if not self._auto_capture:
-            unavailable.append("automatic capture disabled")
+
         if not self._write_enabled:
             unavailable.append("writes disabled")
         if not self._client:
