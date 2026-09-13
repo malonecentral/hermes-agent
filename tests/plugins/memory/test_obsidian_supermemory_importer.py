@@ -378,6 +378,98 @@ def test_schema_v4_backfill_rejects_unverified_legacy_record(importer, change, m
             expected_eligible=1, expected_owner_private=1, expected_family_shared=0)
 
 
+@pytest.mark.parametrize("suffix", ["", " ", "\t\r\n", " \n\n"])
+def test_schema_v4_backfill_accepts_only_eof_whitespace_drift(importer, suffix):
+    doc = importer.item("x.md", b"content")
+    remote = _legacy_remote(importer, doc) | {"content": doc["content"] + suffix}
+    importer.validate_legacy_backend_document(remote, doc)
+
+
+@pytest.mark.parametrize("content", ["Xcontent", "con tent", "content\nX", "content \nX"])
+def test_schema_v4_backfill_rejects_non_eof_content_drift(importer, content):
+    doc = importer.item("x.md", b"content")
+    remote = _legacy_remote(importer, doc) | {"content": content}
+    with pytest.raises(importer.ReconciliationRequired, match="content"):
+        importer.validate_legacy_backend_document(remote, doc)
+
+
+@pytest.mark.parametrize("key,value", [("content_sha256", "bad"), ("content_bytes", 999)])
+def test_schema_v4_backfill_requires_exact_canonical_byte_metadata(importer, key, value):
+    doc = importer.item("x.md", b"content")
+    remote = _legacy_remote(importer, doc)
+    remote["metadata"][key] = value
+    with pytest.raises(importer.ReconciliationRequired, match="identity"):
+        importer.validate_legacy_backend_document(remote, doc)
+
+
+def test_logical_v3_snapshot_is_private_hashed_and_exact(importer, tmp_path):
+    doc = importer.item("x.md", b"content")
+    remote = _legacy_remote(importer, doc)
+    path = tmp_path / "private" / "logical-v3.json"
+    plan = {"already_v4": 0, "replacements": {"x.md": {}},
+            "inventory": {doc["custom_id"]: remote}}
+    receipt = importer.create_logical_v3_snapshot(path, {"x.md": doc}, plan,
+        expected_eligible=1, expected_owner_private=1, expected_family_shared=0)
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    assert receipt["snapshot_format"] == "logical_backend_returned_v3"
+    assert receipt["byte_original"] is False and receipt["verified"] is True
+    loaded = importer.load_logical_v3_snapshot(path, expected_eligible=1,
+        expected_owner_private=1, expected_family_shared=0)
+    assert loaded["records"][0]["content"] == remote["content"]
+    assert loaded["records"][0]["metadata"] == remote["metadata"]
+
+
+def _write_snapshot(importer, tmp_path, doc):
+    legacy = _legacy_remote(importer, doc)
+    path = tmp_path / "logical-v3.json"
+    importer.create_logical_v3_snapshot(path, {doc["relative_path"]: doc},
+        {"already_v4": 0, "replacements": {doc["relative_path"]: {}},
+         "inventory": {doc["custom_id"]: legacy}},
+        expected_eligible=1, expected_owner_private=1, expected_family_shared=0)
+    return path, legacy
+
+
+def test_schema_v3_inverse_deletes_only_verified_v4_and_restores_exact_snapshot(importer, tmp_path):
+    doc = importer.item("x.md", b"content"); path, legacy = _write_snapshot(importer, tmp_path, doc)
+    v4 = _remote(importer, doc, content=doc["content"])
+    calls = []; replacement = dict(legacy, id="replacement-id")
+    class Documents:
+        def list(self, **kwargs):
+            calls.append(("list", kwargs["container_tags"]))
+            row = replacement if any(c[0] == "add" for c in calls) else v4
+            return {"memories": [row], "pagination": {"current_page": 1, "total_pages": 1}}
+        def delete(self, ident, timeout): calls.append(("delete", ident))
+        def add(self, **kwargs):
+            calls.append(("add", kwargs["custom_id"]))
+            assert kwargs["content"] == legacy["content"] and kwargs["metadata"] == legacy["metadata"]
+            return _Result("replacement-id", "queued")
+        def get(self, ident, timeout): calls.append(("get", ident)); return replacement
+    receipt = importer.execute_schema_v3_rollback(type("Client", (), {"documents": Documents()})(),
+        {"x.md": doc}, path, expected_eligible=1, expected_owner_private=1, expected_family_shared=0)
+    assert receipt["complete"] is True and receipt["restored_count"] == 1
+    assert ("delete", "backend-id") in calls
+    checkpoint = json.loads(path.with_suffix(".json.rollback.json").read_text())
+    assert checkpoint["records"][0]["replacement_document_id"] == "replacement-id"
+    assert checkpoint["records"][0]["stage"] == "done"
+
+
+def test_schema_v3_delete_fault_is_fail_closed_and_resumable(importer, tmp_path):
+    doc = importer.item("x.md", b"content"); path, _ = _write_snapshot(importer, tmp_path, doc)
+    v4 = _remote(importer, doc, content=doc["content"])
+    class Documents:
+        def list(self, **kwargs):
+            return {"memories": [v4], "pagination": {"current_page": 1, "total_pages": 1}}
+        def delete(self, ident, timeout): raise RuntimeError("injected delete fault")
+        def add(self, **kwargs): raise AssertionError("add after failed delete")
+    with pytest.raises(RuntimeError, match="injected"):
+        importer.execute_schema_v3_rollback(type("Client", (), {"documents": Documents()})(),
+            {"x.md": doc}, path, expected_eligible=1, expected_owner_private=1, expected_family_shared=0)
+    checkpoint = json.loads(path.with_suffix(".json.rollback.json").read_text())
+    assert checkpoint["records"][0]["stage"] == "verified_v4"
+    assert checkpoint["records"][0]["replacement_document_id"] == ""
+
+
 def test_schema_v4_backfill_container_isolation_never_touches_conversations(importer):
     assert importer.CONTAINER == "owner_primary"
     assert importer.CONVERSATION_CONTAINER == "owner_conversations"
@@ -389,6 +481,7 @@ def test_schema_v4_backfill_cli_requires_all_explicit_counts(importer, monkeypat
     with pytest.raises(SystemExit):
         importer.parse_args()
     monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--backfill-schema-v4",
+                                      "--snapshot", "/private/logical-v3.json",
                                       "--expected-eligible", "237",
                                       "--expected-owner-private", "133",
                                       "--expected-family-shared", "104"])
@@ -400,6 +493,7 @@ def test_schema_v4_backfill_cli_requires_all_explicit_counts(importer, monkeypat
 def test_schema_v4_backfill_cli_is_mutually_exclusive_with_read_only_modes(importer, monkeypatch):
     for read_only in ("--dry-run", "--verify-only"):
         monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--backfill-schema-v4", read_only,
+                                          "--snapshot", "/private/logical-v3.json",
                                           "--expected-eligible", "237",
                                           "--expected-owner-private", "133",
                                           "--expected-family-shared", "104"])
