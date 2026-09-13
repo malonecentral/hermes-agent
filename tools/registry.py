@@ -1204,6 +1204,13 @@ class ToolRegistry:
                 sanitized = raw  # defensive: never let the sanitizer block error propagation
             return tool_error(sanitized)
 
+    def is_available(self, name: str, *, scope: Optional[str] = None) -> bool:
+        """Return whether a registered tool is exposable in the active scope."""
+        entry = self.get_entry(name, scope=scope)
+        if entry is None:
+            return False
+        return not entry.check_fn or _check_fn_cached(entry.check_fn)
+
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)
     # ------------------------------------------------------------------

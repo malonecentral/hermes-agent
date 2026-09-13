@@ -591,7 +591,10 @@ class MemoryManager:
         """
         return extract_user_instruction_from_skill_message(text)
 
-    def prefetch_all(self, query: str, *, session_id: str = "") -> str:
+    def prefetch_all(
+        self, query: str, *, session_id: str = "", deadline: Optional[float] = None,
+        retrieval_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Collect prefetch context from all providers.
 
         Returns merged context text labeled by provider. Empty providers
@@ -603,7 +606,10 @@ class MemoryManager:
         parts = []
         for provider in self._providers:
             try:
-                result = self._prefetch_provider(provider, clean_query, session_id=session_id)
+                result = self._prefetch_provider(
+                    provider, clean_query, session_id=session_id, deadline=deadline,
+                    retrieval_context=retrieval_context,
+                )
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
@@ -614,12 +620,16 @@ class MemoryManager:
         return "\n\n".join(parts)
 
     def _prefetch_provider(
-        self, provider: MemoryProvider, query: str, *, session_id: str = ""
+        self, provider: MemoryProvider, query: str, *, session_id: str = "",
+        deadline: Optional[float] = None, retrieval_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         if provider.name == "builtin":
             return provider.prefetch(query, session_id=session_id)
 
-        deadline = time.monotonic() + self._external_prefetch_timeout
+        deadline = min(
+            deadline if deadline is not None else float("inf"),
+            time.monotonic() + self._external_prefetch_timeout,
+        )
         result_box: Dict[str, str] = {}
         error_box: Dict[str, Exception] = {}
 
@@ -635,6 +645,11 @@ class MemoryManager:
                     or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values())
                 ):
                     kwargs["deadline"] = deadline
+                if signature is not None and (
+                    "retrieval_context" in signature.parameters
+                    or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values())
+                ):
+                    kwargs["retrieval_context"] = retrieval_context or {}
                 result_box["value"] = provider.prefetch(query, **kwargs) or ""
             except Exception as exc:  # pragma: no cover - re-raised by caller
                 error_box["value"] = exc

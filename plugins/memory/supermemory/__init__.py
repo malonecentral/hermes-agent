@@ -15,10 +15,11 @@ import threading
 import time
 import urllib.request
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from zoneinfo import ZoneInfo
+
 
 from agent.memory_provider import MemoryProvider
 from agent.secret_scope import get_secret, is_multiplex_active
@@ -31,7 +32,7 @@ class OwnerAppCaptureUnavailable(RuntimeError):
     """Owner app capture cannot run and should be retried by its caller."""
 
 _DEFAULT_CONTAINER_TAG = "hermes"
-_DEFAULT_MAX_RECALL_RESULTS = 10
+_DEFAULT_MAX_RECALL_RESULTS = 5
 _DEFAULT_PROFILE_FREQUENCY = 50
 _DEFAULT_CAPTURE_MODE = "all"
 _DEFAULT_SEARCH_MODE = "hybrid"
@@ -48,10 +49,30 @@ _OWNER_CONVERSATION_CONTAINER = "owner_conversations"
 _OWNER_RERANK_URL = "http://mcomen.malonecentral.com:8082/rerank"
 _OWNER_RERANK_MODEL = "qwen3-reranker-0.6b-q8_0.gguf"
 _OWNER_RERANK_TIMEOUT_SECONDS = 6.0
-_OWNER_RERANK_MIN_SCORE = 0.5
-_OWNER_RERANK_CANDIDATE_LIMIT = 8
-_OWNER_RERANK_EVIDENCE_LIMIT = 4
-_OWNER_TIMEZONE = ZoneInfo("America/Phoenix")
+_OWNER_SOURCE_CANDIDATE_LIMIT = 20
+_DEFAULT_RERANKER_INPUT_TOKEN_BUDGET = 8192
+# llama.cpp /rerank evaluates every (query, document) pair independently.  A
+# valid UTF-8 byte is a conservative upper bound on tokenizer output, so these
+# reserves protect each pair without imposing an incorrect aggregate cap on a
+# request containing up to forty documents.
+_OWNER_RERANKER_QUERY_BYTE_LIMIT = 1024
+_OWNER_RERANKER_TEMPLATE_TOKEN_RESERVE = 768
+_DEFAULT_CONTEXT_CHAR_BUDGET = 12000
+_DEFAULT_CONTEXT_BYTE_BUDGET = 24000
+
+
+class _EvidenceProvenance(str, Enum):
+    """Trusted local classification used by construction and reranking."""
+
+    CANONICAL_DOCUMENT = "canonical_document"
+    USER_CONVERSATION = "user_conversation"
+
+
+_ROLE_BLOCK_RE = re.compile(
+    r"\[role: (user|assistant)\]\n([\s\S]*?)\n\[\1:end\]",
+)
+
+
 _TRIVIAL_RE = re.compile(
     r"^(ok|okay|thanks|thank you|got it|sure|yes|no|yep|nope|k|ty|thx|np)\.?$",
     re.IGNORECASE,
@@ -72,67 +93,149 @@ _DEFAULT_ENTITY_CONTEXT = (
     "When in doubt, store less."
 )
 
-def _owner_now() -> datetime:
-    """Return the Owner's wall-clock time for date resolution."""
-    return datetime.now(_OWNER_TIMEZONE)
+
+def _build_temporal_filters(retrieval_context: Optional[dict]) -> Optional[dict]:
+    """Build bounded filters exclusively from trusted host context."""
+    context = retrieval_context if isinstance(retrieval_context, dict) else {}
+    if not _valid_trusted_temporal_scope(context):
+        return None
+    clauses: list[dict] = []
+    for raw in context.get("event_date", ()):
+        try:
+            value = date.fromisoformat(raw).isoformat()
+        except (TypeError, ValueError):
+            continue
+        clauses.append({"OR": [
+            {"key": "event_date", "value": value},
+            {"key": "eventDate", "value": value},
+        ]})
+    for bounds in context.get("event_date_ranges", ()):
+        try:
+            start, end = (date.fromisoformat(value) for value in bounds)
+        except (TypeError, ValueError):
+            continue
+        if end < start or (end - start).days > 365:
+            return None
+        clauses.append({"AND": [
+            {"filterType": "numeric", "key": "event_date_ordinal", "value": str(start.toordinal()), "numericOperator": ">="},
+            {"filterType": "numeric", "key": "event_date_ordinal", "value": str(end.toordinal()), "numericOperator": "<="},
+        ]})
+    clauses = clauses[:100]  # at most 200 leaf conditions (provider limit)
+    if not clauses:
+        return None
+    return clauses[0] if len(clauses) == 1 else {"OR": clauses}
 
 
-def _owner_expand_relative_dates(query: str, *, now: Optional[datetime] = None) -> str:
-    """Annotate simple relative dates before semantic memory retrieval."""
-    current = now or _owner_now()
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=_OWNER_TIMEZONE)
-    else:
-        current = current.astimezone(_OWNER_TIMEZONE)
-    offsets = {"yesterday": -1, "today": 0, "tomorrow": 1}
-    pattern = re.compile(
-        r"\b(yesterday|today|tomorrow)\b(?!\s*\(\d{4}-\d{2}-\d{2}\))",
-        re.IGNORECASE,
-    )
-
-    def annotate(match: re.Match[str]) -> str:
-        resolved = (current.date() + timedelta(days=offsets[match.group(1).lower()])).isoformat()
-        return f"{match.group(1)} ({resolved})"
-
-    return pattern.sub(annotate, query)
+def _conversation_has_explicit_user_content(text: str) -> bool:
+    """Accept only a complete production role stream containing user text."""
+    position = 0
+    has_user_content = False
+    for match in _ROLE_BLOCK_RE.finditer(text):
+        if text[position:match.start()].strip():
+            return False
+        role, content = match.groups()
+        if role == "user" and content.strip():
+            has_user_content = True
+        position = match.end()
+    return has_user_content and not text[position:].strip()
 
 
-def _owner_prefetch_query(query: str) -> str:
-    """Resolve relative dates and add retrieval vocabulary for dated events."""
-    expanded = _owner_expand_relative_dates(query)
-    if expanded != query and re.search(r"\b(?:dinner|lunch|breakfast|eat|ate|restaurant)\b", query, re.IGNORECASE):
-        return f"{expanded} Dennis dining event restaurant location party ordered"
-    return expanded
+def _role_delimited_evidence_text(text: str) -> str:
+    """Separate user evidence from assistant context for downstream models."""
+    users, assistants = [], []
+    for role, content in _ROLE_BLOCK_RE.findall(text):
+        cleaned = content.strip()
+        if not cleaned:
+            continue
+        (users if role == "user" else assistants).append(cleaned)
+    sections = ["[user-authored evidence]\n" + "\n\n".join(users)]
+    if assistants:
+        sections.append("[assistant context only; not evidence]\n" + "\n\n".join(assistants))
+    return "\n\n".join(sections)
 
 
-def _owner_prefetch_fallback_query(original_query: str) -> Optional[str]:
-    """Return a broad semantic query when ISO dates damage embedding recall."""
-    has_relative_date = re.search(r"\b(?:yesterday|today|tomorrow)\b", original_query, re.IGNORECASE)
-    has_dining_cue = re.search(
-        r"\b(?:dinner|lunch|breakfast|eat|ate|restaurant)\b", original_query, re.IGNORECASE
-    )
-    if has_relative_date and has_dining_cue:
-        meal = re.search(r"\b(dinner|lunch|breakfast)\b", original_query, re.IGNORECASE)
-        meal_term = meal.group(1).lower() if meal else "dining"
-        return f"Dennis {meal_term} restaurant location party ordered"
+def _evidence_provenance(
+    item: dict, *, schema_v4_ready: bool = False,
+) -> Optional[_EvidenceProvenance]:
+    """Classify evidence from provider metadata plus validated capture shape."""
+    if _is_canonical_result(item, schema_v4_ready=schema_v4_ready):
+        return _EvidenceProvenance.CANONICAL_DOCUMENT
+    metadata = item.get("metadata") or {}
+    text = str(item.get("memory") or "")
+    if metadata.get("type") == "owner_conversation" and _conversation_has_explicit_user_content(text):
+        return _EvidenceProvenance.USER_CONVERSATION
+    # Backward-compatible structured records are accepted only when authorship
+    # is explicit. This does not infer user authorship from arbitrary text.
+    if (metadata.get("source") == "conversation" and metadata.get("speaker") == "user"
+            and text.strip()):
+        return _EvidenceProvenance.USER_CONVERSATION
     return None
 
 
-def _scope_owner_dated_event_results(query: str, results: list[dict]) -> list[dict]:
-    """Select records whose structured header matches the requested date and meal."""
-    dates = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", query)
-    if not dates:
+def _valid_trusted_temporal_scope(context: dict) -> bool:
+    """Reject malformed or over-broad host-generated temporal scope."""
+    if not isinstance(context, dict):
+        return False
+    for raw in context.get("event_date", ()):
+        try:
+            date.fromisoformat(raw)
+        except (TypeError, ValueError):
+            return False
+    for bounds in context.get("event_date_ranges", ()):
+        try:
+            if len(bounds) != 2:
+                return False
+            start, end = (date.fromisoformat(value) for value in bounds)
+        except (TypeError, ValueError):
+            return False
+        # Inclusive ranges are bounded to one calendar year (365/366 days).
+        if end < start or (end - start).days > 365:
+            return False
+    return True
+
+
+def _scope_owner_dated_event_results(
+    query: str, results: list[dict], *, retrieval_context: Optional[dict] = None,
+) -> list[dict]:
+    """Prefer normalized event-date metadata, retaining legacy note support."""
+    context = retrieval_context or {}
+    requested: set[str] = set()
+    for value in context.get("event_date", ()):
+        try:
+            requested.add(date.fromisoformat(value).isoformat())
+        except (TypeError, ValueError):
+            continue
+    for bounds in context.get("event_date_ranges", ()):
+        try:
+            start, end = (date.fromisoformat(value) for value in bounds)
+        except (TypeError, ValueError):
+            continue
+        if end < start or (end - start).days > 365:
+            return []
+        requested.update((start + timedelta(days=offset)).isoformat()
+                         for offset in range((end - start).days + 1))
+    if not requested and ("event_date" in context or "event_date_ranges" in context):
+        return []
+    if not requested:
         return results
-    dated = [item for item in results if any(date in str(item.get("memory") or "") for date in dates)]
+    dated = [
+        item for item in results
+        if requested.intersection(_event_dates(item))
+    ]
     if not dated:
-        return results
+        return []
     meal = re.search(r"\b(dinner|lunch|breakfast)\b", query, re.IGNORECASE)
     if meal:
-        date_pattern = "|".join(map(re.escape, dates))
+        date_pattern = "|".join(map(re.escape, sorted(requested)))
         header = re.compile(
             rf"(?mi)^#+\s*(?:{date_pattern})[^\n]*\b{re.escape(meal.group(1))}\b"
         )
-        meal_matches = [item for item in dated if header.search(str(item.get("memory") or ""))]
+        meal_matches = [
+            item for item in dated
+            if header.search(str(item.get("memory") or ""))
+            or ((item.get("metadata") or {}).get("source") == "conversation"
+                and re.search(rf"\b{re.escape(meal.group(1))}\b", str(item.get("memory") or ""), re.IGNORECASE))
+        ]
         if meal_matches:
             dated = meal_matches
     unique = []
@@ -145,8 +248,104 @@ def _scope_owner_dated_event_results(query: str, results: list[dict]) -> list[di
     return unique
 
 
+def _event_dates(item: dict) -> set[str]:
+    metadata = item.get("metadata") or {}
+    raw = metadata.get("event_date", metadata.get("eventDate"))
+    if isinstance(raw, str):
+        values = [raw]
+    elif isinstance(raw, (list, tuple, set)):
+        values = raw
+    else:
+        values = []
+    normalized = set()
+    for value in values:
+        try:
+            normalized.add(date.fromisoformat(str(value)).isoformat())
+        except ValueError:
+            continue
+    if normalized:
+        return normalized
+    # Legacy notes predate indexed metadata. Bound the scan and accept only a
+    # markdown heading or an explicit event-date/date field.
+    memory = str(item.get("memory") or "")[:16384]
+    found = re.findall(
+        r"(?mi)^(?:#{1,6}\s*|[-*]\s*(?:event[ _-]?date|date)\s*:\s*)(\d{4}-\d{2}-\d{2})\b",
+        memory,
+    )
+    valid = set()
+    for value in found:
+        try:
+            valid.add(date.fromisoformat(value).isoformat())
+        except ValueError:
+            continue
+    return valid
+
+
+def _structured_fact_receipt(item: dict) -> Optional[tuple[str, str]]:
+    """Read a conflict identity only from stable provider metadata."""
+    metadata = item.get("metadata") or {}
+    subject, key, value = (metadata.get(name) for name in ("fact_subject", "fact_key", "fact_value"))
+    if not all(isinstance(part, str) and part.strip() for part in (subject, key, value)):
+        return None
+    return (
+        f"{str(subject).strip().casefold()}|{str(key).strip().casefold()}",
+        str(value).strip().casefold(),
+    )
+
+
+def _suppress_direct_conversation_conflicts(items: list[dict]) -> list[dict]:
+    """Canonical wins only on a proven same-key/different-value conflict."""
+    canonical_receipts = {
+        receipt for item in items if _is_canonical_result(item)
+        if (receipt := _structured_fact_receipt(item))
+    }
+    result = []
+    for item in items:
+        receipt = _structured_fact_receipt(item)
+        if not _is_canonical_result(item) and receipt:
+            if any(key == receipt[0] and value != receipt[1] for key, value in canonical_receipts):
+                continue
+        result.append(item)
+    return result
+
+
+def _utf8_prefix(text: str, byte_limit: int) -> str:
+    """Return a valid-UTF-8 prefix no larger than byte_limit."""
+    return text.encode("utf-8")[:max(0, byte_limit)].decode("utf-8", "ignore")
+
+
+def _bounded_owner_reranker_payload(
+    query: str, candidates: list[dict], *, token_budget: int = _DEFAULT_RERANKER_INPUT_TOKEN_BUDGET,
+) -> tuple[dict, bytes]:
+    """Build one fair, deterministic request within the measured model input.
+
+    This is intentionally separate from the final injected-context budget.
+    We use a conservative UTF-8 byte ceiling when a compatible local tokenizer
+    is not already loaded, avoiding a new dependency and per-turn latency.
+    """
+    pair_budget = max(1, int(token_budget))
+    bounded_query = _utf8_prefix(str(query), min(_OWNER_RERANKER_QUERY_BYTE_LIMIT, pair_budget))
+    query_bytes = len(bounded_query.encode("utf-8"))
+    documents = []
+    for candidate in candidates:
+        candidate_id = str(candidate.get("id") or "")
+        provenance = candidate.get("provenance")
+        provenance_text = str(getattr(provenance, "value", provenance or "unknown"))
+        envelope = f"[candidate-id: {candidate_id}]\n[provenance: {provenance_text}]\n[text]\n"
+        envelope_bytes = len(envelope.encode("utf-8"))
+        text_limit = pair_budget - query_bytes - _OWNER_RERANKER_TEMPLATE_TOKEN_RESERVE - envelope_bytes
+        if text_limit < 0:
+            raise ValueError("reranker query and metadata envelope exceed per-pair input budget")
+        documents.append(envelope + _utf8_prefix(str(candidate.get("text") or ""), text_limit))
+    payload = {"model": _OWNER_RERANK_MODEL, "query": bounded_query,
+               "documents": documents, "top_n": len(candidates)}
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return payload, body
+
+
 def _call_owner_reranker(
     query: str, candidates: list[dict], *, timeout: Optional[float] = None,
+    input_token_budget: int = _DEFAULT_RERANKER_INPUT_TOKEN_BUDGET,
 ) -> dict:
     """Rank bounded evidence with the dedicated non-generative Qwen reranker.
 
@@ -154,15 +353,13 @@ def _call_owner_reranker(
     metadata and is applied after scoring, so document instructions cannot
     promote a conversation record into the canonical partition.
     """
-    payload = {
-        "model": _OWNER_RERANK_MODEL,
-        "query": query,
-        "documents": [str(candidate.get("text") or "") for candidate in candidates],
-        "top_n": len(candidates),
-    }
+    original_candidates = candidates
+    payload, serialized_payload = _bounded_owner_reranker_payload(
+        query, candidates, token_budget=input_token_budget,
+    )
     request = urllib.request.Request(
         _OWNER_RERANK_URL,
-        data=json.dumps(payload).encode("utf-8"),
+        data=serialized_payload,
         headers={"Content-Type": "application/json"},
     )
     request_timeout = _OWNER_RERANK_TIMEOUT_SECONDS if timeout is None else min(
@@ -182,29 +379,35 @@ def _call_owner_reranker(
         score = item.get("relevance_score")
         if not isinstance(index, int) or isinstance(index, bool) or index in seen_indexes:
             return {}
-        if index < 0 or index >= len(candidates) or not isinstance(score, (int, float)):
+        if (index < 0 or index >= len(candidates) or not isinstance(score, (int, float))
+                or isinstance(score, bool) or not math.isfinite(float(score))):
             return {}
         seen_indexes.add(index)
         candidate = candidates[index]
+        candidate_id = str(candidate["id"])
         authority = "canonical" if candidate.get("authority") == "canonical" else "conversation"
-        scored.append((authority, str(candidate["id"]), float(score), index))
+        scored.append((authority, candidate_id, float(score), index))
     if len(seen_indexes) != len(candidates):
         return {}
 
-    relevant = [item for item in scored if item[2] >= _OWNER_RERANK_MIN_SCORE]
-    canonical = [item for item in relevant if item[0] == "canonical"]
-    # Once canonical evidence clears the semantic relevance threshold, do not
-    # expose lower-authority text in the same answer context. This preserves
-    # the established canonical-wins boundary without asking candidate text or
-    # a generative model to classify its own authority.
-    eligible = canonical or [item for item in relevant if item[0] != "canonical"]
-    eligible.sort(key=lambda item: (-item[2], item[3]))
-    selected_ids = [item[1] for item in eligible[:_OWNER_RERANK_EVIDENCE_LIMIT]]
+    # Qwen's cross-encoder scores are ranking values, not calibrated
+    # probabilities (valid best matches can be far below 0.5). Deterministic
+    # authority/date/person/venue/authorship gates establish eligibility. Owner
+    # root and Family Shared canonical evidence have equal authority after ACL.
+    # Conversation evidence is globally score-ranked; canonical wins only for
+    # a proven structured conflict and as the deterministic tie-breaker.
+    eligible = sorted(
+        (item for item in scored if item[0] == "canonical" or
+         candidates[item[3]].get("provenance") is _EvidenceProvenance.USER_CONVERSATION),
+        key=lambda item: (-item[2], 0 if item[0] == "canonical" else 1, item[3]),
+    )
+    selected_ids = [item[1] for item in eligible]
     selected_set = set(selected_ids)
     return {
         "selected_ids": selected_ids,
-        "rejected_ids": [str(candidate["id"]) for candidate in candidates if str(candidate["id"]) not in selected_set],
+        "rejected_ids": [str(candidate["id"]) for candidate in original_candidates if str(candidate["id"]) not in selected_set],
         "sufficient": bool(selected_ids),
+        "scores": [item[2] for item in eligible],
     }
 
 
@@ -214,6 +417,13 @@ def _is_capture_worthy_owner_statement(text: str) -> bool:
     if len(normalized) < _MIN_CAPTURE_LENGTH or "?" in normalized:
         return False
     lowered = normalized.lower()
+    if re.search(
+        r"\b(?:remember|memorize|forget)\b|\bignore\s+(?:all\s+)?(?:previous|prior|above)\b|"
+        r"\b(?:system|developer)\s+(?:prompt|message|instruction)s?\b|"
+        r"\b(?:prompt|operational)\s+instructions?\b|\bdo\s+not\s+(?:follow|obey|remember)\b",
+        lowered,
+    ):
+        return False
     if re.match(r"^(who|what|when|where|why|how|is|are|can|could|would|will|do|does|did)\b", lowered):
         return False
     if re.match(r"^(run|execute|check|find|search|show|tell|give|make|create|write|open|close|turn|set|send|answer|please)\b", lowered):
@@ -235,6 +445,10 @@ def _default_config() -> dict:
         "entity_context": _DEFAULT_ENTITY_CONTEXT,
         "api_timeout": _DEFAULT_API_TIMEOUT,
         "prefetch_timeout": _DEFAULT_PREFETCH_TIMEOUT,
+        "temporal_filters_schema_v4_ready": False,
+        "context_char_budget": _DEFAULT_CONTEXT_CHAR_BUDGET,
+        "context_byte_budget": _DEFAULT_CONTEXT_BYTE_BUDGET,
+        "reranker_input_token_budget": _DEFAULT_RERANKER_INPUT_TOKEN_BUDGET,
         "base_url": "",
         "enable_custom_container_tags": False,
         "custom_containers": [],
@@ -296,6 +510,16 @@ def _load_supermemory_config(hermes_home: str) -> dict:
     config["container_tag"] = raw_tag if raw_tag else _DEFAULT_CONTAINER_TAG
     config["auto_recall"] = _as_bool(config.get("auto_recall"), True)
     config["auto_capture"] = _as_bool(config.get("auto_capture"), True)
+    config["temporal_filters_schema_v4_ready"] = _as_bool(
+        config.get("temporal_filters_schema_v4_ready"), False
+    )
+    for key, default in (("context_char_budget", _DEFAULT_CONTEXT_CHAR_BUDGET),
+                         ("context_byte_budget", _DEFAULT_CONTEXT_BYTE_BUDGET),
+                         ("reranker_input_token_budget", _DEFAULT_RERANKER_INPUT_TOKEN_BUDGET)):
+        try:
+            config[key] = max(1024, int(config.get(key, default)))
+        except (TypeError, ValueError):
+            config[key] = default
     try:
         config["max_recall_results"] = max(1, min(20, int(config.get("max_recall_results", _DEFAULT_MAX_RECALL_RESULTS))))
     except Exception:
@@ -331,6 +555,27 @@ def _load_supermemory_config(hermes_home: str) -> dict:
     config["custom_container_instructions"] = str(config.get("custom_container_instructions", "")).strip()
 
     return config
+
+
+def _verified_v4_import_ready(hermes_home: str) -> bool:
+    """Require a privacy-safe reconciliation receipt, never a toggle alone."""
+    try:
+        payload = json.loads((Path(hermes_home) / "obsidian-supermemory-import.json").read_text())
+        rows = payload.get("documents")
+        expected = payload.get("expected_count", payload.get("eligible_file_count"))
+        return bool(
+            payload.get("schema_version") == 4
+            and payload.get("reconciliation_complete") is True
+            and isinstance(rows, list) and isinstance(expected, int)
+            and len(rows) == expected
+            and payload.get("backend_reconciled_count") == expected
+            and payload.get("submission_failure_count") == 0
+            and payload.get("still_pending_count") == 0
+            and all(isinstance(row, dict) and row.get("index_schema_version") == 4
+                    and row.get("final_status") == "done" for row in rows)
+        )
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def _save_supermemory_config(values: dict, hermes_home: str) -> None:
@@ -398,14 +643,70 @@ def _deduplicate_recall(static_facts: list, dynamic_facts: list, search_results:
     return out_static, out_dynamic, out_search
 
 
-def _is_canonical_result(item: dict) -> bool:
-    metadata = item.get("metadata") or {}
-    return metadata.get("authority") == "canonical" and metadata.get("source") == "obsidian"
+def _valid_v4_canonical_path(metadata: dict) -> bool:
+    """Validate the indexed path and its ACL classification as one unit."""
+    relative_path = metadata.get("relative_path")
+    if not isinstance(relative_path, str) or not relative_path or relative_path != relative_path.strip():
+        return False
+    if (relative_path.startswith(("/", "./")) or "\\" in relative_path
+            or any(part in {"", ".", ".."} for part in relative_path.split("/"))
+            or not relative_path.endswith(".md")):
+        return False
+    expected_visibility = (
+        "family_shared" if relative_path.startswith("Jarvis/Family Shared/")
+        else "owner_private"
+    )
+    return metadata.get("visibility") == expected_visibility
 
 
-def _authoritative_search_results(search_results: list) -> list:
+def _is_canonical_result(item: dict, *, schema_v4_ready: bool = False) -> bool:
+    if not isinstance(item, dict):
+        return False
+    raw_metadata = item.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+    legacy_valid = (
+        metadata.get("authority") == "canonical"
+        and metadata.get("source") == "obsidian"
+        and metadata.get("identity_scope", "owner") == "owner"
+        and metadata.get("canonical_root", "owner") == "owner"
+        and metadata.get("visibility", "owner_private") in {"owner_private", "family_shared"}
+    )
+    if not schema_v4_ready:
+        return legacy_valid
+    exact = (
+        metadata.get("schema_version") == 4
+        and not isinstance(metadata.get("schema_version"), bool)
+        and metadata.get("authority") == "canonical"
+        and metadata.get("source") == "obsidian"
+        and metadata.get("identity_scope") == "owner"
+        and metadata.get("canonical_root") == "owner"
+        and metadata.get("visibility") in {"owner_private", "family_shared"}
+        and _valid_v4_canonical_path(metadata)
+    )
+    if not exact:
+        logger.warning("supermemory_acl outcome=rejected schema_required=4 action=discard")
+    return exact
+
+
+def _visible_canonical_results(
+    items: list, *, family: bool, authenticated_family: bool = False,
+    schema_v4_ready: bool = True,
+) -> list:
+    """Apply canonical ACLs; this Owner provider has no family authentication."""
+    if family and not authenticated_family:
+        return []
+    return [item for item in items or [] if _is_canonical_result(
+        item, schema_v4_ready=schema_v4_ready,
+    ) and (
+        not family or (item.get("metadata") or {}).get("visibility") == "family_shared"
+    )]
+
+
+def _authoritative_search_results(search_results: list, *, schema_v4_ready: bool = False) -> list:
     """Fail closed: Owner facts must come from canonical Obsidian documents."""
-    return [item for item in search_results or [] if _is_canonical_result(item)]
+    return [item for item in search_results or [] if _is_canonical_result(
+        item, schema_v4_ready=schema_v4_ready,
+    )]
 
 
 def _restaurant_key(text: str) -> str:
@@ -679,6 +980,8 @@ def _format_prefetch_context(
     max_results: int,
     *,
     owner_context: bool = False,
+    char_budget: int = _DEFAULT_CONTEXT_CHAR_BUDGET,
+    byte_budget: int = _DEFAULT_CONTEXT_BYTE_BUDGET,
 ) -> str:
     statics, dynamics, search = _deduplicate_recall(static_facts, dynamic_facts, search_results)
     statics = statics[:max_results]
@@ -704,9 +1007,15 @@ def _format_prefetch_context(
                     lambda match: (match.group(2) or match.group(1).rsplit("/", 1)[-1]).strip(),
                     str(memory),
                 )
+                authority_label = (
+                    "canonical" if _is_canonical_result(item)
+                    else "user-authored conversation"
+                )
+                prefix_bits = [f"[authority: {authority_label}]"]
+            else:
+                prefix_bits = []
             similarity = item.get("similarity")
             updated = item.get("updated_at") or item.get("updatedAt") or ""
-            prefix_bits = []
             rel = _format_relative_time(updated)
             if rel:
                 prefix_bits.append(f"[{rel}]")
@@ -739,7 +1048,13 @@ def _format_prefetch_context(
         )
     intro += "Do not force memories into the conversation."
     body = "\n\n".join(sections)
-    return f"<supermemory-context>\n{intro}\n\n{body}\n</supermemory-context>"
+    opening = f"<supermemory-context>\n{intro}\n\n"
+    closing = "\n</supermemory-context>"
+    body = body[:max(0, char_budget - len(opening) - len(closing))]
+    available_bytes = max(0, byte_budget - len(opening.encode()) - len(closing.encode()))
+    if len(body.encode()) > available_bytes:
+        body = body.encode()[:available_bytes].decode("utf-8", "ignore")
+    return opening + body.rstrip() + closing
 
 
 def _clean_text_for_capture(text: str) -> str:
@@ -815,10 +1130,14 @@ class _SupermemoryClient:
     def search_memories(self, query: str, *, limit: int = 5,
                         container_tag: Optional[str] = None,
                         search_mode: Optional[str] = None,
+                        filters: Optional[dict] = None,
                         timeout: Optional[float] = None) -> list[dict]:
         tag = container_tag or self._container_tag
         mode = search_mode or self._search_mode
-        kwargs: dict[str, Any] = {"q": query, "container_tag": tag, "limit": limit}
+        kwargs: dict[str, Any] = {"q": query, "container_tag": tag}
+        if filters:
+            kwargs["filters"] = filters
+        kwargs["limit"] = limit
         if mode in _VALID_SEARCH_MODES:
             kwargs["search_mode"] = mode
         if timeout is not None:
@@ -842,17 +1161,17 @@ class _SupermemoryClient:
 
     def search_documents(self, query: str, *, limit: int = 5,
                          container_tag: Optional[str] = None,
+                         filters: Optional[dict] = None,
                          timeout: Optional[float] = None) -> list[dict]:
         """Search canonical superrag chunks rather than extracted memories."""
         tag = container_tag or self._container_tag
         kwargs: dict[str, Any] = dict(
             q=query,
             container_tags=[tag],
-            limit=limit,
-            rerank=False,
-            rewrite_query=False,
-            only_matching_chunks=True,
         )
+        if filters:
+            kwargs["filters"] = filters
+        kwargs.update(limit=limit, rerank=False, rewrite_query=False, only_matching_chunks=True)
         if timeout is not None:
             kwargs["timeout"] = max(0.001, timeout)
         response = self._client.search.documents(**kwargs)
@@ -1221,6 +1540,16 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._entity_context = self._config["entity_context"]
         self._api_timeout = self._config["api_timeout"]
         self._prefetch_timeout = self._config["prefetch_timeout"]
+        self._context_char_budget = self._config["context_char_budget"]
+        self._context_byte_budget = self._config["context_byte_budget"]
+        self._reranker_input_token_budget = self._config["reranker_input_token_budget"]
+        measured_chars = kwargs.get("runtime_context_chars")
+        if isinstance(measured_chars, int) and measured_chars > 0:
+            self._context_char_budget = min(self._context_char_budget, max(1024, measured_chars // 8))
+        self._temporal_filters_schema_v4_ready = bool(
+            self._config["temporal_filters_schema_v4_ready"]
+            and _verified_v4_import_ready(self._hermes_home)
+        )
         # Base URL: config > SUPERMEMORY_BASE_URL env var > api.supermemory.ai.
         # Supports self-hosted Supermemory servers.
         self._base_url = _resolve_base_url(self._config["base_url"])
@@ -1273,81 +1602,109 @@ class SupermemoryMemoryProvider(MemoryProvider):
     ) -> list[dict]:
         candidates = []
         by_id = {}
+        seen_ids: set[str] = set()
+        seen_texts: set[str] = set()
         for index, item in enumerate(items):
             text = str(item.get("memory") or "").strip()
             metadata = item.get("metadata") or {}
-            canonical = _is_canonical_result(item)
-            conversation = metadata.get("source") == "conversation" or metadata.get("type") == "owner_conversation"
-            if not text or not (canonical or conversation):
-                continue
-            if conversation and "[role: user]" not in text and metadata.get("speaker") != "user":
+            provenance = _evidence_provenance(
+                item, schema_v4_ready=self._temporal_filters_schema_v4_ready,
+            )
+            if not text or provenance is None:
                 continue
             candidate_id = str(item.get("id") or f"candidate-{index}")
-            if candidate_id in by_id:
-                candidate_id = f"{candidate_id}-{index}"
+            candidate_text = (
+                _role_delimited_evidence_text(text)
+                if metadata.get("type") == "owner_conversation" else text
+            )
+            text_identity = " ".join(candidate_text.split()).casefold()
+            if candidate_id in seen_ids or text_identity in seen_texts:
+                continue
             candidate = {
                 "id": candidate_id,
-                "authority": "canonical" if canonical else "non-authoritative",
-                "source": "obsidian" if canonical else "conversation",
-                "speaker": metadata.get("speaker") or ("user-with-assistant-context" if conversation else "document"),
+                "authority": "canonical" if provenance is _EvidenceProvenance.CANONICAL_DOCUMENT else "non-authoritative",
+                "provenance": provenance,
                 "timestamp": item.get("updated_at") or item.get("updatedAt") or "",
-                "text": text,
+                "text": candidate_text,
+                "metadata": metadata,
             }
             candidates.append(candidate)
-            by_id[candidate_id] = item
+            by_id[candidate_id] = (
+                {**item, "memory": candidate_text}
+                if metadata.get("type") == "owner_conversation" else item
+            )
+            seen_ids.add(candidate_id)
+            seen_texts.add(text_identity)
         # Deterministic authority/entity/venue gates have already run. The
         # scorer may order eligible evidence, but its score cannot make an
         # otherwise ineligible record authoritative.
-        # Give both eligible sources a path into the bounded reranker input.
-        # The upstream lists are independently relevance-ordered, so alternate
-        # them rather than allowing a long canonical list to starve explicit
-        # user conversation facts before scoring begins.
-        canonical_candidates = [candidate for candidate in candidates if candidate["authority"] == "canonical"]
-        conversation_candidates = [candidate for candidate in candidates if candidate["authority"] != "canonical"]
-        candidates = []
-        for index in range(max(len(canonical_candidates), len(conversation_candidates))):
-            if index < len(canonical_candidates):
-                candidates.append(canonical_candidates[index])
-            if index < len(conversation_candidates):
-                candidates.append(conversation_candidates[index])
-            if len(candidates) >= _OWNER_RERANK_CANDIDATE_LIMIT:
-                break
-        candidates = candidates[:_OWNER_RERANK_CANDIDATE_LIMIT]
-        by_id = {candidate["id"]: by_id[candidate["id"]] for candidate in candidates}
+        # The independently bounded v3/v4 sources are deliberately combined
+        # without quotas or pre-Qwen lexical admission. One request gives every
+        # unique candidate identical pointwise scoring semantics.
         if len(candidates) <= 1:
-            logger.warning("owner reranker bypassed candidates=%d reason=%s", len(candidates), "single" if candidates else "empty")
+            outcome = "selected" if candidates else "insufficient"
+            logger.warning(
+                "supermemory_prefetch stage=reranker outcome=%s candidates=%d selected=%d "
+                "score_min=na score_max=na elapsed_ms=0 bypass=single",
+                outcome, len(candidates), len(candidates),
+            )
             return [by_id[candidates[0]["id"]]] if candidates else []
         started = time.monotonic()
         logger.warning("owner reranker request model=%s candidates=%d", _OWNER_RERANK_MODEL, len(candidates))
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None and remaining <= 0:
-            logger.warning("supermemory_prefetch stage=reranker outcome=deadline elapsed_ms=0 required=true")
+            logger.warning(
+                "supermemory_prefetch stage=reranker outcome=deadline candidates=%d selected=0 "
+                "score_min=na score_max=na elapsed_ms=0",
+                len(candidates),
+            )
             return []
-        result = _call_owner_reranker(query, candidates, timeout=remaining)
-        if not isinstance(result, dict) or set(result) != {"selected_ids", "rejected_ids", "sufficient"}:
+        try:
+            result = _call_owner_reranker(
+                query, candidates, timeout=remaining,
+                input_token_budget=self._reranker_input_token_budget,
+            )
+        except Exception:
+            logger.warning(
+                "supermemory_prefetch stage=reranker outcome=exception candidates=%d selected=0 "
+                "score_min=na score_max=na elapsed_ms=%d",
+                len(candidates), round((time.monotonic() - started) * 1000),
+            )
+            return []
+        allowed_keys = {"selected_ids", "rejected_ids", "sufficient", "scores"}
+        if not isinstance(result, dict) or not {"selected_ids", "rejected_ids", "sufficient"}.issubset(result) or not set(result).issubset(allowed_keys):
+            logger.warning("supermemory_prefetch stage=reranker outcome=invalid candidates=%d selected=0 score_min=na score_max=na elapsed_ms=%d", len(candidates), round((time.monotonic() - started) * 1000))
             return []
         selected = result.get("selected_ids")
         rejected = result.get("rejected_ids")
         sufficient = result.get("sufficient")
         if not isinstance(selected, list) or not isinstance(rejected, list) or not isinstance(sufficient, bool):
+            logger.warning("supermemory_prefetch stage=reranker outcome=invalid candidates=%d selected=0 score_min=na score_max=na elapsed_ms=%d", len(candidates), round((time.monotonic() - started) * 1000))
             return []
         combined = selected + rejected
         expected = set(by_id)
         if (not all(isinstance(value, str) for value in combined)
                 or len(combined) != len(set(combined)) or set(combined) != expected):
+            logger.warning("supermemory_prefetch stage=reranker outcome=invalid candidates=%d selected=0 score_min=na score_max=na elapsed_ms=%d", len(candidates), round((time.monotonic() - started) * 1000))
             return []
         if not sufficient or not selected:
+            logger.warning("supermemory_prefetch stage=reranker outcome=insufficient candidates=%d selected=0 score_min=na score_max=na elapsed_ms=%d", len(candidates), round((time.monotonic() - started) * 1000))
             return []
-        selected = selected[:_OWNER_RERANK_EVIDENCE_LIMIT]
+        selected_items = _suppress_direct_conversation_conflicts(
+            [by_id[candidate_id] for candidate_id in selected]
+        )
+        selected_items = selected_items[:self._max_recall_results]
         logger.warning(
-            "owner reranker response candidates=%d selected=%d sufficient=%s elapsed_ms=%d",
-            len(candidates), len(selected), sufficient,
+            "supermemory_prefetch stage=reranker outcome=selected candidates=%d selected=%d score_min=%s score_max=%s elapsed_ms=%d",
+            len(candidates), len(selected_items),
+            min(result.get("scores") or [0]), max(result.get("scores") or [0]),
             round((time.monotonic() - started) * 1000),
         )
-        return [by_id[candidate_id] for candidate_id in selected]
+        return selected_items
 
     def _parallel_owner_retrieval(
         self, query: str, retrieval_query: str, recall_query: str, deadline: float,
+        retrieval_context: Optional[dict] = None,
     ) -> tuple[dict[str, Any], dict[str, str]]:
         """Run independent read stages under one monotonic deadline.
 
@@ -1357,25 +1714,25 @@ class SupermemoryMemoryProvider(MemoryProvider):
         """
         client = self._client
         assert client is not None
-        fallback_query = _owner_prefetch_fallback_query(query)
+        temporal_filters = (
+            _build_temporal_filters(retrieval_context)
+            if self._temporal_filters_schema_v4_ready else None
+        )
         stages: dict[str, tuple[bool, Any]] = {
             "profile": (False, lambda timeout: client.get_profile(
                 query=recall_query[:200], timeout=timeout, augment_search=False,
             )),
             "canonical": (True, lambda timeout: client.search_documents(
-                recall_query[:511], limit=20, container_tag=_OWNER_CANONICAL_CONTAINER,
+                recall_query[:511], limit=_OWNER_SOURCE_CANDIDATE_LIMIT, container_tag=_OWNER_CANONICAL_CONTAINER,
+                **({"filters": temporal_filters} if temporal_filters else {}),
                 timeout=timeout,
             )),
             "conversation": (False, lambda timeout: client.search_memories(
-                retrieval_query, limit=20, container_tag=_OWNER_CONVERSATION_CONTAINER,
+                retrieval_query, limit=_OWNER_SOURCE_CANDIDATE_LIMIT, container_tag=_OWNER_CONVERSATION_CONTAINER,
+                **({"filters": temporal_filters} if temporal_filters else {}),
                 search_mode=self._search_mode, timeout=timeout,
             )),
         }
-        if fallback_query:
-            stages["fallback"] = (False, lambda timeout: client.search_documents(
-                fallback_query, limit=20, container_tag=_OWNER_CANONICAL_CONTAINER,
-                timeout=timeout,
-            ))
 
         started_at = time.monotonic()
 
@@ -1457,35 +1814,30 @@ class SupermemoryMemoryProvider(MemoryProvider):
         )
         results = _authoritative_search_results(results)
         results = _scope_owner_named_person_results(owner_query, results)
-        results, named_restaurant = _scope_owner_restaurant_results(owner_query, results)
-        venue_record = results[0] if named_restaurant and results else None
+        results, _named_restaurant = _scope_owner_restaurant_results(owner_query, results)
         results = _rank_owner_canonical_results(owner_query, results)
-        conversations = [] if named_restaurant else self._client.search_memories(
+        conversations = self._client.search_memories(
             owner_query, limit=20, container_tag=_OWNER_CONVERSATION_CONTAINER,
             search_mode=self._search_mode,
         )
         results = self._rerank_owner_candidates(owner_query, results + conversations)
-        if venue_record is not None:
-            scoped_venue = _scope_usual_order_evidence(owner_query, venue_record)
-            if scoped_venue is not venue_record:
-                results = [scoped_venue]
-            else:
-                venue_id = venue_record.get("id")
-                results = [
-                    item for item in results
-                    if item is not venue_record and (not venue_id or item.get("id") != venue_id)
-                ]
-                results = [venue_record] + results[:max(0, limit - 1)]
         return _scope_owner_person_sections(owner_query, results)[:limit]
 
     def prefetch(
         self, query: str, *, session_id: str = "", deadline: Optional[float] = None,
+        retrieval_context: Optional[dict] = None,
     ) -> str:
         if not self._active or not self._auto_recall or not self._client or not query.strip():
             return ""
+        temporal_scope = retrieval_context if self._temporal_filters_schema_v4_ready else None
+        if retrieval_context and not self._temporal_filters_schema_v4_ready:
+            logger.info("temporal_filter_not_ready schema_required=4 action=unfiltered")
+        if temporal_scope and not _valid_trusted_temporal_scope(temporal_scope):
+            logger.warning("supermemory_prefetch stage=temporal outcome=invalid action=discard")
+            return ""
         try:
             canonical_owner = self._container_tag == _OWNER_CANONICAL_CONTAINER
-            retrieval_query = _owner_prefetch_query(query) if canonical_owner else query
+            retrieval_query = query
             recall_query = _owner_canonical_query(retrieval_query) if canonical_owner else retrieval_query
             values: dict[str, Any] = {}
             include_profile = self._turn_count <= 1 or (self._turn_count % self._profile_frequency == 0)
@@ -1497,7 +1849,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 return ""
             if canonical_owner:
                 values, outcomes = self._parallel_owner_retrieval(
-                    query, retrieval_query, recall_query, deadline,
+                    query, retrieval_query, recall_query, deadline, temporal_scope,
                 )
                 if outcomes.get("canonical") != "ok":
                     logger.warning(
@@ -1515,31 +1867,23 @@ class SupermemoryMemoryProvider(MemoryProvider):
                     query=recall_query[:200], timeout=deadline - time.monotonic(),
                 )
                 profile_results = profile["search_results"]
-            search_results = _authoritative_search_results(profile_results)
+            search_results = _authoritative_search_results(
+                profile_results,
+                schema_v4_ready=self._temporal_filters_schema_v4_ready,
+            )
             named_restaurant = False
             if canonical_owner:
                 search_results = _scope_owner_named_person_results(retrieval_query, search_results)
-                search_results, named_restaurant = _scope_owner_restaurant_results(retrieval_query, search_results)
-                venue_record = search_results[0] if named_restaurant and search_results else None
+                search_results, _named_restaurant = _scope_owner_restaurant_results(retrieval_query, search_results)
                 search_results = _rank_owner_canonical_results(retrieval_query, search_results)
-                conversation_results = [] if named_restaurant else list(values.get("conversation") or [])
+                conversation_results = list(values.get("conversation") or [])
                 candidates = _scope_owner_dated_event_results(
                     retrieval_query, search_results + conversation_results,
+                    retrieval_context=temporal_scope,
                 )
                 search_results = self._rerank_owner_candidates(
                     retrieval_query, candidates, deadline=deadline,
                 )
-                if venue_record is not None:
-                    scoped_venue = _scope_usual_order_evidence(retrieval_query, venue_record)
-                    if scoped_venue is not venue_record:
-                        search_results = [scoped_venue]
-                    else:
-                        venue_id = venue_record.get("id")
-                        search_results = [
-                            item for item in search_results
-                            if item is not venue_record and (not venue_id or item.get("id") != venue_id)
-                        ]
-                        search_results = [venue_record] + search_results[:3]
                 search_results = _scope_owner_person_sections(retrieval_query, search_results)
             else:
                 search_results, named_restaurant = _scope_owner_restaurant_results(query, search_results)
@@ -1551,12 +1895,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 ),
                 # Recalled blocks persist in prior user messages. Keep the 8K
                 # retrieval runner below its context threshold across turns.
-                max_results=(
-                    2 if canonical_owner and re.search(r"\bmy\s+parents?\b", query, re.IGNORECASE)
-                    else _OWNER_RERANK_EVIDENCE_LIMIT if canonical_owner
-                    else self._max_recall_results
-                ),
+                max_results=self._max_recall_results,
                 owner_context=canonical_owner,
+                char_budget=self._context_char_budget,
+                byte_budget=self._context_byte_budget,
             )
             return context
         except Exception:

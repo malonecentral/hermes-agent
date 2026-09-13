@@ -6274,6 +6274,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        call_timeout = tool_timeout
+        override = kwargs.pop("_timeout_override", None)
+        if override is not None:
+            try:
+                override = float(override)
+                if math.isfinite(override) and override > 0:
+                    call_timeout = min(tool_timeout, override)
+            except (TypeError, ValueError):
+                pass
+
         # Trust-tier gate (security boundary): write-capable tools on
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy
@@ -6318,7 +6328,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # transient reconnect window doesn't burn a circuit-breaker
             # strike (#26892).
             if _wait_for_server_session_ready(
-                server, timeout=min(5.0, float(tool_timeout or 5.0)),
+                server, timeout=min(5.0, float(call_timeout or 5.0)),
             ):
                 pass  # Fresh session arrived; proceed below.
             else:
@@ -6564,7 +6574,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return json.dumps({"result": text_result}, ensure_ascii=False)
 
         def _call_once():
-            return _run_on_mcp_loop(_call, timeout=tool_timeout)
+            return _run_on_mcp_loop(_call, timeout=call_timeout)
 
         try:
             result = _call_once()

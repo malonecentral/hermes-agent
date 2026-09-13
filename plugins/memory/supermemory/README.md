@@ -50,7 +50,11 @@ Config file: `$HERMES_HOME/supermemory.json`
 | `container_tag` | `hermes` | Container tag used for search and writes. Supports `{identity}` template for profile-scoped tags (e.g. `hermes-{identity}` → `hermes-coder`). |
 | `auto_recall` | `true` | Inject relevant memory context before turns |
 | `auto_capture` | `true` | Store cleaned user-assistant turns after each response |
-| `max_recall_results` | `10` | Max recalled items to format into context |
+| `temporal_filters_schema_v4_ready` | `false` | Request temporal filtering; it activates only when the local import receipt is schema v4, reconciled, has the expected backend count, and every eligible row is terminal `done`/v4 with zero failures or pending work. A v3 or incomplete receipt stays off. |
+| `context_char_budget` | `12000` | Maximum final memory-envelope characters; runtime context measurement may lower it. |
+| `context_byte_budget` | `24000` | Maximum UTF-8 bytes in the final memory envelope. Truncation is deterministic and preserves the envelope and authority labels. |
+| `reranker_input_token_budget` | `8192` | Measured Qwen reranker context. The request builder reserves 512 tokens for the runner template and conservatively bounds the complete serialized JSON by UTF-8 bytes (safe for byte-fallback/pathological Unicode). This is independent of the final context budget. |
+| `max_recall_results` | `10` | Max recalled items to format into context (hard configuration clamp: 20); no authority-specific quota is applied. |
 | `profile_frequency` | `50` | Include profile facts on first turn and every N turns |
 | `capture_mode` | `all` | Skip tiny or trivial turns by default |
 | `search_mode` | `hybrid` | Search mode: `hybrid` (profile + memories), `memories` (memories only), `documents` (documents only) |
@@ -93,6 +97,7 @@ Supermemory app, so you can filter, browse, and bulk-manage them per source agen
 When enabled, Hermes can:
 
 - prefetch relevant memory context before each turn
+- for Owner recall, admit up to 20 independently retrieved canonical candidates and 20 independently retrieved conversation candidates to one Qwen rerank call, with no lexical, rank-fusion, or quota gate before Qwen; final evidence remains capped at 5. The measured 40-candidate p95 is about 1.124s (+463ms versus 20 candidates), accepted to guarantee both sources reach the common scorer.
 - buffer the full conversation and ingest it as **one session** at session end (or on `/reset`, branch, compression, or shutdown)
 - ingest the full session to the conversations endpoint for richer profile/graph updates
 - route every SDK, probe, and conversation-ingest request through the configured hosted or self-hosted endpoint

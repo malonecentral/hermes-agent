@@ -290,7 +290,7 @@ def test_prefetch_runs_for_substantive_user_message():
     agent, mm = _agent_with_memory_manager()
     query = "what did we decide about the deploy pipeline?"
     ctx = _build(agent, user_message=query)
-    mm.prefetch_all.assert_called_once_with(query)
+    assert mm.prefetch_all.call_args.args == (query,)
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
 
 
@@ -300,7 +300,7 @@ def test_prefetch_consumes_one_shot_query_override():
 
     ctx = _build(agent, user_message="mobile wrapper with history and presentation instructions")
 
-    mm.prefetch_all.assert_called_once_with("clean current question")
+    assert mm.prefetch_all.call_args.args == ("clean current question",)
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
     assert agent._memory_prefetch_query == ""
 
@@ -314,7 +314,7 @@ def test_no_memory_manager_still_consumes_query_override():
     assert no_memory_agent._memory_prefetch_query == ""
     memory_agent, mm = _agent_with_memory_manager()
     _build(memory_agent, user_message="later clean question")
-    mm.prefetch_all.assert_called_once_with("later clean question")
+    assert mm.prefetch_all.call_args.args == ("later clean question",)
 
 
 def test_prefetch_query_override_is_bounded_and_whitespace_falls_back():
@@ -328,7 +328,7 @@ def test_prefetch_query_override_is_bounded_and_whitespace_falls_back():
     fallback_agent, fallback_mm = _agent_with_memory_manager()
     fallback_agent._memory_prefetch_query = "   "
     _build(fallback_agent, user_message="clean fallback")
-    fallback_mm.prefetch_all.assert_called_once_with("clean fallback")
+    assert fallback_mm.prefetch_all.call_args.args == ("clean fallback",)
 
 
 def test_agent_constructor_captures_and_consumes_prefetch_env(monkeypatch):
@@ -358,12 +358,12 @@ def test_agent_constructor_captures_and_consumes_prefetch_env(monkeypatch):
     manager.prefetch_all.return_value = "REMEMBERED CONTEXT"
     setattr(first, "_memory_manager", manager)
     _build(first, user_message="wrapped first turn")
-    manager.prefetch_all.assert_called_once_with("é" * 4096)
+    assert manager.prefetch_all.call_args.args == ("é" * 4096,)
     assert getattr(first, "_memory_prefetch_query") == ""
 
     manager.reset_mock()
     _build(first, user_message="normal second turn")
-    manager.prefetch_all.assert_called_once_with("normal second turn")
+    assert manager.prefetch_all.call_args.args == ("normal second turn",)
 
 
 def test_turn_start_replaces_stale_parent_history_with_compression_child():

@@ -1558,7 +1558,17 @@ def build_turn_context(
                 original_user_message if isinstance(original_user_message, str) else ""
             )
             if not is_trivial_prompt(_query):
-                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+                # Temporal annotations affect retrieval only. The durable/user/API
+                # message remains byte-identical to the caller's original text.
+                _prefetch_deadline = time.monotonic() + agent._memory_manager._external_prefetch_timeout
+                from agent.temporal_resolution import resolve_retrieval_query
+                _temporal = resolve_retrieval_query(
+                    _query, deadline=_prefetch_deadline
+                )
+                ext_prefetch_cache = agent._memory_manager.prefetch_all(
+                    _temporal.query, deadline=_prefetch_deadline,
+                    retrieval_context=_temporal.context,
+                ) or ""
         except Exception:
             pass
         # Deterministic, model-independent recall indicator: when memory was
