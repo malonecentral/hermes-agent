@@ -256,6 +256,34 @@ def test_verify_only_exits_nonzero_when_any_document_is_incomplete(importer, mon
     assert result["verification_complete"] is False
 
 
+def test_lookup_backend_document_accepts_provider_empty_page_one_of_zero(importer):
+    doc = importer.item("x.md", b"content")
+    calls = []
+
+    class Documents:
+        def list(self, **kwargs):
+            calls.append(kwargs["page"])
+            return {"memories": [],
+                    "pagination": {"current_page": 1.0, "total_pages": 0.0}}
+
+    client = type("Client", (), {"documents": Documents()})()
+    assert importer.lookup_backend_document(client, doc) is None
+    assert calls == [1]
+
+
+def test_lookup_backend_document_rejects_zero_pages_with_rows(importer):
+    doc = importer.item("x.md", b"content")
+
+    class Documents:
+        def list(self, **kwargs):
+            return {"memories": [_remote(importer, doc)],
+                    "pagination": {"current_page": 1, "total_pages": 0}}
+
+    client = type("Client", (), {"documents": Documents()})()
+    with pytest.raises(importer.ReconciliationRequired, match="pagination"):
+        importer.lookup_backend_document(client, doc)
+
+
 def test_verify_only_exhausts_pagination_and_rejects_duplicates(importer):
     doc = importer.item("x.md", b"content")
     pages = {
