@@ -828,6 +828,39 @@ def test_owner_named_parlay_recall_excludes_zipps_person_collision(provider):
     assert "mozzarella sticks" not in result
 
 
+@pytest.mark.parametrize(
+    ("query", "venue"),
+    [
+        ("What do I like from Ike's?", "Ike's Love & Sandwiches"),
+        ("What do I like from McDonald's?", "McDonald's"),
+        ("What do I like from Zipp's?", "Zipp's"),
+    ],
+)
+def test_possessive_restaurant_names_scope_exact_canonical_venue_without_leakage(query, venue):
+    canonical = {"source": "obsidian", "authority": "canonical"}
+    expected = {
+        "id": venue,
+        "memory": f"restaurant: {venue}\n### Dennis\n- Recorded preference.",
+        "metadata": {
+            **canonical,
+            "relative_path": f"Jarvis/Family Shared/Food/Restaurants/{venue}.md",
+        },
+    }
+    unrelated = {
+        "id": "other",
+        "memory": "restaurant: Parlay\n### Dennis\n- Unrelated order.",
+        "metadata": {
+            **canonical,
+            "relative_path": "Jarvis/Family Shared/Food/Restaurants/Parlay.md",
+        },
+    }
+
+    scoped, named = _scope_owner_restaurant_results(query, [unrelated, expected])
+
+    assert named is True
+    assert scoped == [expected]
+
+
 def test_named_restaurant_matches_canonical_branch_suffix():
     canonical = {"source": "obsidian", "authority": "canonical"}
     alexanders = {

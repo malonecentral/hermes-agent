@@ -796,9 +796,16 @@ def _scope_owner_restaurant_results(query: str, results: list) -> tuple[list, bo
     def venue_keys(name: str) -> list[str]:
         # Restaurant filenames may carry a branch suffix ("Venue - City") even
         # when ordinary questions name only the venue. Both are canonical IDs.
+        # Canonical chain names can likewise extend a possessive brand
+        # ("Ike's Love & Sandwiches") that people naturally shorten to
+        # "Ike's".  Derive that alias from the canonical name itself rather
+        # than maintaining a venue-specific alias table.
         variants = [name]
         if " - " in name:
             variants.append(name.split(" - ", 1)[0])
+        possessive_brand = re.match(r"^(.+?['’]s)(?:\s|$)", name, re.IGNORECASE)
+        if possessive_brand:
+            variants.append(possessive_brand.group(1))
         return [key for key in (_restaurant_key(value) for value in variants) if key]
 
     named = [
