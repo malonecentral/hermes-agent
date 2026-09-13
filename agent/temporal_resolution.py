@@ -163,8 +163,17 @@ def resolve_retrieval_query(original_query: str, *, deadline: float) -> Temporal
             context,
         )
     except Exception as exc:
+        outcome = type(exc).__name__
+        if isinstance(exc, ValueError):
+            message = str(exc)
+            if message in {"missing timezone", "malformed date result"}:
+                outcome = message.replace(" ", "_")
+        elif isinstance(exc, LookupError) and str(exc) == "date tool unavailable":
+            outcome = "date_tool_unavailable"
+        elif isinstance(exc, TimeoutError) and str(exc) == "prefetch deadline":
+            outcome = "prefetch_deadline"
         logger.warning(
             "temporal_resolution_failed_open outcome=%s elapsed_ms=%d",
-            type(exc).__name__, round((time.monotonic() - started) * 1000),
+            outcome, round((time.monotonic() - started) * 1000),
         )
         return TemporalResolution(original_query, {})
