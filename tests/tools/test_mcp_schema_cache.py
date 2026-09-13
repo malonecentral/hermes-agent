@@ -30,6 +30,25 @@ class TestConfigFingerprint:
             {**base, "timeout": 5, "enabled": True, "lazy": True}
         )
 
+    def test_changes_when_schema_or_auth_relevant_config_changes(self):
+        base = {
+            "url": "https://example.test/mcp",
+            "headers": {"Authorization": "Bearer first"},
+            "env": {"SERVER_TOOL_VERSION": "1"},
+        }
+        assert msc.config_fingerprint(base) != msc.config_fingerprint(
+            {**base, "headers": {"Authorization": "Bearer second"}}
+        )
+        assert msc.config_fingerprint(base) != msc.config_fingerprint(
+            {**base, "env": {"SERVER_TOOL_VERSION": "2"}}
+        )
+
+    def test_cache_format_version_invalidates_old_fingerprints(self, monkeypatch):
+        cfg = {"url": "https://example.test/mcp"}
+        before = msc.config_fingerprint(cfg)
+        monkeypatch.setattr(msc, "_CACHE_FORMAT_VERSION", msc._CACHE_FORMAT_VERSION + 1)
+        assert before != msc.config_fingerprint(cfg)
+
 
 class TestCacheRoundTrip:
     def _isolate(self, monkeypatch, tmp_path):
@@ -50,6 +69,17 @@ class TestCacheRoundTrip:
         msc.write_cache_entry("srv", "fp1", tools=[], utility_tools=[])
         assert msc.get_cached_entry("srv", "OTHER") is None
         assert not msc.has_cached_entry("srv", "OTHER")
+
+    def test_entry_without_server_ttl_expires_at_safe_default(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        monkeypatch.setattr(msc.time, "time", lambda: 1_000.0)
+        msc.write_cache_entry("srv", "fp1", tools=[], utility_tools=[])
+        monkeypatch.setattr(
+            msc.time,
+            "time",
+            lambda: 1_000.0 + msc._DEFAULT_CACHE_MAX_AGE_SECONDS + 1,
+        )
+        assert msc.get_cached_entry("srv", "fp1") is None
 
     def test_missing_server_returns_none(self, monkeypatch, tmp_path):
         self._isolate(monkeypatch, tmp_path)
@@ -90,8 +120,8 @@ class TestCacheFileLocation:
         assert (path.stat().st_mode & 0o777) == 0o600
 
 
-class TestWriteSkip:
-    def test_identical_payload_skips_rewrite(self, monkeypatch, tmp_path):
+class TestWriteRefresh:
+    def test_identical_payload_refreshes_bounded_default_ttl(self, monkeypatch, tmp_path):
         monkeypatch.setattr(msc, "_cache_path", lambda: tmp_path / "cache.json")
         saves = []
         real_save = msc._save_all
@@ -104,9 +134,9 @@ class TestWriteSkip:
         tools = [{"name": "t1", "description": "d", "inputSchema": {}}]
         msc.write_cache_entry("srv", "fp1", tools=tools, utility_tools=[])
         assert len(saves) == 1
-        # Identical payload (reconnect / list_changed refresh) → no rewrite.
+        # Identical payload was live-reconfirmed, so refresh written_at.
         msc.write_cache_entry("srv", "fp1", tools=list(tools), utility_tools=[])
-        assert len(saves) == 1
+        assert len(saves) == 2
         # Changed payload → rewrite.
         msc.write_cache_entry("srv", "fp2", tools=tools, utility_tools=[])
-        assert len(saves) == 2
+        assert len(saves) == 3

@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 _CACHE_FILENAME = "mcp_schema_cache.json"
+_CACHE_FORMAT_VERSION = 2
+_DEFAULT_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 _cache_lock = threading.Lock()
 
 
@@ -29,15 +31,14 @@ def _cache_path() -> Path:
 
 
 def config_fingerprint(config: dict) -> str:
-    """Stable hash of the connection-defining parts of an MCP server config."""
-    tools_filter = config.get("tools") or {}
+    """Stable hash of every input that can affect the advertised tool schema."""
+    runtime_only = {
+        "connect_timeout", "enabled", "idle_timeout_seconds", "keepalive_interval",
+        "lazy", "max_lifetime_seconds", "supports_parallel_tool_calls", "timeout",
+    }
     payload = {
-        "command": config.get("command"),
-        "args": config.get("args") or [],
-        "url": config.get("url"),
-        "transport": config.get("transport"),
-        "tools_include": sorted(tools_filter.get("include") or []),
-        "tools_exclude": sorted(tools_filter.get("exclude") or []),
+        "cache_format_version": _CACHE_FORMAT_VERSION,
+        "config": {key: value for key, value in config.items() if key not in runtime_only},
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -71,7 +72,7 @@ def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
     freshness hint. When the live discovery path recorded one, an entry
     older than its TTL is treated as a miss so the next startup re-probes
     the server instead of serving a stale manifest forever. Entries without
-    a recorded TTL (pre-2026 servers) keep the old never-expires behavior.
+    a positive server TTL use a bounded 24-hour default.
     ``cacheScope`` is irrelevant here: this cache is per-user local disk,
     which satisfies even ``private``.
     """
@@ -83,9 +84,17 @@ def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
         return None
     ttl_ms = entry.get("ttl_ms")
     written_at = entry.get("written_at")
-    if isinstance(ttl_ms, (int, float)) and isinstance(written_at, (int, float)):
-        if (time.time() - written_at) * 1000.0 >= float(ttl_ms):
+    if isinstance(written_at, (int, float)):
+        max_age_ms = (
+            float(ttl_ms)
+            if isinstance(ttl_ms, (int, float))
+            else _DEFAULT_CACHE_MAX_AGE_SECONDS * 1000.0
+        )
+        if (time.time() - written_at) * 1000.0 >= max_age_ms:
             return None
+    else:
+        # Pre-v2 entries had no creation time and could remain stale forever.
+        return None
     return entry
 
 
@@ -112,22 +121,18 @@ def write_cache_entry(
         "fingerprint": fingerprint,
         "tools": tools,
         "utility_tools": utility_tools or [],
+        "written_at": time.time(),
     }
     if isinstance(ttl_ms, (int, float)):
         entry["ttl_ms"] = ttl_ms
-        entry["written_at"] = time.time()
+
     if cache_scope:
         entry["cache_scope"] = cache_scope
     with _cache_lock:
         data = _load_all()
-        # Write-through fires on every registration (reconnects,
-        # list_changed refreshes); skip the load-all+rewrite churn when the
-        # entry is byte-identical to what is already on disk. TTL'd entries
-        # always rewrite: written_at must advance or the entry would expire
-        # at its ORIGINAL write time no matter how many live reconnects
-        # confirmed it since.
-        if "written_at" not in entry and data.get(server_name) == entry:
-            return
+        # Every v2 entry has a bounded lifetime, so a successful live
+        # reconfirmation must always advance written_at even when the schema
+        # itself is unchanged.
         data[server_name] = entry
         _save_all(data)
 

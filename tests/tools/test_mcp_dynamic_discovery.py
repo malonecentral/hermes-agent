@@ -35,6 +35,24 @@ class TestRegisterServerTools:
             assert validate_toolset("my_srv") is True
             assert "mcp__my_srv__my_tool" in resolve_toolset("my_srv")
 
+    def test_cache_preserves_sdk_input_schema_field(self, mock_registry):
+        schema = {
+            "type": "object",
+            "properties": {"operation": {"type": "string"}},
+        }
+        tool = SimpleNamespace(
+            name="calculate_date", description="date", input_schema=schema
+        )
+        server = MCPServerTask("date")
+        server._tools = [tool]
+        server.session = MagicMock()
+
+        with patch("tools.registry.registry", mock_registry), \
+             patch("tools.mcp_schema_cache.write_cache_entry") as write_entry:
+            _register_server_tools("date", server, {})
+
+        assert write_entry.call_args.kwargs["tools"][0]["inputSchema"] == schema
+
 
 class TestRefreshTools:
     """Tests for MCPServerTask._refresh_tools nuke-and-repave cycle."""

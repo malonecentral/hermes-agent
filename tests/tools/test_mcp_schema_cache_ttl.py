@@ -13,7 +13,7 @@ def _isolated_cache(tmp_path, monkeypatch):
     yield
 
 
-def test_entry_without_ttl_never_expires():
+def test_entry_without_ttl_uses_bounded_default():
     sc.write_cache_entry("srv", "fp", tools=[{"name": "t"}])
     assert sc.get_cached_entry("srv", "fp") is not None
 
@@ -24,6 +24,22 @@ def test_entry_within_ttl_served():
     assert entry is not None
     assert entry["ttl_ms"] == 60_000
     assert "written_at" in entry
+
+
+def test_zero_ttl_is_an_immediate_cache_miss(monkeypatch):
+    monkeypatch.setattr(sc.time, "time", lambda: 1_000.0)
+    sc.write_cache_entry("srv", "fp", tools=[{"name": "t"}], ttl_ms=0)
+    assert sc.get_cached_entry("srv", "fp") is None
+
+
+def test_non_numeric_ttl_uses_bounded_default(monkeypatch):
+    monkeypatch.setattr(sc.time, "time", lambda: 1_000.0)
+    sc.write_cache_entry("srv", "fp", tools=[{"name": "t"}])
+    cache = sc._load_all()
+    cache["srv"]["ttl_ms"] = "not-a-number"
+    sc._save_all(cache)
+    monkeypatch.setattr(sc.time, "time", lambda: 1_001.0)
+    assert sc.get_cached_entry("srv", "fp") is not None
 
 
 def test_entry_past_ttl_is_a_miss(monkeypatch):

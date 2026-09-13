@@ -7,6 +7,8 @@ existing connect path.
 """
 
 import json
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,6 +24,7 @@ def _reset_mcp_state():
     old_fps = dict(mcp._lazy_server_fingerprints)
     old_names = dict(mcp._lazy_server_tool_names)
     old_connecting = set(mcp._server_connecting)
+    old_events = dict(mcp._lazy_connect_events)
     yield
     mcp._servers.clear()
     mcp._servers.update(old_servers)
@@ -33,6 +36,8 @@ def _reset_mcp_state():
     mcp._lazy_server_tool_names.update(old_names)
     mcp._server_connecting.clear()
     mcp._server_connecting.update(old_connecting)
+    mcp._lazy_connect_events.clear()
+    mcp._lazy_connect_events.update(old_events)
 
 
 def _fake_cache_entry():
@@ -60,6 +65,23 @@ def _lazy_config():
 
 
 class TestLazyMcpRegistration:
+    def test_mobile_voice_defaults_to_lazy_without_hiding_tools(self, monkeypatch):
+        monkeypatch.setenv("HERMES_VOICE_CONVERSATION_ONLY", "1")
+
+        assert mcp._resolve_server_lazy("date", {"url": "http://date.test/mcp"}) is True
+
+    def test_mobile_voice_respects_explicit_eager_override(self, monkeypatch):
+        monkeypatch.setenv("HERMES_VOICE_CONVERSATION_ONLY", "1")
+
+        assert mcp._resolve_server_lazy(
+            "date", {"url": "http://date.test/mcp", "lazy": False}
+        ) is False
+
+    def test_non_mobile_server_remains_eager_by_default(self, monkeypatch):
+        monkeypatch.delenv("HERMES_VOICE_CONVERSATION_ONLY", raising=False)
+
+        assert mcp._resolve_server_lazy("date", {"url": "http://date.test/mcp"}) is False
+
     def test_registers_from_cache_without_connect(self):
         config = _lazy_config()
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
@@ -80,6 +102,19 @@ class TestLazyMcpRegistration:
         mock_run.assert_not_called()
         mock_loop.assert_not_called()
 
+    def test_cached_mobile_registration_does_not_import_mcp_sdk(self):
+        config = _lazy_config()
+        with patch("tools.mcp_schema_cache.config_fingerprint", return_value="abc"), \
+             patch("tools.mcp_schema_cache.get_cached_entry", return_value=_fake_cache_entry()), \
+             patch(
+                 "tools.mcp_tool._register_from_cache_sync",
+                 return_value=["mcp_playwright_browser_navigate"],
+             ), \
+             patch("tools.mcp_tool._ensure_mcp_sdk") as ensure_sdk:
+            mcp.register_mcp_servers(config)
+
+        ensure_sdk.assert_not_called()
+
     def test_cache_miss_falls_back_to_eager_connect(self):
         config = _lazy_config()
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
@@ -88,6 +123,43 @@ class TestLazyMcpRegistration:
              patch("tools.mcp_tool._ensure_mcp_loop"), \
              patch("tools.mcp_tool._run_on_mcp_loop") as mock_run:
 
+            mcp.register_mcp_servers(config)
+
+        mock_run.assert_called_once()
+
+    def test_stale_cache_falls_back_to_eager_connect(self, monkeypatch, tmp_path):
+        from tools import mcp_schema_cache as cache
+
+        config = _lazy_config()
+        server_config = config["playwright"]
+        monkeypatch.setattr(cache, "_cache_path", lambda: tmp_path / "cache.json")
+        monkeypatch.setattr(cache.time, "time", lambda: 1_000.0)
+        cache.write_cache_entry(
+            "playwright",
+            cache.config_fingerprint(server_config),
+            tools=_fake_cache_entry()["tools"],
+        )
+        monkeypatch.setattr(
+            cache.time,
+            "time",
+            lambda: 1_000.0 + cache._DEFAULT_CACHE_MAX_AGE_SECONDS + 1,
+        )
+
+        with patch("tools.mcp_tool._ensure_mcp_sdk", return_value=True), \
+             patch("tools.mcp_tool._ensure_mcp_loop"), \
+             patch("tools.mcp_tool._run_on_mcp_loop") as mock_run:
+            mcp.register_mcp_servers(config)
+
+        mock_run.assert_called_once()
+
+    def test_empty_corrupt_cache_falls_back_to_eager_connect(self):
+        config = _lazy_config()
+        corrupt_entry = {"fingerprint": "abc", "tools": [], "utility_tools": []}
+        with patch("tools.mcp_schema_cache.config_fingerprint", return_value="abc"), \
+             patch("tools.mcp_schema_cache.get_cached_entry", return_value=corrupt_entry), \
+             patch("tools.mcp_tool._ensure_mcp_sdk", return_value=True), \
+             patch("tools.mcp_tool._ensure_mcp_loop"), \
+             patch("tools.mcp_tool._run_on_mcp_loop") as mock_run:
             mcp.register_mcp_servers(config)
 
         mock_run.assert_called_once()
@@ -255,6 +327,63 @@ class TestLazyFirstUseConnect:
         assert "playwright" not in mcp._lazy_server_configs
         assert "playwright" not in mcp._lazy_server_fingerprints
         assert "playwright" not in mcp._lazy_server_tool_names
+
+    def test_concurrent_first_calls_share_one_lazy_connect(self):
+        mcp._lazy_server_configs["playwright"] = {
+            "command": "npx", "lazy": True, "connect_timeout": 1
+        }
+        started = threading.Event()
+        release = threading.Event()
+        connected = mcp.MCPServerTask("playwright")
+        connected.session = MagicMock()
+        connected._registered_tool_names = []
+        calls = []
+
+        def _fake_run(coro_or_factory, timeout=30):
+            calls.append(1)
+            started.set()
+            assert release.wait(2)
+            mcp._servers["playwright"] = connected
+            coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+            coro.close()
+            return []
+
+        results = []
+        with patch.object(mcp, "_ensure_mcp_sdk", return_value=True), \
+             patch.object(mcp, "_ensure_mcp_loop"), \
+             patch.object(mcp, "_run_on_mcp_loop", side_effect=_fake_run):
+            first = threading.Thread(
+                target=lambda: results.append(mcp._ensure_lazy_server_connected("playwright"))
+            )
+            second = threading.Thread(
+                target=lambda: results.append(mcp._ensure_lazy_server_connected("playwright"))
+            )
+            first.start()
+            assert started.wait(1)
+            second.start()
+            time.sleep(0.05)
+            release.set()
+            first.join(2)
+            second.join(2)
+
+        assert results == [True, True]
+        assert len(calls) == 1
+
+    def test_concurrent_waiter_honors_interrupt_without_disrupting_owner(self):
+        mcp._lazy_server_configs["playwright"] = {
+            "command": "npx", "lazy": True, "connect_timeout": 1
+        }
+        owner_event = threading.Event()
+        mcp._server_connecting.add("playwright")
+        mcp._lazy_connect_events["playwright"] = owner_event
+
+        with patch("tools.interrupt.is_interrupted", side_effect=[False, True]), \
+             pytest.raises(InterruptedError, match="User sent a new message"):
+            mcp._ensure_lazy_server_connected("playwright")
+
+        assert "playwright" in mcp._server_connecting
+        assert mcp._lazy_connect_events["playwright"] is owner_event
+        assert not owner_event.is_set()
 
     def test_lazy_connect_deregisters_phantom_cached_tools(self):
         # Stale-cache reconciliation: the cached manifest advertised tool X,

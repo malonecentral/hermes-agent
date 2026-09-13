@@ -4524,6 +4524,7 @@ _server_connect_errors: Dict[str, str] = {}
 _lazy_server_configs: Dict[str, dict] = {}
 _lazy_server_fingerprints: Dict[str, str] = {}
 _lazy_server_tool_names: Dict[str, List[str]] = {}
+_lazy_connect_events: Dict[str, threading.Event] = {}
 # Discovery installs a task-local claim before calling ``_connect_server`` so
 # it can retain a recoverable parked task without making standalone probe calls
 # publish failed servers into module-global ownership.
@@ -6100,11 +6101,16 @@ def _request_lazy_reconnect(server_name: str, server: MCPServerTask) -> bool:
 def _resolve_server_lazy(name: str, config: dict) -> bool:
     """True when this server defers spawn/connect until first tool use.
 
-    Gated per-server by ``mcp_servers.<name>.lazy`` in config (default OFF),
-    following the same per-server key pattern as ``idle_timeout_seconds``.
-    Design from #56832 (Vansh5632).
+    Explicit per-server config always wins. Mobile voice subprocesses default
+    to lazy startup because they are short-lived, while retaining cached exact
+    schemas and connecting on first MCP dispatch. Other entry points remain
+    eager by default.
     """
-    return _parse_boolish(config.get("lazy", False), default=False)
+    if "lazy" in config:
+        return _parse_boolish(config.get("lazy"), default=False)
+    return _parse_boolish(
+        os.environ.get("HERMES_VOICE_CONVERSATION_ONLY"), default=False
+    )
 
 
 def _ensure_lazy_server_connected(server_name: str) -> bool:
@@ -6113,9 +6119,11 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     Composes with the existing connect machinery: respects the per-server
     connect cooldown (#50394), the ``_server_connecting`` dedup set, and
     routes through ``_discover_and_register_server`` so parked/recycle/
-    cooldown bookkeeping stays in one place. Returns True when a live
-    session is available afterwards.
+    cooldown bookkeeping stays in one place. Concurrent first callers wait
+    for the single shared connection attempt. Returns True when a live session
+    is available afterwards.
     """
+    wait_event: Optional[threading.Event] = None
     with _lock:
         server = _servers.get(server_name)
         if server is not None and server.session is not None:
@@ -6126,13 +6134,39 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
         if _connect_cooldown_active(server_name):
             return False
         if server_name in _server_connecting:
-            return False
-        _server_connecting.add(server_name)
-        _server_connect_errors.pop(server_name, None)
+            wait_event = _lazy_connect_events.get(server_name)
+        else:
+            _server_connecting.add(server_name)
+            _server_connect_errors.pop(server_name, None)
+            _lazy_connect_events[server_name] = threading.Event()
 
+    connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
+    if wait_event is not None:
+        from tools.interrupt import is_interrupted
+
+        deadline = time.monotonic() + float(connect_timeout) + 30.0
+        while not wait_event.is_set():
+            if is_interrupted():
+                # This caller does not own the shared connection attempt, so
+                # interrupt only its wait; the owner must remain undisturbed.
+                raise InterruptedError("User sent a new message")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wait_event.wait(timeout=min(0.1, remaining))
+        with _lock:
+            server = _servers.get(server_name)
+            return server is not None and server.session is not None
+
+    if not _ensure_mcp_sdk():
+        with _lock:
+            _server_connecting.discard(server_name)
+            event = _lazy_connect_events.pop(server_name, None)
+            if event is not None:
+                event.set()
+        return False
     logger.info("MCP server '%s': lazy start on first use", server_name)
     _ensure_mcp_loop()
-    connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
 
     async def _connect():
         return await _discover_and_register_server(server_name, config)
@@ -6145,6 +6179,9 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
             _server_connecting.discard(server_name)
             _server_connect_errors[server_name] = message
             _record_connect_failure(server_name)
+            event = _lazy_connect_events.pop(server_name, None)
+            if event is not None:
+                event.set()
         logger.warning(
             "Lazy MCP connect failed for '%s': %s", server_name, message,
         )
@@ -6160,6 +6197,9 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
         live_names = set(
             getattr(server, "_registered_tool_names", []) or []
         )
+        event = _lazy_connect_events.pop(server_name, None)
+        if event is not None:
+            event.set()
     # Stale-cache reconciliation: the cached manifest may advertise tools
     # the live server no longer serves. Deregister those phantoms so the
     # model stops seeing tools that can never succeed.
@@ -7608,7 +7648,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             for mcp_tool in server._tools:
                 if not _should_register(mcp_tool.name):
                     continue
-                schema_obj = getattr(mcp_tool, "inputSchema", None)
+                # MCP SDK models expose the Python field as ``input_schema``
+                # (with ``inputSchema`` only as its JSON alias). Accept both
+                # so the cache preserves the real callable schema.
+                schema_obj = mcp_field(mcp_tool, "input_schema", "inputSchema")
                 tools_payload.append({
                     "name": mcp_tool.name,
                     "description": mcp_tool.description or "",
@@ -7869,10 +7912,6 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     Returns:
         List of all currently registered MCP tool names.
     """
-    if not _ensure_mcp_sdk():
-        logger.debug("MCP SDK not available -- skipping explicit MCP registration")
-        return []
-
     servers = _filter_suspicious_mcp_servers(servers)
     if not servers:
         logger.debug("No explicit MCP servers provided")
@@ -7958,6 +7997,13 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 with _lock:
                     _server_connecting.add(name)
                 continue
+            if not names:
+                # A cache entry that cannot advertise any callable tool is
+                # not a successful lazy registration. Fail closed to live
+                # eager discovery instead of silently hiding the server.
+                with _lock:
+                    _server_connecting.add(name)
+                continue
             eager_servers.pop(name, None)
             lazy_registered += len(names)
             lazy_server_count += 1
@@ -7970,6 +8016,15 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 "(no processes spawned)",
                 lazy_registered,
             )
+        return _existing_tool_names()
+
+    # Cached lazy registration is SDK-free. Import the optional MCP stack only
+    # when an eager connection is actually required; first lazy dispatch does
+    # the same in _ensure_lazy_server_connected().
+    if not _ensure_mcp_sdk():
+        with _lock:
+            _server_connecting.difference_update(new_servers)
+        logger.debug("MCP SDK not available -- skipping explicit MCP registration")
         return _existing_tool_names()
 
     # Start the background event loop for MCP connections
@@ -8086,12 +8141,6 @@ def discover_mcp_tools() -> List[str]:
     servers = _load_mcp_config()
     if not servers:
         logger.debug("No MCP servers configured")
-        return []
-
-    # SDK import is deferred to HERE so a config with zero MCP servers (the
-    # default) never pays the ~260ms `mcp` import on CLI startup.
-    if not _ensure_mcp_sdk():
-        logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []
 
     # Cross-process discovery guard (#62771). A lock loser waits for
