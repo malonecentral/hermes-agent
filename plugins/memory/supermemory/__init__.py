@@ -6,6 +6,7 @@ explicit memory tools, and cleaned completed-turn conversation capture.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -59,6 +60,7 @@ _OWNER_RERANKER_QUERY_BYTE_LIMIT = 1024
 _OWNER_RERANKER_TEMPLATE_TOKEN_RESERVE = 768
 _DEFAULT_CONTEXT_CHAR_BUDGET = 12000
 _DEFAULT_CONTEXT_BYTE_BUDGET = 24000
+_OWNER_EXACT_DOCUMENT_MAX_BYTES = 65536
 
 
 class _EvidenceProvenance(str, Enum):
@@ -845,6 +847,21 @@ def _scope_owner_restaurant_results(query: str, results: list) -> tuple[list, bo
     return [exact, *reciprocal], True
 
 
+def _exact_restaurant_parent(items: list[dict]) -> Optional[dict]:
+    """Return one unambiguous schema-v4 restaurant search parent."""
+    parents: dict[tuple[str, str], dict] = {}
+    for item in items or []:
+        metadata = item.get("metadata") or {}
+        path = str(metadata.get("relative_path") or "")
+        if not re.search(r"/Food/Restaurants/[^/]+\.md$", path, re.IGNORECASE):
+            continue
+        document_id = str(item.get("_parent_document_id") or "")
+        if not document_id or not _is_canonical_result(item, schema_v4_ready=True):
+            continue
+        parents[(document_id, path)] = item
+    return next(iter(parents.values())) if len(parents) == 1 else None
+
+
 def _scope_usual_order_evidence(query: str, item: dict) -> dict:
     """For explicit usual-order questions, expose only the recorded answer."""
     if not re.search(r"\b(?:normally|usual(?:ly)?|typically)\b", query or "", re.IGNORECASE):
@@ -1287,8 +1304,26 @@ class _SupermemoryClient:
                     ),
                     "updated_at": updated_at,
                     "metadata": metadata,
+                    "_parent_document_id": document_id,
                 })
         return results[:limit]
+
+    def get_document(self, document_id: str, *, timeout: Optional[float] = None) -> dict:
+        """Fetch one document by its provider-issued parent ID."""
+        kwargs: dict[str, Any] = {}
+        if timeout is not None:
+            kwargs["timeout"] = max(0.001, timeout)
+        document = self._client.documents.get(document_id, **kwargs)
+        return {
+            "id": str(getattr(document, "id", "") or ""),
+            "custom_id": str(getattr(document, "custom_id", None) or getattr(document, "customId", None) or ""),
+            "content": str(getattr(document, "content", "") or ""),
+            "metadata": getattr(document, "metadata", None),
+            "container_tags": list(getattr(document, "container_tags", None) or getattr(document, "containerTags", None) or []),
+            "task_type": getattr(document, "task_type", None) or getattr(document, "taskType", None),
+            "status": getattr(document, "status", None),
+            "updated_at": getattr(document, "updated_at", None) or getattr(document, "updatedAt", None),
+        }
 
     def get_profile(self, query: Optional[str] = None, *,
                     container_tag: Optional[str] = None,
@@ -1780,6 +1815,67 @@ class SupermemoryMemoryProvider(MemoryProvider):
         )
         return selected_items
 
+    def _hydrate_exact_restaurant(
+        self, items: list[dict], *, deadline: float,
+    ) -> list[dict]:
+        """Replace one exact venue chunk with its verified bounded parent."""
+        candidate = _exact_restaurant_parent(items)
+        if candidate is None or self._client is None:
+            return items
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return items
+        parent_id = str(candidate["_parent_document_id"])
+        try:
+            document = self._client.get_document(parent_id, timeout=remaining)
+        except Exception:
+            logger.warning("supermemory_prefetch stage=hydrate outcome=error")
+            return items
+        metadata = document.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        content = str(document.get("content") or "")
+        prefix = re.match(r"\A\[canonical-identity\]\n[\s\S]*?\n\[/canonical-identity\]\n\n", content)
+        source = content[prefix.end():] if prefix else ""
+        source_bytes = source.encode("utf-8")
+        expected_custom_id = "obsidian-" + hashlib.sha256(
+            str(metadata.get("relative_path") or "").encode("utf-8")
+        ).hexdigest()
+        trusted = {
+            **candidate, "metadata": metadata,
+        }
+        # The get endpoint normalizes away one final LF. Restore it only when
+        # both the indexed byte count and SHA-256 prove that exact transform.
+        expected_bytes = metadata.get("content_bytes")
+        expected_hash = metadata.get("content_sha256")
+        if (
+            isinstance(expected_bytes, int) and expected_bytes == len(source_bytes) + 1
+            and expected_hash == hashlib.sha256(source_bytes + b"\n").hexdigest()
+        ):
+            content += "\n"
+            source_bytes += b"\n"
+        valid = (
+            parent_id in {document.get("id"), document.get("custom_id")}
+            and document.get("custom_id") == expected_custom_id
+            and _OWNER_CANONICAL_CONTAINER in document.get("container_tags", [])
+            and document.get("task_type") == "superrag"
+            and document.get("status") == "done"
+            and metadata == (candidate.get("metadata") or {})
+            and _is_canonical_result(trusted, schema_v4_ready=True)
+            and isinstance(expected_bytes, int)
+            and expected_bytes == len(source_bytes)
+            and expected_hash == hashlib.sha256(source_bytes).hexdigest()
+            and len(content.encode("utf-8")) <= _OWNER_EXACT_DOCUMENT_MAX_BYTES
+            and time.monotonic() <= deadline
+        )
+        if not valid:
+            logger.warning("supermemory_prefetch stage=hydrate outcome=rejected")
+            return items
+        hydrated = {
+            **candidate, "id": parent_id, "memory": content,
+            "updated_at": document.get("updated_at") or candidate.get("updated_at"),
+        }
+        return [hydrated if item is candidate else item for item in items]
+
     def _parallel_owner_retrieval(
         self, query: str, retrieval_query: str, recall_query: str, deadline: float,
         retrieval_context: Optional[dict] = None,
@@ -1956,6 +2052,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
             if canonical_owner:
                 search_results = _scope_owner_named_person_results(retrieval_query, search_results)
                 search_results, _named_restaurant = _scope_owner_restaurant_results(retrieval_query, search_results)
+                if _named_restaurant:
+                    search_results = self._hydrate_exact_restaurant(search_results, deadline=deadline)
                 search_results = _rank_owner_canonical_results(retrieval_query, search_results)
                 conversation_results = list(values.get("conversation") or [])
                 candidates = _scope_owner_dated_event_results(

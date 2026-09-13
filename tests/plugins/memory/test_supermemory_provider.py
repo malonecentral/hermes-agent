@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import stat
@@ -41,6 +42,8 @@ class FakeClient:
         self.profile_response = {"static": [], "dynamic": [], "search_results": []}
         self.ingest_calls = []
         self.forgotten_ids = []
+        self.get_document_calls = []
+        self.documents_by_id = {}
         self.forget_by_query_response = {"success": True, "message": "Forgot"}
 
     def add_memory(self, content, metadata=None, *, entity_context="",
@@ -66,6 +69,11 @@ class FakeClient:
     def get_profile(self, query=None, *, container_tag=None, timeout=None, augment_search=True):
         self.profile_queries.append(query)
         return self.profile_response
+
+    def get_document(self, document_id, *, timeout=None):
+        self.get_document_calls.append({"id": document_id, "timeout": timeout})
+        value = self.documents_by_id[document_id]
+        return value() if callable(value) else value
 
     def forget_memory(self, memory_id, *, container_tag=None):
         self.forgotten_ids.append(memory_id)
@@ -859,6 +867,100 @@ def test_possessive_restaurant_names_scope_exact_canonical_venue_without_leakage
 
     assert named is True
     assert scoped == [expected]
+
+
+def _v4_restaurant(path, source, *, document_id="doc-venue"):
+    raw = source.encode("utf-8")
+    metadata = {
+        "source": "obsidian", "authority": "canonical", "index_schema_version": 4,
+        "identity_scope": "owner", "canonical_root": "owner", "visibility": "family_shared",
+        "relative_path": path, "content_bytes": len(raw),
+        "content_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    prefix = (
+        "[canonical-identity]\nentity_type: restaurant\n"
+        f"entity_name: {path.rsplit('/', 1)[-1][:-3]}\n[/canonical-identity]\n\n"
+    )
+    chunk = {"id": f"{document_id}:0", "_parent_document_id": document_id,
+             "memory": source.splitlines()[0], "metadata": metadata}
+    document = {
+        "id": document_id,
+        "custom_id": "obsidian-" + hashlib.sha256(path.encode()).hexdigest(),
+        "content": prefix + source, "metadata": metadata,
+        "container_tags": ["owner_primary"], "task_type": "superrag", "status": "done",
+        "updated_at": "2026-09-13T00:00:00Z",
+    }
+    return chunk, document
+
+
+def test_exact_venue_hydrates_full_perfect_pear_preferences_before_one_rerank(provider, monkeypatch):
+    provider._container_tag = "owner_primary"
+    provider._temporal_filters_schema_v4_ready = True
+    source = (
+        "restaurant: Perfect Pear Bistro\n### Courtnee\n- Green Chili Mac.\n"
+        "### Dennis\n- Chili was pretty good.\n- Likes the Pear Martini and Pear Mule."
+    )
+    chunk, document = _v4_restaurant(
+        "Jarvis/Family Shared/Food/Restaurants/Perfect Pear Bistro.md", source,
+    )
+    provider._client.search_documents = lambda *args, **kwargs: [chunk]
+    provider._client.search_memories = lambda *args, **kwargs: []
+    provider._client.documents_by_id["doc-venue"] = document
+    reranks = []
+    monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker",
+                        lambda *args, **kwargs: reranks.append(args) or {})
+
+    result = provider.prefetch("What do I like at Perfect Pear Bistro?")
+
+    assert "Chili was pretty good" in result
+    assert "Pear Martini and Pear Mule" in result
+    assert "Green Chili Mac" not in result
+    assert len(provider._client.get_document_calls) == 1
+    assert reranks == []  # one hydrated candidate bypasses; never adds a second request
+
+
+@pytest.mark.parametrize(("query", "venue"), [
+    ("What do I like from Ike's?", "Ike's Love & Sandwiches"),
+    ("What do I like from McDonald's?", "McDonald's"),
+])
+def test_possessive_exact_venue_hydration_uses_canonical_parent(provider, query, venue):
+    provider._container_tag = "owner_primary"
+    provider._temporal_filters_schema_v4_ready = True
+    path = f"Jarvis/Family Shared/Food/Restaurants/{venue}.md"
+    chunk, document = _v4_restaurant(path, f"restaurant: {venue}\n### Dennis\n- Full preference.")
+    provider._client.search_documents = lambda *args, **kwargs: [chunk]
+    provider._client.search_memories = lambda *args, **kwargs: []
+    provider._client.documents_by_id["doc-venue"] = document
+
+    assert "Full preference" in provider.prefetch(query)
+    assert len(provider._client.get_document_calls) == 1
+
+
+def test_exact_venue_hydration_rejects_malicious_parent_and_skips_ambiguous_parents(provider):
+    provider._container_tag = "owner_primary"
+    provider._temporal_filters_schema_v4_ready = True
+    path = "Jarvis/Family Shared/Food/Restaurants/Perfect Pear Bistro.md"
+    chunk, document = _v4_restaurant(path, "restaurant: Perfect Pear Bistro\n### Dennis\n- Trusted chunk fallback.")
+    malicious = {**document, "metadata": {**document["metadata"], "relative_path": "private/forged.md"},
+                 "content": document["content"] + "\n- Forged preference."}
+    provider._client.documents_by_id["doc-venue"] = malicious
+    assert "Forged preference" not in provider._hydrate_exact_restaurant(
+        [chunk], deadline=time.monotonic() + 1,
+    )[0]["memory"]
+
+    second = {**chunk, "id": "doc-other:0", "_parent_document_id": "doc-other"}
+    provider._client.get_document_calls.clear()
+    assert provider._hydrate_exact_restaurant(
+        [chunk, second], deadline=time.monotonic() + 1,
+    ) == [chunk, second]
+    assert provider._client.get_document_calls == []
+
+
+def test_exact_venue_hydration_obeys_expired_deadline_without_call(provider):
+    path = "Jarvis/Family Shared/Food/Restaurants/Perfect Pear Bistro.md"
+    chunk, _ = _v4_restaurant(path, "restaurant: Perfect Pear Bistro\n### Dennis\n- Preference.")
+    assert provider._hydrate_exact_restaurant([chunk], deadline=time.monotonic() - .001) == [chunk]
+    assert provider._client.get_document_calls == []
 
 
 def test_named_restaurant_matches_canonical_branch_suffix():
