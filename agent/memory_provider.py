@@ -175,7 +175,9 @@ class MemoryProvider(ABC):
         """
         return ""
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(
+        self, query: str, *, session_id: str = "", deadline: Optional[float] = None,
+    ) -> str:
         """Recall relevant context for the upcoming turn.
 
         Called before each API call. Return formatted text to inject as
@@ -186,6 +188,10 @@ class MemoryProvider(ABC):
         session_id is provided for providers serving concurrent sessions
         (gateway group chats, cached agents). Providers that don't need
         per-session scoping can ignore it.
+
+        ``deadline`` is an absolute monotonic deadline supplied by the manager.
+        Networked providers should cap all internal work to its remaining time.
+        Legacy providers without this keyword remain supported by the manager.
         """
         return ""
 

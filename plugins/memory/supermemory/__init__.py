@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
 import urllib.request
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -35,6 +37,8 @@ _DEFAULT_CAPTURE_MODE = "all"
 _DEFAULT_SEARCH_MODE = "hybrid"
 _VALID_SEARCH_MODES = ("hybrid", "memories", "documents")
 _DEFAULT_API_TIMEOUT = 5.0
+_DEFAULT_PREFETCH_TIMEOUT = 7.0
+_PREFETCH_FORMAT_MARGIN = 0.01
 _MIN_CAPTURE_LENGTH = 10
 _MAX_ENTITY_CONTEXT_LENGTH = 1500
 _DEFAULT_BASE_URL = "https://api.supermemory.ai"
@@ -141,7 +145,9 @@ def _scope_owner_dated_event_results(query: str, results: list[dict]) -> list[di
     return unique
 
 
-def _call_owner_reranker(query: str, candidates: list[dict]) -> dict:
+def _call_owner_reranker(
+    query: str, candidates: list[dict], *, timeout: Optional[float] = None,
+) -> dict:
     """Rank bounded evidence with the dedicated non-generative Qwen reranker.
 
     Candidate text is sent only as a document. Authority remains trusted local
@@ -159,7 +165,10 @@ def _call_owner_reranker(query: str, candidates: list[dict]) -> dict:
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=_OWNER_RERANK_TIMEOUT_SECONDS) as response:
+    request_timeout = _OWNER_RERANK_TIMEOUT_SECONDS if timeout is None else min(
+        _OWNER_RERANK_TIMEOUT_SECONDS, max(0.001, timeout)
+    )
+    with urllib.request.urlopen(request, timeout=request_timeout) as response:
         body = json.load(response)
     results = body.get("results") if isinstance(body, dict) else None
     if not isinstance(results, list):
@@ -225,6 +234,7 @@ def _default_config() -> dict:
         "search_mode": _DEFAULT_SEARCH_MODE,
         "entity_context": _DEFAULT_ENTITY_CONTEXT,
         "api_timeout": _DEFAULT_API_TIMEOUT,
+        "prefetch_timeout": _DEFAULT_PREFETCH_TIMEOUT,
         "base_url": "",
         "enable_custom_container_tags": False,
         "custom_containers": [],
@@ -302,6 +312,13 @@ def _load_supermemory_config(hermes_home: str) -> dict:
         config["api_timeout"] = max(0.5, min(15.0, float(config.get("api_timeout", _DEFAULT_API_TIMEOUT))))
     except Exception:
         config["api_timeout"] = _DEFAULT_API_TIMEOUT
+    try:
+        configured_timeout = float(config.get("prefetch_timeout", _DEFAULT_PREFETCH_TIMEOUT))
+        if not math.isfinite(configured_timeout) or configured_timeout <= 0:
+            raise ValueError("prefetch_timeout must be finite and positive")
+        config["prefetch_timeout"] = min(30.0, configured_timeout)
+    except Exception:
+        config["prefetch_timeout"] = _DEFAULT_PREFETCH_TIMEOUT
     config["base_url"] = str(config.get("base_url", "") or "").strip()
 
     # Multi-container support
@@ -797,12 +814,15 @@ class _SupermemoryClient:
 
     def search_memories(self, query: str, *, limit: int = 5,
                         container_tag: Optional[str] = None,
-                        search_mode: Optional[str] = None) -> list[dict]:
+                        search_mode: Optional[str] = None,
+                        timeout: Optional[float] = None) -> list[dict]:
         tag = container_tag or self._container_tag
         mode = search_mode or self._search_mode
         kwargs: dict[str, Any] = {"q": query, "container_tag": tag, "limit": limit}
         if mode in _VALID_SEARCH_MODES:
             kwargs["search_mode"] = mode
+        if timeout is not None:
+            kwargs["timeout"] = max(0.001, timeout)
         response = self._client.search.memories(**kwargs)
         results = []
         for item in (getattr(response, "results", None) or []):
@@ -821,10 +841,11 @@ class _SupermemoryClient:
         return results
 
     def search_documents(self, query: str, *, limit: int = 5,
-                         container_tag: Optional[str] = None) -> list[dict]:
+                         container_tag: Optional[str] = None,
+                         timeout: Optional[float] = None) -> list[dict]:
         """Search canonical superrag chunks rather than extracted memories."""
         tag = container_tag or self._container_tag
-        response = self._client.search.documents(
+        kwargs: dict[str, Any] = dict(
             q=query,
             container_tags=[tag],
             limit=limit,
@@ -832,6 +853,9 @@ class _SupermemoryClient:
             rewrite_query=False,
             only_matching_chunks=True,
         )
+        if timeout is not None:
+            kwargs["timeout"] = max(0.001, timeout)
+        response = self._client.search.documents(**kwargs)
         results = []
         for document in (getattr(response, "results", None) or []):
             document_id = (
@@ -874,11 +898,15 @@ class _SupermemoryClient:
         return results[:limit]
 
     def get_profile(self, query: Optional[str] = None, *,
-                    container_tag: Optional[str] = None) -> dict:
+                    container_tag: Optional[str] = None,
+                    timeout: Optional[float] = None,
+                    augment_search: bool = True) -> dict:
         tag = container_tag or self._container_tag
         kwargs: dict[str, Any] = {"container_tag": tag}
         if query:
             kwargs["q"] = query
+        if timeout is not None:
+            kwargs["timeout"] = max(0.001, timeout)
         response = self._client.profile(**kwargs)
         profile_data = getattr(response, "profile", None)
         search_data = getattr(response, "search_results", None) or getattr(response, "searchResults", None)
@@ -896,7 +924,7 @@ class _SupermemoryClient:
                         "updated_at": getattr(item, "updated_at", None) or getattr(item, "updatedAt", None),
                         "similarity": getattr(item, "similarity", None),
                     })
-        if query and self._search_mode in {"hybrid", "documents"}:
+        if augment_search and query and self._search_mode in {"hybrid", "documents"}:
             if tag == _OWNER_CANONICAL_CONTAINER:
                 hybrid_results = self.search_documents(
                     query,
@@ -1070,6 +1098,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._search_mode = _DEFAULT_SEARCH_MODE
         self._entity_context = _DEFAULT_ENTITY_CONTEXT
         self._api_timeout = _DEFAULT_API_TIMEOUT
+        self._prefetch_timeout = _DEFAULT_PREFETCH_TIMEOUT
         self._base_url = _DEFAULT_BASE_URL
         self._hermes_home = ""
         self._write_enabled = True
@@ -1191,6 +1220,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._search_mode = self._config["search_mode"]
         self._entity_context = self._config["entity_context"]
         self._api_timeout = self._config["api_timeout"]
+        self._prefetch_timeout = self._config["prefetch_timeout"]
         # Base URL: config > SUPERMEMORY_BASE_URL env var > api.supermemory.ai.
         # Supports self-hosted Supermemory servers.
         self._base_url = _resolve_base_url(self._config["base_url"])
@@ -1238,7 +1268,9 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 lines.append(f"\n{self._custom_container_instructions}")
         return "\n".join(lines)
 
-    def _rerank_owner_candidates(self, query: str, items: list[dict]) -> list[dict]:
+    def _rerank_owner_candidates(
+        self, query: str, items: list[dict], *, deadline: Optional[float] = None,
+    ) -> list[dict]:
         candidates = []
         by_id = {}
         for index, item in enumerate(items):
@@ -1287,7 +1319,11 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return [by_id[candidates[0]["id"]]] if candidates else []
         started = time.monotonic()
         logger.warning("owner reranker request model=%s candidates=%d", _OWNER_RERANK_MODEL, len(candidates))
-        result = _call_owner_reranker(query, candidates)
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            logger.warning("supermemory_prefetch stage=reranker outcome=deadline elapsed_ms=0 required=true")
+            return []
+        result = _call_owner_reranker(query, candidates, timeout=remaining)
         if not isinstance(result, dict) or set(result) != {"selected_ids", "rejected_ids", "sufficient"}:
             return []
         selected = result.get("selected_ids")
@@ -1309,6 +1345,97 @@ class SupermemoryMemoryProvider(MemoryProvider):
             round((time.monotonic() - started) * 1000),
         )
         return [by_id[candidate_id] for candidate_id in selected]
+
+    def _parallel_owner_retrieval(
+        self, query: str, retrieval_query: str, recall_query: str, deadline: float,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        """Run independent read stages under one monotonic deadline.
+
+        Every production HTTP call receives the remaining budget. Pending
+        futures are cancelled and executor shutdown never waits past the outer
+        deadline. Late results are ignored, so they cannot leak into a later turn.
+        """
+        client = self._client
+        assert client is not None
+        fallback_query = _owner_prefetch_fallback_query(query)
+        stages: dict[str, tuple[bool, Any]] = {
+            "profile": (False, lambda timeout: client.get_profile(
+                query=recall_query[:200], timeout=timeout, augment_search=False,
+            )),
+            "canonical": (True, lambda timeout: client.search_documents(
+                recall_query[:511], limit=20, container_tag=_OWNER_CANONICAL_CONTAINER,
+                timeout=timeout,
+            )),
+            "conversation": (False, lambda timeout: client.search_memories(
+                retrieval_query, limit=20, container_tag=_OWNER_CONVERSATION_CONTAINER,
+                search_mode=self._search_mode, timeout=timeout,
+            )),
+        }
+        if fallback_query:
+            stages["fallback"] = (False, lambda timeout: client.search_documents(
+                fallback_query, limit=20, container_tag=_OWNER_CANONICAL_CONTAINER,
+                timeout=timeout,
+            ))
+
+        started_at = time.monotonic()
+
+        def run_stage(name: str, call: Any) -> tuple[str, str, Any, int]:
+            stage_started = time.monotonic()
+            remaining = deadline - stage_started
+            if remaining <= 0:
+                return name, "deadline", None, 0
+            try:
+                value = call(remaining)
+                outcome = "ok"
+            except Exception:
+                value = None
+                outcome = "error"
+            completed_at = time.monotonic()
+            if completed_at > deadline:
+                value = None
+                outcome = "deadline"
+            return name, outcome, value, round((completed_at - stage_started) * 1000)
+
+        values: dict[str, Any] = {}
+        outcomes: dict[str, str] = {}
+        executor = ThreadPoolExecutor(
+            max_workers=len(stages), thread_name_prefix="supermemory-prefetch"
+        )
+        futures = {
+            executor.submit(run_stage, name, call): name
+            for name, (_, call) in stages.items()
+        }
+        pending = set(futures)
+        try:
+            while pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                done, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+                if not done:
+                    break
+                for future in done:
+                    name, outcome, value, elapsed_ms = future.result()
+                    outcomes[name] = outcome
+                    if outcome == "ok":
+                        values[name] = value
+                    logger.info(
+                        "supermemory_prefetch stage=%s outcome=%s elapsed_ms=%d required=%s",
+                        name, outcome, elapsed_ms, str(stages[name][0]).lower(),
+                    )
+        finally:
+            for future in pending:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+        elapsed_ms = round((time.monotonic() - started_at) * 1000)
+        for future in pending:
+            name = futures[future]
+            outcomes[name] = "deadline"
+            logger.warning(
+                "supermemory_prefetch stage=%s outcome=deadline elapsed_ms=%d required=%s",
+                name, elapsed_ms, str(stages[name][0]).lower(),
+            )
+        return values, outcomes
 
     @staticmethod
     def _owner_tool_query(query: str) -> str:
@@ -1351,25 +1478,43 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 results = [venue_record] + results[:max(0, limit - 1)]
         return _scope_owner_person_sections(owner_query, results)[:limit]
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(
+        self, query: str, *, session_id: str = "", deadline: Optional[float] = None,
+    ) -> str:
         if not self._active or not self._auto_recall or not self._client or not query.strip():
             return ""
         try:
             canonical_owner = self._container_tag == _OWNER_CANONICAL_CONTAINER
             retrieval_query = _owner_prefetch_query(query) if canonical_owner else query
             recall_query = _owner_canonical_query(retrieval_query) if canonical_owner else retrieval_query
-            profile = self._client.get_profile(query=recall_query[:200])
+            values: dict[str, Any] = {}
             include_profile = self._turn_count <= 1 or (self._turn_count % self._profile_frequency == 0)
-            profile_results = profile["search_results"]
+            configured_deadline = time.monotonic() + self._prefetch_timeout
+            if deadline is not None:
+                configured_deadline = min(configured_deadline, deadline)
+            deadline = configured_deadline - _PREFETCH_FORMAT_MARGIN
+            if deadline <= time.monotonic():
+                return ""
             if canonical_owner:
-                profile_results = profile_results + self._client.search_documents(
-                    recall_query[:511], limit=20, container_tag=_OWNER_CANONICAL_CONTAINER,
+                values, outcomes = self._parallel_owner_retrieval(
+                    query, retrieval_query, recall_query, deadline,
                 )
-                fallback_query = _owner_prefetch_fallback_query(query)
-                if fallback_query:
-                    profile_results = profile_results + self._client.search_documents(
-                        fallback_query, limit=20, container_tag=_OWNER_CANONICAL_CONTAINER,
+                if outcomes.get("canonical") != "ok":
+                    logger.warning(
+                        "supermemory_prefetch stage=canonical outcome=%s required=true action=discard",
+                        outcomes.get("canonical", "missing"),
                     )
+                    return ""
+                profile = values.get("profile") or {"static": [], "dynamic": [], "search_results": []}
+                profile_results = list(profile.get("search_results") or [])
+                profile_results += list(values.get("canonical") or [])
+                profile_results += list(values.get("fallback") or [])
+            else:
+                # Preserve the common provider's historical one-call fast path.
+                profile = self._client.get_profile(
+                    query=recall_query[:200], timeout=deadline - time.monotonic(),
+                )
+                profile_results = profile["search_results"]
             search_results = _authoritative_search_results(profile_results)
             named_restaurant = False
             if canonical_owner:
@@ -1377,13 +1522,13 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 search_results, named_restaurant = _scope_owner_restaurant_results(retrieval_query, search_results)
                 venue_record = search_results[0] if named_restaurant and search_results else None
                 search_results = _rank_owner_canonical_results(retrieval_query, search_results)
-                conversation_results = [] if named_restaurant else self._client.search_memories(
-                    retrieval_query, limit=20, container_tag=_OWNER_CONVERSATION_CONTAINER, search_mode=self._search_mode
-                )
+                conversation_results = [] if named_restaurant else list(values.get("conversation") or [])
                 candidates = _scope_owner_dated_event_results(
                     retrieval_query, search_results + conversation_results,
                 )
-                search_results = self._rerank_owner_candidates(retrieval_query, candidates)
+                search_results = self._rerank_owner_candidates(
+                    retrieval_query, candidates, deadline=deadline,
+                )
                 if venue_record is not None:
                     scoped_venue = _scope_usual_order_evidence(retrieval_query, venue_record)
                     if scoped_venue is not venue_record:

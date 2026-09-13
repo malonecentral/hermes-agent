@@ -19,6 +19,7 @@ import pytest
 
 import run_agent
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
+from hermes_state import SessionDB
 
 
 @pytest.fixture
@@ -73,6 +74,84 @@ class TestApiModeAccepted:
 
 
 class TestRunConversationCodexPath:
+    def test_composed_user_context_reaches_codex_once_and_storage_stays_clean(
+        self, monkeypatch, tmp_path
+    ):
+        captured = []
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            captured.append(user_input)
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-context-1",
+                thread_id="thread-context-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-context-1"
+        )
+        db = SessionDB(db_path=tmp_path / "state.db")
+        agent = _make_codex_agent(session_db=db, session_id="context-session")
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.build_system_prompt.return_value = ""
+        agent._memory_manager.prefetch_all.return_value = "remembered fact"
+        agent._memory_manager.describe_recall.return_value = ""
+
+        def hook_results(name, **kwargs):
+            if name == "pre_llm_call":
+                return [
+                    {"context": "<supermemory-context>SM-CONTEXT</supermemory-context>"},
+                    {"context": "PLUGIN-CTX"},
+                ]
+            return []
+
+        with patch(
+            "hermes_cli.lifecycle.invoke_hook",
+            side_effect=hook_results,
+        ), patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("what did we decide?")
+
+        assert len(captured) == 1
+        wire = captured[0]
+        assert wire.count("<supermemory-context>") == 1
+        assert wire.count("SM-CONTEXT") == 1
+        assert wire.count("remembered fact") == 1
+        assert wire.count("PLUGIN-CTX") == 1
+        user = next(m for m in result["messages"] if m.get("role") == "user")
+        assert user["content"] == "what did we decide?"
+        assert user["api_content"] == wire
+        stored_user = next(
+            m for m in db.get_messages("context-session") if m["role"] == "user"
+        )
+        assert stored_user["content"] == "what did we decide?"
+        assert stored_user["api_content"] == wire
+        db.close()
+
+    def test_no_context_codex_input_is_unchanged(self):
+        agent = _make_codex_agent()
+        captured = []
+
+        def capture(user_input: str, **kwargs):
+            captured.append(user_input)
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-plain-1",
+                thread_id="thread-stub-1",
+            )
+
+        agent._codex_session = MagicMock()
+        agent._codex_session.run_turn.side_effect = capture
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("plain question")
+
+        assert captured == ["plain question"]
+        user = next(m for m in result["messages"] if m.get("role") == "user")
+        assert user["content"] == "plain question"
+        assert "api_content" not in user
+
     def test_run_conversation_returns_codex_shape(self, fake_session):
         agent = _make_codex_agent()
         # No background review fork during tests

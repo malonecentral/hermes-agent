@@ -28,9 +28,11 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import re
 import inspect
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
@@ -446,10 +448,8 @@ class MemoryManager:
             if external_prefetch_timeout is None
             else float(external_prefetch_timeout)
         )
-        if self._external_prefetch_timeout <= 0:
-            raise ValueError("external_prefetch_timeout must be positive")
-        self._external_prefetch_threads: Dict[str, threading.Thread] = {}
-        self._external_prefetch_lock = threading.Lock()
+        if not math.isfinite(self._external_prefetch_timeout) or self._external_prefetch_timeout <= 0:
+            raise ValueError("external_prefetch_timeout must be finite and positive")
         # Background executor for end-of-turn sync/prefetch. Lazily created on
         # first use so the common builtin-only path spawns no extra threads.
         # A single worker serializes a provider's writes (turn N must land
@@ -619,12 +619,23 @@ class MemoryManager:
         if provider.name == "builtin":
             return provider.prefetch(query, session_id=session_id)
 
+        deadline = time.monotonic() + self._external_prefetch_timeout
         result_box: Dict[str, str] = {}
         error_box: Dict[str, Exception] = {}
 
         def _run() -> None:
             try:
-                result_box["value"] = provider.prefetch(query, session_id=session_id) or ""
+                kwargs: Dict[str, Any] = {"session_id": session_id}
+                try:
+                    signature = inspect.signature(provider.prefetch)
+                except (TypeError, ValueError):
+                    signature = None
+                if signature is not None and (
+                    "deadline" in signature.parameters
+                    or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values())
+                ):
+                    kwargs["deadline"] = deadline
+                result_box["value"] = provider.prefetch(query, **kwargs) or ""
             except Exception as exc:  # pragma: no cover - re-raised by caller
                 error_box["value"] = exc
 
@@ -638,32 +649,16 @@ class MemoryManager:
             daemon=True,
             name=f"memory-prefetch-{provider.name}",
         )
-        with self._external_prefetch_lock:
-            existing = self._external_prefetch_threads.get(provider.name)
-            if existing is not None:
-                if existing.is_alive():
-                    logger.debug(
-                        "Memory provider '%s' prefetch is still running; skipping this turn",
-                        provider.name,
-                    )
-                    return ""
-                self._external_prefetch_threads.pop(provider.name, None)
-            self._external_prefetch_threads[provider.name] = thread
-            thread.start()
+        thread.start()
 
-        thread.join(self._external_prefetch_timeout)
+        thread.join(max(0.0, deadline - time.monotonic()))
         if thread.is_alive():
             logger.warning(
-                "Memory provider '%s' prefetch timed out after %.1fs; skipping it until "
-                "the stuck call returns",
+                "Memory provider '%s' prefetch timed out after %.1fs; discarding late result",
                 provider.name,
                 self._external_prefetch_timeout,
             )
             return ""
-
-        with self._external_prefetch_lock:
-            if self._external_prefetch_threads.get(provider.name) is thread:
-                self._external_prefetch_threads.pop(provider.name, None)
         if error_box:
             raise error_box["value"]
         return result_box.get("value", "")

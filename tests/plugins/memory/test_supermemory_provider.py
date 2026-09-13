@@ -2,11 +2,13 @@ import json
 import os
 import stat
 import threading
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from agent.memory_manager import MemoryManager
 from plugins.memory.supermemory import (
     SupermemoryMemoryProvider,
     _clean_text_for_capture,
@@ -50,15 +52,15 @@ class FakeClient:
         })
         return {"id": "mem_123"}
 
-    def search_memories(self, query, *, limit=5, container_tag=None, search_mode=None):
+    def search_memories(self, query, *, limit=5, container_tag=None, search_mode=None, timeout=None):
         self.search_calls.append({"query": query, "container_tag": container_tag, "search_mode": search_mode})
         return self.search_results
 
-    def search_documents(self, query, *, limit=5, container_tag=None):
+    def search_documents(self, query, *, limit=5, container_tag=None, timeout=None):
         self.search_calls.append({"query": query, "container_tag": container_tag, "search_mode": "documents"})
         return self.search_results
 
-    def get_profile(self, query=None, *, container_tag=None):
+    def get_profile(self, query=None, *, container_tag=None, timeout=None, augment_search=True):
         self.profile_queries.append(query)
         return self.profile_response
 
@@ -78,7 +80,7 @@ def provider(monkeypatch, tmp_path):
     monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
     monkeypatch.setattr(
         "plugins.memory.supermemory._call_owner_reranker",
-        lambda query, candidates: {
+        lambda query, candidates, **kwargs: {
             "selected_ids": [candidate["id"] for candidate in candidates],
             "rejected_ids": [],
             "sufficient": True,
@@ -129,9 +131,151 @@ def test_owner_prefetch_expands_relative_date_before_all_retrieval(provider, mon
         "Dennis dining event restaurant location party ordered"
     )
     assert provider._client.profile_queries[-1] == expected
-    assert provider._client.search_calls[-1]["query"] == expected
-    assert provider._client.search_calls[-1]["container_tag"] == "owner_conversations"
+    assert any(call["query"] == expected for call in provider._client.search_calls)
+    assert any(call["container_tag"] == "owner_conversations" for call in provider._client.search_calls)
     assert "Ghost Ranch" in provider.prefetch("Where did I eat dinner yesterday?")
+
+
+def test_owner_prefetch_preserves_canonical_when_optional_profile_times_out(provider):
+    provider._container_tag = "owner_primary"
+    provider._prefetch_timeout = 0.12
+    canonical = {"id": "c1", "memory": "Dennis's venue is Ghost Ranch.",
+                 "metadata": {"source": "obsidian", "authority": "canonical"}}
+
+    def slow_profile(*args, **kwargs):
+        time.sleep(0.3)
+        return {"static": [], "dynamic": [], "search_results": []}
+
+    provider._client.get_profile = slow_profile
+    provider._client.search_documents = lambda *args, **kwargs: [canonical]
+    provider._client.search_memories = lambda *args, **kwargs: []
+
+    started = time.monotonic()
+    result = provider.prefetch("What is my venue?")
+    assert time.monotonic() - started < 0.25
+    assert "Ghost Ranch" in result
+
+
+def test_owner_prefetch_required_canonical_failure_is_observable(provider, caplog):
+    provider._container_tag = "owner_primary"
+    provider._prefetch_timeout = 0.1
+    provider._client.get_profile = lambda *args, **kwargs: {"static": [], "dynamic": [], "search_results": []}
+    provider._client.search_documents = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("private payload"))
+    provider._client.search_memories = lambda *args, **kwargs: [{
+        "id": "u1", "memory": "[role: user]\nConversation claim\n[user:end]",
+        "metadata": {"source": "conversation", "speaker": "user"},
+    }]
+
+    with caplog.at_level("WARNING"):
+        assert provider.prefetch("Who am I?") == ""
+    assert "stage=canonical outcome=error" in caplog.text
+    assert "private payload" not in caplog.text
+
+
+def test_owner_prefetch_all_source_failure_returns_empty_with_stage_outcomes(provider, caplog):
+    provider._container_tag = "owner_primary"
+    provider._prefetch_timeout = 0.1
+
+    def fail(*args, **kwargs):
+        raise OSError("content must not be logged")
+
+    provider._client.get_profile = fail
+    provider._client.search_documents = fail
+    provider._client.search_memories = fail
+    with caplog.at_level("INFO"):
+        assert provider.prefetch("private query") == ""
+    assert "stage=profile outcome=error" in caplog.text
+    assert "stage=canonical outcome=error" in caplog.text
+    assert "stage=conversation outcome=error" in caplog.text
+    assert "private query" not in caplog.text
+    assert "content must not be logged" not in caplog.text
+
+
+def test_owner_prefetch_discards_result_that_finishes_after_deadline(provider):
+    provider._container_tag = "owner_primary"
+    provider._prefetch_timeout = 0.06
+    late = {"id": "late", "memory": "LATE SECRET",
+            "metadata": {"source": "obsidian", "authority": "canonical"}}
+    provider._client.get_profile = lambda *args, **kwargs: {"static": [], "dynamic": [], "search_results": []}
+    provider._client.search_memories = lambda *args, **kwargs: []
+
+    def late_canonical(*args, **kwargs):
+        time.sleep(0.15)
+        return [late]
+
+    provider._client.search_documents = late_canonical
+    assert "LATE SECRET" not in provider.prefetch("Who am I?")
+    time.sleep(0.16)
+    provider._client.search_documents = lambda *args, **kwargs: []
+    assert "LATE SECRET" not in provider.prefetch("Who am I?")
+
+
+def test_owner_prefetch_discards_optional_result_completed_after_deadline(provider):
+    provider._container_tag = "owner_primary"
+    provider._prefetch_timeout = 0.06
+    canonical = {"id": "c1", "memory": "Canonical evidence.",
+                 "metadata": {"source": "obsidian", "authority": "canonical"}}
+    late = {"id": "late", "memory": "LATE OPTIONAL SECRET",
+            "metadata": {"source": "conversation", "speaker": "user"}}
+    provider._client.get_profile = lambda *args, **kwargs: {
+        "static": [], "dynamic": [], "search_results": []
+    }
+    provider._client.search_documents = lambda *args, **kwargs: [canonical]
+
+    def late_conversation(*args, **kwargs):
+        time.sleep(0.08)
+        return [late]
+
+    provider._client.search_memories = late_conversation
+    result = provider.prefetch("Who am I?")
+    assert "Canonical evidence" in result
+    assert "LATE OPTIONAL SECRET" not in result
+
+
+def test_manager_50ms_deadline_beats_350ms_provider_and_turn_two_is_fresh(provider):
+    provider._container_tag = "owner_primary"
+    provider._prefetch_timeout = 0.35
+    canonical = {"id": "fresh", "memory": "TURN TWO FRESH",
+                 "metadata": {"source": "obsidian", "authority": "canonical"}}
+    calls = 0
+    observed_timeouts = []
+
+    provider._client.get_profile = lambda *args, **kwargs: {
+        "static": [], "dynamic": [], "search_results": []
+    }
+    provider._client.search_memories = lambda *args, **kwargs: []
+
+    def documents(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        observed_timeouts.append(kwargs["timeout"])
+        if "first unique query" in args[0]:
+            time.sleep(0.35)
+            return [{"id": "late", "memory": "TURN ONE LATE",
+                     "metadata": {"source": "obsidian", "authority": "canonical"}}]
+        return [canonical]
+
+    provider._client.search_documents = documents
+    manager = MemoryManager(external_prefetch_timeout=0.05)
+    manager.add_provider(provider)
+
+    started = time.monotonic()
+    assert manager.prefetch_all("first unique query") == ""
+    assert time.monotonic() - started < 0.15
+    second = manager.prefetch_all("second unique query")
+
+    assert "TURN TWO FRESH" in second
+    assert "TURN ONE LATE" not in second
+    assert observed_timeouts
+    assert max(observed_timeouts) <= 0.045
+
+
+def test_non_owner_prefetch_keeps_one_call_fast_path(provider):
+    provider._container_tag = "ordinary"
+    provider._client.profile_response = {"static": ["fact"], "dynamic": [], "search_results": []}
+    assert "fact" in provider.prefetch("question")
+    assert len(provider._client.profile_queries) == 1
+    assert provider._client.search_calls == []
 
 
 def test_is_available_false_without_api_key(monkeypatch):
@@ -147,6 +291,13 @@ def test_load_and_save_config_round_trip(tmp_path):
     assert cfg["container_tag"] == "demo-tag"
     assert cfg["auto_capture"] is False
     assert cfg["auto_recall"] is True
+
+
+@pytest.mark.parametrize("value", [None, "bad", float("nan"), float("inf"), 0, -1])
+def test_prefetch_timeout_config_is_finite_and_positive(tmp_path, value):
+    _save_supermemory_config({"prefetch_timeout": value}, str(tmp_path))
+    cfg = _load_supermemory_config(str(tmp_path))
+    assert 0 < cfg["prefetch_timeout"] <= 30
 
 
 def test_clean_text_for_capture_strips_injected_context():
@@ -591,13 +742,14 @@ def test_owner_prefetch_reranker_selects_valid_evidence(provider, monkeypatch):
     provider._client.profile_response = {"static": [], "dynamic": [], "search_results": [
         {"id": "c1", "memory": "Alex prefers tea.", "metadata": canonical},
     ]}
-    provider._client.search_results = [
+    conversation = [
         {"id": "u1", "memory": "[role: user]\nI prefer coffee.\n[user:end]", "metadata": {"authority": "non-authoritative", "source": "conversation", "speaker": "user"}},
     ]
-    monkeypatch.setattr(provider, "_rerank_owner_candidates", lambda query, items: [items[0]])
+    provider._client.search_documents = lambda *args, **kwargs: provider._client.profile_response["search_results"]
+    provider._client.search_memories = lambda *args, **kwargs: conversation
+    monkeypatch.setattr(provider, "_rerank_owner_candidates", lambda query, items, **kwargs: [items[0]])
     result = provider.prefetch("What does Alex prefer?")
     assert provider._client.profile_queries[-1] == "What does Alex prefer?"
-    assert provider._client.search_calls[-1]["container_tag"] == "owner_conversations"
     assert "Alex prefers tea" in result
     assert "I prefer coffee" not in result
 
@@ -689,7 +841,7 @@ def test_owner_reranker_candidate_instruction_cannot_invert_authority(monkeypatc
 def test_owner_reranker_caps_filtered_candidates_at_eight(provider, monkeypatch):
     captured = {}
 
-    def fake_reranker(query, candidates):
+    def fake_reranker(query, candidates, **kwargs):
         captured["candidates"] = candidates
         return {"selected_ids": [candidate["id"] for candidate in candidates],
                 "rejected_ids": [], "sufficient": True}
@@ -709,6 +861,25 @@ def test_owner_reranker_caps_filtered_candidates_at_eight(provider, monkeypatch)
     assert len(captured["candidates"]) == 8
     assert {candidate["source"] for candidate in captured["candidates"]} == {"obsidian", "conversation"}
     assert selected == [canonical[0], conversations[0], canonical[1], conversations[1]]
+
+
+def test_owner_reranker_consumes_only_remaining_deadline_budget(provider, monkeypatch):
+    captured = {}
+
+    def fake_reranker(query, candidates, **kwargs):
+        captured["timeout"] = kwargs["timeout"]
+        return {"selected_ids": [candidates[0]["id"]],
+                "rejected_ids": [candidate["id"] for candidate in candidates[1:]],
+                "sufficient": True}
+
+    monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker", fake_reranker)
+    items = [
+        {"id": "c1", "memory": "one", "metadata": {"source": "obsidian", "authority": "canonical"}},
+        {"id": "c2", "memory": "two", "metadata": {"source": "obsidian", "authority": "canonical"}},
+    ]
+    deadline = time.monotonic() + 0.2
+    assert provider._rerank_owner_candidates("question", items, deadline=deadline) == [items[0]]
+    assert 0 < captured["timeout"] <= 0.2
 
 
 def test_sync_turn_fallback_accumulates_turns_and_isolates_sessions(provider):

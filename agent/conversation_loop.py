@@ -2269,8 +2269,15 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        api_user_message = user_message
+        if 0 <= current_turn_user_idx < len(messages):
+            current_user_message = messages[current_turn_user_idx]
+            if isinstance(current_user_message, dict):
+                sidecar = current_user_message.get("api_content")
+                if isinstance(sidecar, str):
+                    api_user_message = sidecar
         return agent._run_codex_app_server_turn(
-            user_message=user_message,
+            user_message=api_user_message,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,

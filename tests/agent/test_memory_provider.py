@@ -109,6 +109,20 @@ class BlockingPrefetchProvider(FakeMemoryProvider):
         return self._prefetch_result
 
 
+class DeadlineAwarePrefetchProvider(FakeMemoryProvider):
+    def __init__(self, name="external"):
+        super().__init__(name=name)
+        self.deadlines = []
+
+    def prefetch(self, query, *, session_id="", deadline=None):
+        self.prefetch_queries.append(query)
+        self.deadlines.append(deadline)
+        if query == "query 1":
+            time.sleep(0.35)
+            return "late turn-one memory"
+        return "turn-two memory"
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider ABC tests
 # ---------------------------------------------------------------------------
@@ -286,7 +300,7 @@ class TestMemoryManager:
     # -- Error resilience ---------------------------------------------------
 
 
-    def test_external_prefetch_timeout_skips_stuck_provider(self):
+    def test_external_prefetch_timeout_does_not_poison_the_next_turn(self):
         mgr = MemoryManager(external_prefetch_timeout=0.01)
         builtin = FakeMemoryProvider("builtin")
         builtin._prefetch_result = "builtin memory"
@@ -304,29 +318,32 @@ class TestMemoryManager:
         assert external.started.wait(timeout=1.0)
         assert external.prefetch_queries == ["query"]
 
-        started = time.monotonic()
-        result = mgr.prefetch_all("query 2")
-        elapsed = time.monotonic() - started
-
-        assert result == "builtin memory"
-        assert elapsed < 0.2
-        assert external.prefetch_queries == ["query"]
-
         external.release.set()
+        external._prefetch_result = "fresh external memory"
+        result = mgr.prefetch_all("query 2")
+        assert result == "builtin memory\n\nfresh external memory"
+        assert external.prefetch_queries == ["query", "query 2"]
 
-        deadline = time.monotonic() + 1.0
-        while (
-            external.name in mgr._external_prefetch_threads
-            and mgr._external_prefetch_threads[external.name].is_alive()
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.01)
+    def test_external_prefetch_propagates_one_deadline_and_discards_late_result(self):
+        mgr = MemoryManager(external_prefetch_timeout=0.05)
+        external = DeadlineAwarePrefetchProvider()
+        mgr.add_provider(external)
 
-        result = mgr.prefetch_all("query 3")
+        started = time.monotonic()
+        assert mgr.prefetch_all("query 1") == ""
+        assert time.monotonic() - started < 0.15
+        first_deadline = external.deadlines[0]
+        assert first_deadline is not None
+        assert started < first_deadline <= started + 0.06
 
-        assert result == "builtin memory\n\nlate external memory"
-        assert external.prefetch_queries == ["query", "query 3"]
-        assert external.name not in mgr._external_prefetch_threads
+        assert mgr.prefetch_all("query 2") == "turn-two memory"
+        time.sleep(0.36)
+        assert mgr.prefetch_all("query 2") == "turn-two memory"
+
+    @pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), "bad"])
+    def test_external_prefetch_timeout_rejects_invalid_config(self, value):
+        with pytest.raises((TypeError, ValueError)):
+            MemoryManager(external_prefetch_timeout=value)
 
 
 
