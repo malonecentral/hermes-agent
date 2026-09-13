@@ -599,6 +599,9 @@ def _verified_v4_import_ready(hermes_home: str) -> bool:
             and isinstance(rows, list) and isinstance(expected, int)
             and len(rows) == expected
             and payload.get("backend_reconciled_count") == expected
+            and payload.get("search_verified_count") == expected
+            and payload.get("search_readiness_complete") is True
+            and payload.get("search_failure_count") == 0
             and payload.get("submission_failure_count") == 0
             and payload.get("still_pending_count") == 0
             and all(isinstance(row, dict) and row.get("index_schema_version") == 4
@@ -706,8 +709,8 @@ def _is_canonical_result(item: dict, *, schema_v4_ready: bool = False) -> bool:
     if not schema_v4_ready:
         return legacy_valid
     exact = (
-        metadata.get("schema_version") == 4
-        and not isinstance(metadata.get("schema_version"), bool)
+        metadata.get("index_schema_version") == 4
+        and not isinstance(metadata.get("index_schema_version"), bool)
         and metadata.get("authority") == "canonical"
         and metadata.get("source") == "obsidian"
         and metadata.get("identity_scope") == "owner"
@@ -1185,8 +1188,28 @@ class _SupermemoryClient:
             # nesting or trusting a metadata claim about its source.
             documents = getattr(item, "documents", None) or []
             source_custom_id = ""
+            parent = None
             if len(documents) == 1:
-                source_custom_id = str(getattr(documents[0], "id", "") or "")
+                parent = documents[0]
+                source_custom_id = str(getattr(parent, "id", "") or "")
+            result_metadata = getattr(item, "metadata", None)
+            parent_metadata = getattr(parent, "metadata", None) if parent is not None else None
+            if (isinstance(result_metadata, dict) and isinstance(parent_metadata, dict)
+                    and result_metadata != parent_metadata):
+                logger.warning("supermemory_search outcome=rejected reason=parent_metadata_disagreement")
+                continue
+            normalized_metadata = (
+                result_metadata if isinstance(result_metadata, dict)
+                else parent_metadata if isinstance(parent_metadata, dict) else None
+            )
+            result_updated_at = getattr(item, "updated_at", None) or getattr(item, "updatedAt", None)
+            parent_updated_at = (
+                getattr(parent, "updated_at", None) or getattr(parent, "updatedAt", None)
+                if parent is not None else None
+            )
+            if result_updated_at and parent_updated_at and result_updated_at != parent_updated_at:
+                logger.warning("supermemory_search outcome=rejected reason=parent_timestamp_disagreement")
+                continue
             results.append({
                 "id": getattr(item, "id", ""),
                 "memory": (
@@ -1196,8 +1219,8 @@ class _SupermemoryClient:
                     or ""
                 ),
                 "similarity": getattr(item, "similarity", None),
-                "updated_at": getattr(item, "updated_at", None) or getattr(item, "updatedAt", None),
-                "metadata": getattr(item, "metadata", None),
+                "updated_at": result_updated_at or parent_updated_at,
+                "metadata": normalized_metadata,
                 "_source_container": tag,
                 "_source_custom_id": source_custom_id,
             })

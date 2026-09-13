@@ -17,6 +17,7 @@ from plugins.memory.supermemory import (
     _format_connection_summary,
     _format_prefetch_context,
     _load_supermemory_config,
+    _verified_v4_import_ready,
 
     _probe_supermemory_connection,
     _save_supermemory_config,
@@ -196,6 +197,62 @@ def test_client_does_not_infer_custom_id_from_ambiguous_parent_documents():
     assert client.search_memories("q", container_tag="owner_conversations")[0][
         "_source_custom_id"
     ] == ""
+
+
+def test_client_falls_back_to_sole_parent_metadata_and_timestamp():
+    client = object.__new__(_SupermemoryClient)
+    metadata = {"type": "owner_conversation", "session_id": "s", "request_id": "r"}
+    parent = type("Document", (), {
+        "id": "jarvis-owner-app:s:r", "metadata": metadata,
+        "updated_at": None, "updatedAt": "2026-09-12T05:22:35.302Z",
+    })()
+    live = type("Result", (), {
+        "id": "opaque", "memory": None, "chunk": "statement", "content": None,
+        "documents": [parent], "metadata": None, "similarity": .5,
+        "updated_at": None, "updatedAt": None,
+    })()
+    client._client = type("Client", (), {"search": type("Search", (), {
+        "memories": lambda self, **kwargs: type("Response", (), {"results": [live]})()
+    })()})()
+    client._container_tag = "owner_primary"; client._search_mode = "hybrid"
+    result = client.search_memories("q", container_tag="owner_conversations")[0]
+    assert result["metadata"] == metadata
+    assert result["updated_at"] == "2026-09-12T05:22:35.302Z"
+
+
+@pytest.mark.parametrize("field", ["metadata", "updatedAt"])
+def test_client_rejects_result_parent_metadata_or_timestamp_disagreement(field):
+    client = object.__new__(_SupermemoryClient)
+    metadata = {"index_schema_version": 4, "relative_path": "x.md"}
+    parent_values = {"metadata": metadata, "updatedAt": "2026-09-12T05:22:35Z"}
+    result_values = {"metadata": metadata, "updatedAt": "2026-09-12T05:22:35Z"}
+    result_values[field] = ({**metadata, "relative_path": "other.md"}
+                            if field == "metadata" else "2026-09-13T05:22:35Z")
+    parent = type("Document", (), {"id": "parent", **parent_values})()
+    live = type("Result", (), {
+        "id": "opaque", "memory": "statement", "chunk": None, "content": None,
+        "documents": [parent], "similarity": .5, "updated_at": None,
+        **result_values,
+    })()
+    client._client = type("Client", (), {"search": type("Search", (), {
+        "memories": lambda self, **kwargs: type("Response", (), {"results": [live]})()
+    })()})()
+    client._container_tag = "owner_primary"; client._search_mode = "hybrid"
+    assert client.search_memories("q") == []
+
+
+def test_v4_import_gate_requires_search_metadata_convergence_receipt(tmp_path):
+    row = {"index_schema_version": 4, "final_status": "done"}
+    base = {"schema_version": 4, "reconciliation_complete": True,
+            "documents": [row], "expected_count": 1, "backend_reconciled_count": 1,
+            "submission_failure_count": 0, "still_pending_count": 0}
+    path = tmp_path / "obsidian-supermemory-import.json"
+    path.write_text(json.dumps(base), encoding="utf-8")
+    assert _verified_v4_import_ready(str(tmp_path)) is False
+    path.write_text(json.dumps(base | {"search_readiness_complete": True,
+                                       "search_verified_count": 1,
+                                       "search_failure_count": 0}), encoding="utf-8")
+    assert _verified_v4_import_ready(str(tmp_path)) is True
 
 
 def test_owner_capture_identity_ignores_forged_metadata_custom_id(provider):
@@ -1706,7 +1763,7 @@ def test_context_budget_bounds_oversized_canonical_and_conversation():
 
 def _v4_canonical_metadata(path="Jarvis/Owner Private/Fact.md", **overrides):
     metadata = {
-        "schema_version": 4, "source": "obsidian", "authority": "canonical",
+        "index_schema_version": 4, "source": "obsidian", "authority": "canonical",
         "identity_scope": "owner", "canonical_root": "owner",
         "visibility": "owner_private", "relative_path": path,
     }
@@ -1715,7 +1772,7 @@ def _v4_canonical_metadata(path="Jarvis/Owner Private/Fact.md", **overrides):
 
 
 @pytest.mark.parametrize("mutation", [
-    {"schema_version": None}, {"schema_version": "4"}, {"identity_scope": None},
+    {"index_schema_version": None}, {"index_schema_version": "4"}, {"identity_scope": None},
     {"identity_scope": "family"}, {"canonical_root": None}, {"canonical_root": "family"},
     {"visibility": None}, {"visibility": "public"}, {"authority": "non-authoritative"},
     {"source": "conversation"}, {"relative_path": None}, {"relative_path": "../Fact.md"},

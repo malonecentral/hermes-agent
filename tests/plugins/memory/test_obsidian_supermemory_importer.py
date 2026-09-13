@@ -316,6 +316,51 @@ def test_verify_only_reports_path_only_for_backend_mismatch(importer, change):
     assert set(result) == {"backend_verified_count", "failure_count", "failed_paths", "verification_complete"}
 
 
+def test_search_readiness_requires_result_and_sole_parent_v4_metadata_convergence(importer):
+    doc = importer.item("Jarvis/Family Shared/x.md", b"content")
+    expected = importer.metadata(doc)
+    parent = type("Parent", (), {"metadata": expected})()
+    result = type("Result", (), {"metadata": expected, "documents": [parent]})()
+    assert importer.validate_search_result_metadata(result, doc) is True
+
+
+@pytest.mark.parametrize("result_metadata,parents", [
+    (None, [{}]),
+    ({}, [{}]),
+    ({"index_schema_version": 4}, []),
+    ({"index_schema_version": 4}, [{}, {}]),
+])
+def test_search_readiness_rejects_missing_partial_or_ambiguous_metadata(
+        importer, result_metadata, parents):
+    doc = importer.item("x.md", b"content")
+    result = {"metadata": result_metadata,
+              "documents": [{"metadata": value} for value in parents]}
+    with pytest.raises(importer.ReconciliationRequired, match="search"):
+        importer.validate_search_result_metadata(result, doc)
+
+
+def test_search_readiness_rejects_result_parent_disagreement(importer):
+    doc = importer.item("x.md", b"content")
+    expected = importer.metadata(doc)
+    wrong = expected | {"visibility": "family_shared"}
+    result = {"metadata": expected, "documents": [{"metadata": wrong}]}
+    with pytest.raises(importer.ReconciliationRequired, match="search"):
+        importer.validate_search_result_metadata(result, doc)
+
+
+def test_search_readiness_summary_fails_closed_on_missing_results(importer):
+    first = importer.item("a.md", b"a")
+    second = importer.item("b.md", b"b")
+    expected = importer.metadata(first)
+    valid = {"metadata": expected, "documents": [{"metadata": expected}]}
+    result = importer.verify_search_readiness(
+        {"a.md": [valid], "b.md": []}, {"a.md": first, "b.md": second})
+    assert result == {
+        "search_verified_count": 1, "search_failure_count": 1,
+        "search_failed_paths": ["b.md"], "search_readiness_complete": False,
+    }
+
+
 def _legacy_remote(importer, doc, ident="legacy-id"):
     legacy = importer.metadata(doc)
     for key in ("index_schema_version", "visibility", "identity_scope", "canonical_root"):
