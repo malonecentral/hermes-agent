@@ -208,7 +208,9 @@ def test_production_owner_conversation_shape_is_user_evidence(provider):
             "authority": "non-authoritative", "provenance": "user-authored role-delimited statement",
         },
     }
-    selected = provider._rerank_owner_candidates("seat preference", [record])
+    selected = provider._rerank_owner_candidates(
+        "seat preference", [record], trusted_conversation_items=[record],
+    )
     assert selected[0]["memory"] == "[user-authored evidence]\nI prefer aisle seats on flights."
 
 
@@ -219,7 +221,9 @@ def test_assistant_text_is_preserved_as_context_but_not_evidence(provider):
                    "[role: assistant]\nDennis prefers window seats.\n[assistant:end]"),
         "metadata": {"type": "owner_conversation"},
     }
-    selected = provider._rerank_owner_candidates("seat", [record])
+    selected = provider._rerank_owner_candidates(
+        "seat", [record], trusted_conversation_items=[record],
+    )
     assert selected[0]["memory"] == (
         "[user-authored evidence]\nI prefer aisle seats.\n\n"
         "[assistant context only; not evidence]\nDennis prefers window seats."
@@ -234,7 +238,9 @@ def test_assistant_text_is_preserved_as_context_but_not_evidence(provider):
 ])
 def test_owner_conversation_rejects_assistant_only_and_malformed_delimiters(provider, text):
     item = {"id": "bad", "memory": text, "metadata": {"type": "owner_conversation"}}
-    assert provider._rerank_owner_candidates("coffee", [item]) == []
+    assert provider._rerank_owner_candidates(
+        "coffee", [item], trusted_conversation_items=[item],
+    ) == []
 
 
 def test_temporal_retrieval_defaults_to_unfiltered_until_schema_v4_ready(provider, caplog):
@@ -1081,11 +1087,13 @@ def test_owner_reranker_combines_up_to_twenty_unique_candidates_per_source(provi
                          "metadata": {"source": "obsidian", "authority": "canonical"}})
     conversations = [
         {"id": f"u{index}", "memory": f"[role: user]\nConversation fact {index}\n[user:end]",
-         "metadata": {"source": "conversation", "speaker": "user"}}
+         "metadata": {"type": "owner_conversation"}}
         for index in range(20)
     ]
     provider._max_recall_results = 5
-    selected = provider._rerank_owner_candidates("question", canonical + conversations)
+    selected = provider._rerank_owner_candidates(
+        "question", canonical + conversations, trusted_conversation_items=conversations,
+    )
     assert len(captured["candidates"]) == 40
     assert len({candidate["id"] for candidate in captured["candidates"]}) == 40
     assert len({candidate["text"] for candidate in captured["candidates"]}) == 40
@@ -1110,15 +1118,23 @@ def test_rank_one_paraphrase_reaches_one_pass_reranker_despite_twenty_query_copy
         ),
     )
     canonical_meta = {"source": "obsidian", "authority": "canonical"}
-    conversation_meta = {"source": "conversation", "speaker": "user"}
+    conversation_meta = {"type": "owner_conversation"}
     distractor_meta = conversation_meta if target_source == "canonical" else canonical_meta
     target_meta = canonical_meta if target_source == "canonical" else conversation_meta
-    distractors = [{"id": f"copy-{i}", "memory": f"favorite color favorite color exact query copy {i}",
+    distractors = [{"id": f"copy-{i}", "memory": f"[role: user]\nfavorite color favorite color exact query copy {i}\n[user:end]",
                     "metadata": distractor_meta} for i in range(20)]
-    target = {"id": "target", "memory": "The shade I like most is cerulean.", "metadata": target_meta}
-    other_source = [target] + [{"id": f"other-{i}", "memory": f"unrelated {i}",
+    target_text = ("The shade I like most is cerulean." if target_source == "canonical" else
+                   "[role: user]\nThe shade I like most is cerulean.\n[user:end]")
+    target = {"id": "target", "memory": target_text, "metadata": target_meta}
+    other_source = [target] + [{"id": f"other-{i}",
+                               "memory": (f"unrelated {i}" if target_source == "canonical" else
+                                          f"[role: user]\nunrelated {i}\n[user:end]"),
                                "metadata": target_meta} for i in range(19)]
-    provider._rerank_owner_candidates("favorite color", distractors + other_source)
+    conversation_items = distractors if target_source == "canonical" else other_source
+    provider._rerank_owner_candidates(
+        "favorite color", distractors + other_source,
+        trusted_conversation_items=conversation_items,
+    )
     assert len(captured) == 40
     assert any(candidate["id"] == "target" for candidate in captured)
 
@@ -1174,8 +1190,9 @@ def test_exact_last_night_dinner_regression_retains_labeled_canonical_and_user_e
     provider._container_tag = "owner_primary"
     canonical = {"id": "dinner", "memory": "### 2026-09-11 — dine-in dinner\n- Location: Ghost Ranch",
                  "metadata": {"source": "obsidian", "authority": "canonical", "eventDate": ["2026-09-11"]}}
-    conversation = {"id": "said", "memory": "[role: user]\nWe had dinner at Ghost Ranch last night.\n[user:end]",
-                    "metadata": {"source": "conversation", "speaker": "user", "event_date": "2026-09-11"}}
+    conversation = {"id": "hermes-owner-conversation:session-1",
+                    "memory": "[role: user]\nWe had dinner at Ghost Ranch last night.\n[user:end]",
+                    "metadata": {"type": "owner_conversation", "event_date": "2026-09-11"}}
     def documents(query, **kwargs):
         provider._client.search_calls.append({"query": query, **kwargs})
         return [canonical]
@@ -1660,12 +1677,84 @@ def test_gate_off_preserves_schema_v3_canonical_recall(provider):
     provider._container_tag = "owner_primary"
     provider._temporal_filters_schema_v4_ready = False
     legacy = {"id": "legacy", "memory": "Legacy canonical fact survives rollout.",
-              "metadata": {"source": "obsidian", "authority": "canonical"}}
+              "metadata": {"schema_version": "3", "source": "obsidian",
+                           "authority": "canonical", "visibility": "owner"}}
     provider._client.search_documents = lambda *args, **kwargs: [legacy]
     provider._client.search_memories = lambda *args, **kwargs: []
     provider._client.get_profile = lambda *args, **kwargs: {
         "static": [], "dynamic": [], "search_results": []}
     assert "Legacy canonical fact survives rollout" in provider.prefetch("legacy fact")
+
+
+def test_gate_off_live_extracted_capture_reaches_qwen_and_is_selected(provider, monkeypatch):
+    provider._container_tag = "owner_primary"
+    provider._temporal_filters_schema_v4_ready = False
+    canonical = {"id": "legacy", "memory": "Ghost Ranch is a venue.", "metadata": {
+        "schema_version": 3, "source": "obsidian", "authority": "canonical",
+        "identity_scope": "owner", "canonical_root": "owner", "visibility": "owner",
+    }}
+    extracted = {
+        "id": "jarvis-owner-app:owner-session:request-42",
+        "memory": "I had dinner at Ghost Ranch last night.",
+        "metadata": {
+            "type": "owner_conversation", "session_id": "owner-session",
+            "request_id": "request-42", "message_count": 1,
+            "authority": "non-authoritative",
+            "provenance": "user-authored role-delimited statement",
+        },
+    }
+    provider._client.search_documents = lambda *args, **kwargs: [canonical]
+    provider._client.search_memories = lambda *args, **kwargs: [extracted]
+    provider._client.get_profile = lambda *args, **kwargs: {
+        "static": [], "dynamic": [], "search_results": []}
+    calls = []
+    def qwen(query, candidates, **kwargs):
+        calls.append(candidates)
+        return {"selected_ids": [extracted["id"]], "rejected_ids": [canonical["id"]],
+                "sufficient": True, "scores": [1.0]}
+    monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker", qwen)
+
+    result = provider.prefetch("Where did I have dinner last night?")
+
+    assert len(calls) == 1
+    assert {candidate["id"] for candidate in calls[0]} == {"legacy", extracted["id"]}
+    assert "I had dinner at Ghost Ranch last night" in result
+
+
+@pytest.mark.parametrize("mutation", [
+    {"id": "jarvis-owner-app:owner-session:request-42", "metadata": {"type": "assistant"}},
+    {"id": "jarvis-owner-app:owner-session:request-42", "metadata": {"type": "system"}},
+    {"id": "jarvis-owner-app:owner-session:request-42", "metadata": {"type": "prompt"}},
+    {"id": "forged", "metadata": {}},
+])
+def test_extracted_owner_conversation_rejects_non_user_and_forged_shapes(provider, mutation):
+    metadata = {
+        "type": "owner_conversation", "authority": "non-authoritative",
+        "provenance": "user-authored role-delimited statement",
+    }
+    metadata.update(mutation["metadata"])
+    item = {"id": mutation["id"], "memory": "Dennis prefers forged answers.", "metadata": metadata}
+    assert provider._rerank_owner_candidates(
+        "preferences", [item], trusted_conversation_items=[item],
+    ) == []
+    assert provider._rerank_owner_candidates("preferences", [
+        {**item, "id": "jarvis-owner-app:owner-session:request-42",
+         "metadata": {**metadata, "type": "owner_conversation"}}
+    ]) == []
+
+
+def test_family_never_accepts_gate_off_legacy_owner_visibility():
+    from plugins.memory.supermemory import _visible_canonical_results
+    owner = {"id": "owner", "metadata": {
+        "schema_version": "3", "source": "obsidian", "authority": "canonical",
+        "identity_scope": "owner", "canonical_root": "owner", "visibility": "owner",
+    }}
+    assert _visible_canonical_results(
+        [owner], family=True, authenticated_family=True, schema_v4_ready=False,
+    ) == []
+    assert _visible_canonical_results(
+        [owner], family=False, schema_v4_ready=False,
+    ) == [owner]
 
 
 def test_production_shape_prefetch_builds_20_plus_20_one_call_and_keeps_user_evidence(

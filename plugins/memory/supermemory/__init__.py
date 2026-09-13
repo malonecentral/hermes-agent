@@ -154,20 +154,41 @@ def _role_delimited_evidence_text(text: str) -> str:
     return "\n\n".join(sections)
 
 
+def _owner_capture_custom_id(item: dict) -> bool:
+    """Recognize only IDs emitted by the two Owner capture entry points."""
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    values = (item.get("id"), metadata.get("custom_id"), metadata.get("customId"))
+    return any(
+        isinstance(value, str) and (
+            re.fullmatch(r"hermes-owner-conversation:[^\s:]+", value)
+            or re.fullmatch(r"jarvis-owner-app:[^\s:]+:[^\s:]+", value)
+        )
+        for value in values
+    )
+
+
 def _evidence_provenance(
     item: dict, *, schema_v4_ready: bool = False,
+    trusted_owner_conversation_source: bool = False,
 ) -> Optional[_EvidenceProvenance]:
     """Classify evidence from provider metadata plus validated capture shape."""
     if _is_canonical_result(item, schema_v4_ready=schema_v4_ready):
         return _EvidenceProvenance.CANONICAL_DOCUMENT
     metadata = item.get("metadata") or {}
     text = str(item.get("memory") or "")
-    if metadata.get("type") == "owner_conversation" and _conversation_has_explicit_user_content(text):
+    if not trusted_owner_conversation_source or metadata.get("type") != "owner_conversation":
+        return None
+    # Raw captures retain cryptographically-unavailable but structurally exact
+    # role parsing. Extracted memories have lost those delimiters, so require
+    # every marker written by our Owner capture boundary plus its custom ID.
+    if _conversation_has_explicit_user_content(text):
         return _EvidenceProvenance.USER_CONVERSATION
-    # Backward-compatible structured records are accepted only when authorship
-    # is explicit. This does not infer user authorship from arbitrary text.
-    if (metadata.get("source") == "conversation" and metadata.get("speaker") == "user"
-            and text.strip()):
+    if (
+        text.strip()
+        and metadata.get("authority") == "non-authoritative"
+        and metadata.get("provenance") == "user-authored role-delimited statement"
+        and _owner_capture_custom_id(item)
+    ):
         return _EvidenceProvenance.USER_CONVERSATION
     return None
 
@@ -665,11 +686,13 @@ def _is_canonical_result(item: dict, *, schema_v4_ready: bool = False) -> bool:
     raw_metadata = item.get("metadata")
     metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     legacy_valid = (
-        metadata.get("authority") == "canonical"
+        metadata.get("schema_version") in {None, 3, "3", 4}
+        and not isinstance(metadata.get("schema_version"), bool)
+        and metadata.get("authority") == "canonical"
         and metadata.get("source") == "obsidian"
         and metadata.get("identity_scope", "owner") == "owner"
         and metadata.get("canonical_root", "owner") == "owner"
-        and metadata.get("visibility", "owner_private") in {"owner_private", "family_shared"}
+        and metadata.get("visibility", "owner_private") in {"owner", "owner_private", "family_shared"}
     )
     if not schema_v4_ready:
         return legacy_valid
@@ -1599,23 +1622,27 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
     def _rerank_owner_candidates(
         self, query: str, items: list[dict], *, deadline: Optional[float] = None,
+        trusted_conversation_items: Optional[list[dict]] = None,
     ) -> list[dict]:
         candidates = []
         by_id = {}
         seen_ids: set[str] = set()
         seen_texts: set[str] = set()
+        trusted_conversation_objects = {id(item) for item in (trusted_conversation_items or [])}
         for index, item in enumerate(items):
             text = str(item.get("memory") or "").strip()
             metadata = item.get("metadata") or {}
             provenance = _evidence_provenance(
                 item, schema_v4_ready=self._temporal_filters_schema_v4_ready,
+                trusted_owner_conversation_source=id(item) in trusted_conversation_objects,
             )
             if not text or provenance is None:
                 continue
             candidate_id = str(item.get("id") or f"candidate-{index}")
             candidate_text = (
                 _role_delimited_evidence_text(text)
-                if metadata.get("type") == "owner_conversation" else text
+                if (metadata.get("type") == "owner_conversation"
+                    and _conversation_has_explicit_user_content(text)) else text
             )
             text_identity = " ".join(candidate_text.split()).casefold()
             if candidate_id in seen_ids or text_identity in seen_texts:
@@ -1631,7 +1658,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             candidates.append(candidate)
             by_id[candidate_id] = (
                 {**item, "memory": candidate_text}
-                if metadata.get("type") == "owner_conversation" else item
+                if candidate_text != text else item
             )
             seen_ids.add(candidate_id)
             seen_texts.add(text_identity)
@@ -1820,7 +1847,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
             owner_query, limit=20, container_tag=_OWNER_CONVERSATION_CONTAINER,
             search_mode=self._search_mode,
         )
-        results = self._rerank_owner_candidates(owner_query, results + conversations)
+        results = self._rerank_owner_candidates(
+            owner_query, results + conversations,
+            trusted_conversation_items=conversations,
+        )
         return _scope_owner_person_sections(owner_query, results)[:limit]
 
     def prefetch(
@@ -1883,6 +1913,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 )
                 search_results = self._rerank_owner_candidates(
                     retrieval_query, candidates, deadline=deadline,
+                    trusted_conversation_items=conversation_results,
                 )
                 search_results = _scope_owner_person_sections(retrieval_query, search_results)
             else:
