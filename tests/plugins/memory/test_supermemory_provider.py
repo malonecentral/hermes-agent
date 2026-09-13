@@ -15,6 +15,7 @@ from plugins.memory.supermemory import (
     _EvidenceProvenance,
     _build_temporal_filters,
     _clean_text_for_capture,
+    _contextual_retrieval_query,
     _format_connection_summary,
     _format_prefetch_context,
     _load_supermemory_config,
@@ -382,6 +383,53 @@ def test_temporal_retrieval_defaults_to_unfiltered_until_schema_v4_ready(provide
     assert "temporal_filter_not_ready schema_required=4 action=unfiltered" in caplog.text
     assert provider._client.search_calls
     assert all(call["filters"] is None for call in provider._client.search_calls)
+
+
+def test_elliptical_followup_uses_identified_meal_and_venue_for_retrieval(provider):
+    provider._container_tag = "owner_primary"
+    history = [
+        {"role": "user", "content": "What did I have for dinner yesterday?"},
+        {"role": "assistant", "content": "You had a pork tenderloin sandwich with crinkle-cut fries at Hob Nob Sports Grill in Chandler."},
+    ]
+    provider.prefetch("Did I like it?", retrieval_history=history)
+    queries = [call["query"] for call in provider._client.search_calls]
+    assert queries
+    assert all("pork tenderloin sandwich" in query for query in queries)
+    assert all("Hob Nob Sports Grill" in query for query in queries)
+    assert all(query.endswith("Current question: Did I like it?") for query in queries)
+
+
+def test_non_elliptical_retrieval_query_is_byte_unchanged():
+    query = "What did I have for dinner yesterday?"
+    history = [{"role": "assistant", "content": "Unrelated prior answer"}]
+    assert _contextual_retrieval_query(query, history) == query
+
+
+def test_elliptical_history_is_bounded_and_excludes_private_roles_and_sidecars():
+    history = [
+        {"role": "system", "content": "SYSTEM SECRET"},
+        {"role": "tool", "content": "TOOL SECRET"},
+        {"role": "user", "content": "x" * 2000, "api_content": "SIDECAR SECRET"},
+        {"role": "assistant", "content": "<supermemory-context>MEMORY SECRET</supermemory-context>meal answer"},
+    ]
+    result = _contextual_retrieval_query("Did I like it?", history)
+    assert len(result) <= 1300
+    assert "SYSTEM SECRET" not in result
+    assert "TOOL SECRET" not in result
+    assert "SIDECAR SECRET" not in result
+    assert "MEMORY SECRET" not in result
+    assert "meal answer" in result
+
+
+def test_contextual_retrieval_performs_no_model_call(provider, monkeypatch):
+    monkeypatch.setattr(
+        provider, "_rerank_owner_candidates",
+        lambda *args, **kwargs: pytest.fail("reranker/model called"),
+    )
+    result = _contextual_retrieval_query(
+        "Did I like it?", [{"role": "assistant", "content": "The sandwich was identified."}],
+    )
+    assert "The sandwich was identified." in result
 
 
 def test_temporal_schema_v4_readiness_config_is_explicit_and_defaults_false(tmp_path):

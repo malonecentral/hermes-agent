@@ -1568,6 +1568,7 @@ def build_turn_context(
                 ext_prefetch_cache = agent._memory_manager.prefetch_all(
                     _temporal.query, deadline=_prefetch_deadline,
                     retrieval_context=_temporal.context,
+                    retrieval_history=messages[:current_turn_user_idx],
                 ) or ""
         except Exception:
             pass

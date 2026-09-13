@@ -61,6 +61,8 @@ _OWNER_RERANKER_TEMPLATE_TOKEN_RESERVE = 768
 _DEFAULT_CONTEXT_CHAR_BUDGET = 12000
 _DEFAULT_CONTEXT_BYTE_BUDGET = 24000
 _OWNER_EXACT_DOCUMENT_MAX_BYTES = 65536
+_ELLIPTICAL_HISTORY_MESSAGES = 2
+_ELLIPTICAL_HISTORY_CHAR_BUDGET = 320
 
 
 class _EvidenceProvenance(str, Enum):
@@ -85,6 +87,11 @@ _CONTEXT_STRIP_RE = re.compile(
 _CONTAINERS_STRIP_RE = re.compile(
     r"<supermemory-containers>[\s\S]*?</supermemory-containers>\s*", re.DOTALL
 )
+_ELLIPTICAL_QUERY_RE = re.compile(
+    r"^(?:and\s+|but\s+)?(?:did|do|does|was|were|is|are|can|could|would|should|"
+    r"what|where|when|why|how)\b[^?!.]{0,120}\b(?:it|that|this|they|them|there)\b",
+    re.IGNORECASE,
+)
 _DEFAULT_ENTITY_CONTEXT = (
     "User-assistant conversation. Format: [role: user]...[user:end] and "
     "[role: assistant]...[assistant:end].\n\n"
@@ -94,6 +101,34 @@ _DEFAULT_ENTITY_CONTEXT = (
     "Do not remember temporary intents, one-time tasks, assistant actions, implementation details, or in-progress status.\n\n"
     "When in doubt, store less."
 )
+
+
+def _contextual_retrieval_query(query: str, history: Optional[List[Dict[str, Any]]]) -> str:
+    """Ground an elliptical query in one bounded completed turn, without a model."""
+    text = str(query or "").strip()
+    if not _ELLIPTICAL_QUERY_RE.search(text) or not isinstance(history, list):
+        return text
+    selected: list[tuple[str, str]] = []
+    remaining = _ELLIPTICAL_HISTORY_CHAR_BUDGET
+    for message in reversed(history):
+        if len(selected) >= _ELLIPTICAL_HISTORY_MESSAGES:
+            break
+        role = str(message.get("role") or "") if isinstance(message, dict) else ""
+        content = message.get("content") if isinstance(message, dict) else None
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            continue
+        clean = _CONTEXT_STRIP_RE.sub("", _CONTAINERS_STRIP_RE.sub("", content)).strip()
+        if not clean:
+            continue
+        clean = clean[-remaining:]
+        selected.append((role, clean))
+        remaining -= len(clean)
+        if remaining <= 0:
+            break
+    if not selected:
+        return text
+    prior = "\n".join(f"{role.title()}: {content}" for role, content in reversed(selected))
+    return f"Previous conversation context:\n{prior}\nCurrent question: {text}"
 
 
 def _build_temporal_filters(retrieval_context: Optional[dict]) -> Optional[dict]:
@@ -2003,6 +2038,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
     def prefetch(
         self, query: str, *, session_id: str = "", deadline: Optional[float] = None,
         retrieval_context: Optional[dict] = None,
+        retrieval_history: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         if not self._active or not self._auto_recall or not self._client or not query.strip():
             return ""
@@ -2014,7 +2050,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return ""
         try:
             canonical_owner = self._container_tag == _OWNER_CANONICAL_CONTAINER
-            retrieval_query = query
+            retrieval_query = _contextual_retrieval_query(query, retrieval_history)
             recall_query = _owner_canonical_query(retrieval_query) if canonical_owner else retrieval_query
             values: dict[str, Any] = {}
             include_profile = self._turn_count <= 1 or (self._turn_count % self._profile_frequency == 0)

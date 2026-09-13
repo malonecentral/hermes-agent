@@ -594,6 +594,7 @@ class MemoryManager:
     def prefetch_all(
         self, query: str, *, session_id: str = "", deadline: Optional[float] = None,
         retrieval_context: Optional[Dict[str, Any]] = None,
+        retrieval_history: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """Collect prefetch context from all providers.
 
@@ -608,7 +609,7 @@ class MemoryManager:
             try:
                 result = self._prefetch_provider(
                     provider, clean_query, session_id=session_id, deadline=deadline,
-                    retrieval_context=retrieval_context,
+                    retrieval_context=retrieval_context, retrieval_history=retrieval_history,
                 )
                 if result and result.strip():
                     parts.append(result)
@@ -622,6 +623,7 @@ class MemoryManager:
     def _prefetch_provider(
         self, provider: MemoryProvider, query: str, *, session_id: str = "",
         deadline: Optional[float] = None, retrieval_context: Optional[Dict[str, Any]] = None,
+        retrieval_history: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         if provider.name == "builtin":
             return provider.prefetch(query, session_id=session_id)
@@ -650,6 +652,11 @@ class MemoryManager:
                     or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values())
                 ):
                     kwargs["retrieval_context"] = retrieval_context or {}
+                if signature is not None and (
+                    "retrieval_history" in signature.parameters
+                    or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values())
+                ):
+                    kwargs["retrieval_history"] = retrieval_history or []
                 result_box["value"] = provider.prefetch(query, **kwargs) or ""
             except Exception as exc:  # pragma: no cover - re-raised by caller
                 error_box["value"] = exc
