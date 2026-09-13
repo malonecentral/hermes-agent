@@ -61,8 +61,17 @@ _OWNER_RERANKER_TEMPLATE_TOKEN_RESERVE = 768
 _DEFAULT_CONTEXT_CHAR_BUDGET = 12000
 _DEFAULT_CONTEXT_BYTE_BUDGET = 24000
 _OWNER_EXACT_DOCUMENT_MAX_BYTES = 65536
+_OWNER_EXACT_DATE_DOCUMENT_LIMIT = 4
 _ELLIPTICAL_HISTORY_MESSAGES = 2
 _ELLIPTICAL_HISTORY_CHAR_BUDGET = 320
+_DIRECT_PERSONAL_RECALL_RE = re.compile(
+    r"(?:\b(?:what|where|when|who|which|did|was|were)\b[?!.\s\w'-]{0,100}"
+    r"\b(?:i|my|me)\b[?!.\s\w'-]{0,60}"
+    r"\b(?:eat|ate|have|had|go|went|do|did|wear|wore|watch|watched|meet|met)\b|"
+    r"\b(?:i|my|me)\b[?!.\s\w'-]{0,100}"
+    r"\b(?:ate|had|went|did|wore|watched|met)\b)",
+    re.IGNORECASE,
+)
 
 
 class _EvidenceProvenance(str, Enum):
@@ -129,6 +138,26 @@ def _contextual_retrieval_query(query: str, history: Optional[List[Dict[str, Any
         return text
     prior = "\n".join(f"{role.title()}: {content}" for role, content in reversed(selected))
     return f"Previous conversation context:\n{prior}\nCurrent question: {text}"
+
+
+def _empty_direct_recall_guidance(query: str, retrieval_context: Optional[dict]) -> str:
+    """Return bounded fallback policy after an exhaustive direct-memory miss."""
+    if not _DIRECT_PERSONAL_RECALL_RE.search(str(query or "")):
+        return ""
+    temporal = retrieval_context if isinstance(retrieval_context, dict) else {}
+    if not temporal and not re.search(
+        r"\b(?:today|yesterday|last\s+(?:night|week|month|year)|ago|on\s+\w+)\b",
+        query,
+        re.IGNORECASE,
+    ):
+        return ""
+    return (
+        "Direct personal-memory lookup completed successfully but found no matching evidence. "
+        "Do not repeat the memory search, reload skills, or re-resolve the date. For this simple "
+        "recall question, answer that no record was found. You may use at most one targeted "
+        "fallback lookup only when a specific, directly relevant personal source is already known; "
+        "do not browse broadly or chain exploratory tools. If that lookup has no evidence, stop."
+    )
 
 
 def _build_temporal_filters(retrieval_context: Optional[dict]) -> Optional[dict]:
@@ -1911,6 +1940,93 @@ class SupermemoryMemoryProvider(MemoryProvider):
         }
         return [hydrated if item is candidate else item for item in items]
 
+    def _hydrate_exact_date_restaurants(
+        self, retrieval_context: Optional[dict], *, deadline: float,
+    ) -> list[dict]:
+        """Read verified restaurant parents when the search index misses a date.
+
+        This is deliberately not a temporal search-filter fallback.  It uses a
+        host-resolved single date to locate bounded canonical source files,
+        then admits only the corresponding provider parent after byte, ACL,
+        path, container, and stable-ID verification.
+        """
+        if (self._client is None or not isinstance(retrieval_context, dict)
+                or not _valid_trusted_temporal_scope(retrieval_context)):
+            return []
+        dates = tuple(retrieval_context.get("event_date", ()))
+        if len(dates) != 1 or (retrieval_context or {}).get("event_date_ranges"):
+            return []
+        try:
+            receipt = json.loads(
+                (Path(self._hermes_home) / "obsidian-supermemory-import.json").read_text()
+            )
+            root = Path(str(receipt["root"])).expanduser().resolve(strict=True)
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return []
+        restaurant_root = (root / "Jarvis/Family Shared/Food/Restaurants").resolve()
+        if restaurant_root.parent.parent.parent.parent != root:
+            return []
+        needle = dates[0].encode("ascii")
+        matches: list[tuple[Path, bytes]] = []
+        try:
+            for path in sorted(restaurant_root.glob("*.md")):
+                raw = path.read_bytes()
+                if needle in raw:
+                    matches.append((path, raw))
+                    if len(matches) > _OWNER_EXACT_DATE_DOCUMENT_LIMIT:
+                        return []
+        except OSError:
+            return []
+
+        hydrated: list[dict] = []
+        for path, raw in matches:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or len(raw) > _OWNER_EXACT_DOCUMENT_MAX_BYTES:
+                return []
+            relative_path = path.relative_to(root).as_posix()
+            custom_id = "obsidian-" + hashlib.sha256(relative_path.encode("utf-8")).hexdigest()
+            try:
+                document = self._client.get_document(custom_id, timeout=remaining)
+            except Exception:
+                logger.warning("supermemory_prefetch stage=exact_date_hydrate outcome=error")
+                return []
+            metadata = document.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            content = str(document.get("content") or "")
+            prefix = re.match(r"\A\[canonical-identity\]\n[\s\S]*?\n\[/canonical-identity\]\n\n", content)
+            source = content[prefix.end():] if prefix else ""
+            source_bytes = source.encode("utf-8")
+            if raw.endswith(b"\n") and source_bytes == raw[:-1]:
+                content += "\n"
+                source_bytes += b"\n"
+            trusted = {"metadata": metadata}
+            valid = (
+                document.get("custom_id") == custom_id
+                and custom_id in {document.get("id"), document.get("custom_id")}
+                and _OWNER_CANONICAL_CONTAINER in document.get("container_tags", [])
+                and document.get("task_type") == "superrag"
+                and document.get("status") == "done"
+                and metadata.get("relative_path") == relative_path
+                and _is_canonical_result(trusted, schema_v4_ready=True)
+                and metadata.get("content_bytes") == len(raw)
+                and metadata.get("content_sha256") == hashlib.sha256(raw).hexdigest()
+                and source_bytes == raw
+                and time.monotonic() <= deadline
+            )
+            if not valid:
+                logger.warning("supermemory_prefetch stage=exact_date_hydrate outcome=rejected")
+                return []
+            hydrated.append({
+                "id": custom_id, "memory": content, "metadata": metadata,
+                "updated_at": document.get("updated_at"),
+            })
+        if hydrated:
+            logger.info(
+                "supermemory_prefetch stage=exact_date_hydrate outcome=selected candidates=%d",
+                len(hydrated),
+            )
+        return hydrated
+
     def _parallel_owner_retrieval(
         self, query: str, retrieval_query: str, recall_query: str, deadline: float,
         retrieval_context: Optional[dict] = None,
@@ -2053,6 +2169,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             retrieval_query = _contextual_retrieval_query(query, retrieval_history)
             recall_query = _owner_canonical_query(retrieval_query) if canonical_owner else retrieval_query
             values: dict[str, Any] = {}
+            outcomes: dict[str, str] = {}
             include_profile = self._turn_count <= 1 or (self._turn_count % self._profile_frequency == 0)
             configured_deadline = time.monotonic() + self._prefetch_timeout
             if deadline is not None:
@@ -2096,11 +2213,28 @@ class SupermemoryMemoryProvider(MemoryProvider):
                     retrieval_query, search_results + conversation_results,
                     retrieval_context=temporal_scope,
                 )
+                if (not candidates and retrieval_context and not temporal_scope
+                        and re.search(r"\b(?:dinner|lunch|breakfast|brunch|ate|eat|meal)\b",
+                                      retrieval_query, re.IGNORECASE)):
+                    candidates = self._hydrate_exact_date_restaurants(
+                        retrieval_context, deadline=deadline,
+                    )
                 search_results = self._rerank_owner_candidates(
                     retrieval_query, candidates, deadline=deadline,
                     trusted_conversation_items=conversation_results,
                 )
                 search_results = _scope_owner_person_sections(retrieval_query, search_results)
+                if (
+                    not search_results
+                    and outcomes.get("canonical") == "ok"
+                    and outcomes.get("conversation") == "ok"
+                ):
+                    guidance = _empty_direct_recall_guidance(query, retrieval_context)
+                    if guidance:
+                        logger.info(
+                            "supermemory_prefetch outcome=empty_direct_recall action=bounded_fallback"
+                        )
+                        return guidance
             else:
                 search_results, named_restaurant = _scope_owner_restaurant_results(query, search_results)
             context = _format_prefetch_context(

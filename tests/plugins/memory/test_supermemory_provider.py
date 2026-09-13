@@ -16,6 +16,7 @@ from plugins.memory.supermemory import (
     _build_temporal_filters,
     _clean_text_for_capture,
     _contextual_retrieval_query,
+    _empty_direct_recall_guidance,
     _format_connection_summary,
     _format_prefetch_context,
     _load_supermemory_config,
@@ -403,6 +404,30 @@ def test_non_elliptical_retrieval_query_is_byte_unchanged():
     query = "What did I have for dinner yesterday?"
     history = [{"role": "assistant", "content": "Unrelated prior answer"}]
     assert _contextual_retrieval_query(query, history) == query
+
+
+def test_empty_completed_owner_recall_injects_bounded_fallback_policy(provider):
+    provider._container_tag = "owner_primary"
+    result = provider.prefetch(
+        "What did I have for dinner yesterday?",
+        retrieval_context={"event_date": ("2026-09-12",)},
+    )
+    assert "found no matching evidence" in result
+    assert "at most one targeted fallback lookup" in result
+    assert "do not browse broadly" in result
+
+
+def test_empty_recall_policy_is_narrow_to_personal_temporal_queries():
+    assert _empty_direct_recall_guidance(
+        "What did I have for dinner yesterday?", {"event_date": ("2026-09-12",)}
+    )
+    assert not _empty_direct_recall_guidance(
+        "Research dinner restaurants in Phoenix", {"event_date": ("2026-09-12",)}
+    )
+    assert not _empty_direct_recall_guidance(
+        "What should I cook with yesterday's leftovers?", {"event_date": ("2026-09-12",)}
+    )
+    assert not _empty_direct_recall_guidance("What food do I like?", {})
 
 
 def test_elliptical_history_is_bounded_and_excludes_private_roles_and_sidecars():
@@ -1008,6 +1033,75 @@ def test_exact_venue_hydration_obeys_expired_deadline_without_call(provider):
     path = "Jarvis/Family Shared/Food/Restaurants/Perfect Pear Bistro.md"
     chunk, _ = _v4_restaurant(path, "restaurant: Perfect Pear Bistro\n### Dennis\n- Preference.")
     assert provider._hydrate_exact_restaurant([chunk], deadline=time.monotonic() - .001) == [chunk]
+    assert provider._client.get_document_calls == []
+
+
+def _install_exact_date_restaurant(tmp_path, provider, source):
+    root = tmp_path / "vault"
+    relative = "Jarvis/Family Shared/Food/Restaurants/Hob Nob Sports Grill.md"
+    path = root / relative
+    path.parent.mkdir(parents=True)
+    path.write_text(source)
+    provider._hermes_home = str(tmp_path)
+    (tmp_path / "obsidian-supermemory-import.json").write_text(json.dumps({"root": str(root)}))
+    custom_id = "obsidian-" + hashlib.sha256(relative.encode()).hexdigest()
+    _, document = _v4_restaurant(relative, source, document_id=custom_id)
+    provider._client.documents_by_id[custom_id] = document
+    return custom_id
+
+
+def test_gate_off_exact_date_food_miss_hydrates_verified_canonical_parent(
+        provider, tmp_path, monkeypatch):
+    provider._container_tag = "owner_primary"
+    provider._temporal_filters_schema_v4_ready = False
+    source = (
+        "restaurant: Hob Nob Sports Grill\n## Visits\n### 2026-09-12\n"
+        "- Dennis liked and ordered the pork tenderloin sandwich with crinkle-cut fries."
+    )
+    custom_id = _install_exact_date_restaurant(tmp_path, provider, source)
+    provider._client.search_documents = lambda *args, **kwargs: []
+    provider._client.search_memories = lambda *args, **kwargs: []
+    monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker",
+                        lambda *args, **kwargs: pytest.fail("single candidate must bypass reranker"))
+
+    result = provider.prefetch(
+        "What did I have for dinner yesterday?",
+        retrieval_context={"event_date": ("2026-09-12",)},
+    )
+
+    assert "pork tenderloin sandwich with crinkle-cut fries" in result
+    assert provider._client.get_document_calls[0]["id"] == custom_id
+    assert all(call["filters"] is None for call in provider._client.search_calls)
+
+
+def test_exact_date_hydration_fails_closed_for_unverified_parent(provider, tmp_path):
+    source = "restaurant: Hob Nob Sports Grill\n### 2026-09-12\n- Trusted local text."
+    custom_id = _install_exact_date_restaurant(tmp_path, provider, source)
+    provider._client.documents_by_id[custom_id]["metadata"] = {
+        **provider._client.documents_by_id[custom_id]["metadata"],
+        "relative_path": "Jarvis/Owner Private/Secrets.md",
+    }
+
+    assert provider._hydrate_exact_date_restaurants(
+        {"event_date": ("2026-09-12",)}, deadline=time.monotonic() + 1,
+    ) == []
+
+
+def test_exact_date_hydration_does_not_expand_ranges_or_non_food_prefetch(provider, tmp_path):
+    provider._container_tag = "owner_primary"
+    provider._temporal_filters_schema_v4_ready = False
+    source = "restaurant: Hob Nob Sports Grill\n### 2026-09-12\n- Dinner."
+    _install_exact_date_restaurant(tmp_path, provider, source)
+    provider._client.search_documents = lambda *args, **kwargs: []
+    provider._client.search_memories = lambda *args, **kwargs: []
+
+    assert provider._hydrate_exact_date_restaurants(
+        {"event_date_ranges": (("2026-09-01", "2026-09-12"),)},
+        deadline=time.monotonic() + 1,
+    ) == []
+    assert provider.prefetch(
+        "What happened yesterday?", retrieval_context={"event_date": ("2026-09-12",)},
+    ) == ""
     assert provider._client.get_document_calls == []
 
 
