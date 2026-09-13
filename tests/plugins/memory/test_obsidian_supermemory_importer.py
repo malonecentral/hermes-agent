@@ -78,7 +78,7 @@ def _recovery_client(*, get_status=None, add_error=None, listed=None, list_error
     calls = []
     class Documents:
         def list(self, **kwargs):
-            calls.append(("list", kwargs["filters"]))
+            calls.append(("list", kwargs.get("filters")))
             if list_error: raise list_error
             return {"memories": listed or [], "pagination": {"current_page": 1, "total_pages": 1}}
         def get(self, ident, timeout):
@@ -286,3 +286,122 @@ def test_verify_only_reports_path_only_for_backend_mismatch(importer, change):
     assert result["failure_count"] == 1
     assert result["failed_paths"] == ["private/secret-name.md"]
     assert set(result) == {"backend_verified_count", "failure_count", "failed_paths", "verification_complete"}
+
+
+def _legacy_remote(importer, doc, ident="legacy-id"):
+    legacy = importer.metadata(doc)
+    for key in ("index_schema_version", "visibility", "identity_scope", "canonical_root"):
+        legacy.pop(key, None)
+    return {"id": ident, "custom_id": doc["custom_id"], "status": "done",
+            "content": doc["content"], "metadata": legacy}
+
+
+def _previous_row(importer, doc, **overrides):
+    row = importer.record(doc, _Result("legacy-id", "done"), "legacy-id")
+    row.update({"final_status": "done", "replacement_stage": "done"})
+    row.update(overrides)
+    return row
+
+
+def test_schema_v4_backfill_plans_all_verified_legacy_records(importer):
+    private = [importer.item(f"People/Private-{index}.md", f"private-{index}".encode())
+               for index in range(133)]
+    shared = [importer.item(f"Jarvis/Family Shared/Shared-{index}.md", f"shared-{index}".encode())
+              for index in range(104)]
+    docs = {doc["relative_path"]: doc for doc in private + shared}
+    previous = {rel: _previous_row(importer, doc) for rel, doc in docs.items()}
+    remotes = {rel: _legacy_remote(importer, doc, f"legacy-{index}")
+               for index, (rel, doc) in enumerate(docs.items())}
+
+    class Documents:
+        def list(self, **kwargs):
+            assert kwargs["container_tags"] == ["owner_primary"]
+            assert kwargs["include_content"] is True
+            page = kwargs["page"]
+            values = list(remotes.values())
+            return {"memories": values[(page - 1) * 100:page * 100],
+                    "pagination": {"current_page": page, "total_pages": 3}}
+
+    plan = importer.build_schema_v4_backfill_plan(
+        type("Client", (), {"documents": Documents()})(), docs, previous,
+        expected_eligible=237, expected_owner_private=133, expected_family_shared=104)
+    assert set(plan["replacements"]) == set(docs)
+    assert plan["already_v4"] == 0
+    assert len(plan["replacements"]) == 237
+    assert all(row["replacement_stage"] == "verified_legacy" for row in plan["replacements"].values())
+
+
+def test_schema_v4_backfill_resume_accepts_only_matching_atomic_checkpoint(importer):
+    doc = importer.item("x.md", b"content")
+    current = {"x.md": doc}
+    checkpoint = _previous_row(importer, doc, document_id="", replacement_stage="deleted",
+                               replaced_document_id="legacy-id")
+    client, calls = _recovery_client(listed=[])
+    plan = importer.build_schema_v4_backfill_plan(
+        client, current, {"x.md": checkpoint},
+        expected_eligible=1, expected_owner_private=1, expected_family_shared=0)
+    assert calls == []
+    assert plan["replacements"]["x.md"]["replacement_stage"] == "deleted"
+
+
+@pytest.mark.parametrize("counts", [(2, 1, 0), (1, 0, 1), (1, 1, 1)])
+def test_schema_v4_backfill_fails_closed_on_count_drift(importer, counts):
+    doc = importer.item("x.md", b"content")
+    with pytest.raises(importer.ReconciliationRequired, match="count"):
+        importer.build_schema_v4_backfill_plan(
+            object(), {"x.md": doc}, {"x.md": _previous_row(importer, doc)},
+            expected_eligible=counts[0], expected_owner_private=counts[1],
+            expected_family_shared=counts[2])
+
+
+def test_schema_v4_backfill_rejects_unexpected_removed_paths(importer):
+    doc = importer.item("x.md", b"content")
+    removed = dict(_previous_row(importer, doc), relative_path="removed.md")
+    with pytest.raises(importer.ReconciliationRequired, match="path set"):
+        importer.build_schema_v4_backfill_plan(
+            object(), {"x.md": doc}, {"x.md": _previous_row(importer, doc), "removed.md": removed},
+            expected_eligible=1, expected_owner_private=1, expected_family_shared=0)
+
+
+@pytest.mark.parametrize("change, message", [
+    ({"content": "wrong"}, "content"),
+    ({"status": "processing"}, "terminal"),
+    ({"metadata": {"source": "other"}}, "identity"),
+])
+def test_schema_v4_backfill_rejects_unverified_legacy_record(importer, change, message):
+    doc = importer.item("x.md", b"content")
+    remote = _legacy_remote(importer, doc) | change
+    client, _ = _recovery_client(listed=[remote])
+    with pytest.raises(importer.ReconciliationRequired, match=message):
+        importer.build_schema_v4_backfill_plan(
+            client, {"x.md": doc}, {"x.md": _previous_row(importer, doc)},
+            expected_eligible=1, expected_owner_private=1, expected_family_shared=0)
+
+
+def test_schema_v4_backfill_container_isolation_never_touches_conversations(importer):
+    assert importer.CONTAINER == "owner_primary"
+    assert importer.CONVERSATION_CONTAINER == "owner_conversations"
+    assert importer.CONTAINER != importer.CONVERSATION_CONTAINER
+
+
+def test_schema_v4_backfill_cli_requires_all_explicit_counts(importer, monkeypatch):
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--backfill-schema-v4"])
+    with pytest.raises(SystemExit):
+        importer.parse_args()
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--backfill-schema-v4",
+                                      "--expected-eligible", "237",
+                                      "--expected-owner-private", "133",
+                                      "--expected-family-shared", "104"])
+    args = importer.parse_args()
+    assert (args.expected_eligible, args.expected_owner_private,
+            args.expected_family_shared) == (237, 133, 104)
+
+
+def test_schema_v4_backfill_cli_is_mutually_exclusive_with_read_only_modes(importer, monkeypatch):
+    for read_only in ("--dry-run", "--verify-only"):
+        monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--backfill-schema-v4", read_only,
+                                          "--expected-eligible", "237",
+                                          "--expected-owner-private", "133",
+                                          "--expected-family-shared", "104"])
+        with pytest.raises(SystemExit):
+            importer.parse_args()
