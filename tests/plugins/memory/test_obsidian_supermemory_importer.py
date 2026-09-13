@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -186,3 +187,102 @@ def test_backend_metadata_mismatch_requires_operator_reconciliation(importer):
     with pytest.raises(importer.ReconciliationRequired, match="metadata"):
         importer.recover_submission(client, doc, {"replacement_stage": "reconcile_required"}, lambda value: None)
     assert [call[0] for call in calls] == ["list"]
+
+
+def _remote(importer, doc, **overrides):
+    value = {"id": "backend-id", "custom_id": doc["custom_id"], "status": "done",
+             "metadata": importer.metadata(doc)}
+    value.update(overrides)
+    return value
+
+
+def test_verify_only_is_read_only_and_does_not_consult_manifest_or_lock(importer, monkeypatch, capsys, tmp_path):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(b"do not touch\n")
+    before = manifest.stat()
+    lock = tmp_path / "sync.lock"
+    monkeypatch.setattr(importer, "OUT", manifest)
+    monkeypatch.setattr(importer, "LOCK", lock)
+    private = importer.item("People/Ada.md", b"private")
+    shared = importer.item("Jarvis/Family Shared/Food.md", b"shared")
+    calls = []
+
+    class Documents:
+        def list(self, **kwargs):
+            calls.append(("list", kwargs["page"]))
+            doc = private if "People/Ada.md" in str(kwargs["filters"]) else shared
+            return {"memories": [_remote(importer, doc)],
+                    "pagination": {"current_page": 1, "total_pages": 1}}
+        def add(self, **kwargs): raise AssertionError("verify-only called add")
+        def delete(self, *args, **kwargs): raise AssertionError("verify-only called delete")
+        def update(self, *args, **kwargs): raise AssertionError("verify-only called update")
+
+    monkeypatch.setattr(importer, "canonical_documents", lambda: [private, shared])
+    monkeypatch.setattr(importer, "load_previous", lambda: (_ for _ in ()).throw(AssertionError("manifest read")))
+    monkeypatch.setattr(importer, "atomic_receipt", lambda payload: (_ for _ in ()).throw(AssertionError("manifest write")))
+    monkeypatch.setattr(importer, "Supermemory", lambda **kwargs: type("Client", (), {"documents": Documents()})())
+    monkeypatch.setattr(importer, "api_key", lambda: "key")
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--verify-only"])
+
+    importer.main()
+
+    result = json.loads(capsys.readouterr().out)
+    assert result == {"schema_version": 4, "scanned": 2, "eligible": 2,
+                      "owner_private_count": 1, "family_shared_count": 1,
+                      "backend_verified_count": 2, "failure_count": 0,
+                      "failed_paths": [], "verification_complete": True,
+                      "verify_only": True, "filesystem_mutated": False,
+                      "backend_mutated": False}
+    assert calls == [("list", 1), ("list", 1)]
+    after = manifest.stat()
+    assert manifest.read_bytes() == b"do not touch\n"
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (before.st_ino, before.st_size, before.st_mtime_ns)
+    assert not lock.exists()
+
+
+def test_verify_only_exits_nonzero_when_any_document_is_incomplete(importer, monkeypatch, capsys):
+    doc = importer.item("x.md", b"content")
+    client, calls = _recovery_client(listed=[])
+    monkeypatch.setattr(importer, "canonical_documents", lambda: [doc])
+    monkeypatch.setattr(importer, "Supermemory", lambda **kwargs: client)
+    monkeypatch.setattr(importer, "api_key", lambda: "key")
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--verify-only"])
+    with pytest.raises(SystemExit) as exc:
+        importer.main()
+    assert exc.value.code == 1
+    assert [call[0] for call in calls] == ["list"]
+    result = json.loads(capsys.readouterr().out)
+    assert result["failed_paths"] == ["x.md"]
+    assert result["verification_complete"] is False
+
+
+def test_verify_only_exhausts_pagination_and_rejects_duplicates(importer):
+    doc = importer.item("x.md", b"content")
+    pages = {
+        1: {"memories": [_remote(importer, doc)], "pagination": {"current_page": 1, "total_pages": 2}},
+        2: {"memories": [_remote(importer, doc, id="duplicate")], "pagination": {"current_page": 2, "total_pages": 2}},
+    }
+    calls = []
+    client = type("Client", (), {"documents": type("Documents", (), {
+        "list": lambda self, **kwargs: calls.append(kwargs["page"]) or pages[kwargs["page"]]
+    })()})()
+    result = importer.verify_backend(client, {doc["relative_path"]: doc})
+    assert calls == [1, 2]
+    assert result["backend_verified_count"] == 0
+    assert result["failed_paths"] == ["x.md"]
+
+
+@pytest.mark.parametrize("change", [
+    {"custom_id": "wrong"},
+    {"status": "processing"},
+    {"metadata": {}},
+])
+def test_verify_only_reports_path_only_for_backend_mismatch(importer, change):
+    doc = importer.item("private/secret-name.md", b"content")
+    remote = _remote(importer, doc, **change)
+    client, _ = _recovery_client(listed=[remote])
+    result = importer.verify_backend(client, {doc["relative_path"]: doc})
+    assert result["verification_complete"] is False
+    assert result["failure_count"] == 1
+    assert result["failed_paths"] == ["private/secret-name.md"]
+    assert set(result) == {"backend_verified_count", "failure_count", "failed_paths", "verification_complete"}
