@@ -1,4 +1,5 @@
 """Regression tests for conversation loop fallback state management."""
+import copy
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -34,6 +35,165 @@ def _response(*, content, finish_reason, tool_calls=None):
     message = SimpleNamespace(content=content, tool_calls=tool_calls)
     choice = SimpleNamespace(message=message, finish_reason=finish_reason)
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+
+_REFINEMENT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "supermemory_search",
+        "description": "Search only the staged memory provider.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+}
+
+
+def _make_host_gate_agent(prefetch, responses):
+    ordinary_tools = _tool_defs("web_search", "terminal")
+    with (
+        patch("run_agent.get_tool_definitions", return_value=ordinary_tools),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1/",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    agent.valid_tool_names = {"web_search", "terminal"}
+    agent._memory_manager = MagicMock()
+    agent._memory_manager._external_prefetch_timeout = 1.0
+    agent._memory_manager.prefetch_all.return_value = prefetch
+    agent._memory_manager.describe_recall.return_value = ""
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = responses
+    return agent, ordinary_tools
+
+
+def _run_host_gate(agent):
+    gate = {
+        "sentinel": '{"insufficient_evidence":true}',
+        "refinement_schema": _REFINEMENT_SCHEMA,
+    }
+    persisted_snapshots = []
+
+    def capture_persist(messages, *_args, **_kwargs):
+        persisted_snapshots.append(copy.deepcopy(messages))
+
+    with (
+        patch("run_agent.handle_function_call", return_value="scoped result"),
+        patch.object(agent, "_persist_session", side_effect=capture_persist),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "Which fact applies?", host_staged_memory_gate=gate
+        )
+    return result, persisted_snapshots
+
+
+def _sent_tools(agent):
+    return [
+        call.kwargs.get("tools", [])
+        for call in agent.client.chat.completions.create.call_args_list
+    ]
+
+
+def test_host_staged_gate_refines_then_synthesizes_without_tools():
+    sentinel = '  {"insufficient_evidence":true}\n'
+    agent, _ = _make_host_gate_agent(
+        "canonical prefetched evidence",
+        [
+            _response(content=sentinel, finish_reason="stop"),
+            _response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[_tool_call("supermemory_search", "refine1")],
+            ),
+            _response(content="Grounded answer.", finish_reason="stop"),
+        ],
+    )
+
+    result, persisted = _run_host_gate(agent)
+
+    assert result["final_response"] == "Grounded answer."
+    assert result["api_calls"] == 3
+    assert _sent_tools(agent) == [[], [_REFINEMENT_SCHEMA], []]
+    assert "insufficient_evidence" not in repr(result["messages"])
+    assert "insufficient_evidence" not in repr(persisted)
+
+
+def test_host_staged_gate_second_sentinel_opens_ordinary_fallback():
+    sentinel = '{"insufficient_evidence":true}'
+    agent, ordinary_tools = _make_host_gate_agent(
+        "canonical prefetched evidence",
+        [
+            _response(content=sentinel, finish_reason="stop"),
+            _response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[_tool_call("supermemory_search", "refine1")],
+            ),
+            _response(content=sentinel, finish_reason="stop"),
+            _response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[_tool_call("web_search", "fallback1")],
+            ),
+            _response(content="Fallback answer.", finish_reason="stop"),
+        ],
+    )
+
+    result, persisted = _run_host_gate(agent)
+
+    assert result["final_response"] == "Fallback answer."
+    assert result["api_calls"] == 5
+    assert _sent_tools(agent) == [
+        [],
+        [_REFINEMENT_SCHEMA],
+        [],
+        ordinary_tools,
+        ordinary_tools,
+    ]
+    assert "insufficient_evidence" not in repr(result["messages"])
+    assert "insufficient_evidence" not in repr(persisted)
+
+
+def test_host_staged_gate_near_miss_sentinel_does_not_unlock():
+    near_miss = '{"insufficient_evidence": true}'
+    agent, _ = _make_host_gate_agent(
+        "canonical prefetched evidence",
+        [_response(content=near_miss, finish_reason="stop")],
+    )
+
+    result, persisted = _run_host_gate(agent)
+
+    assert result["final_response"] == near_miss
+    assert result["api_calls"] == 1
+    assert _sent_tools(agent) == [[]]
+
+
+def test_host_staged_gate_without_prefetch_exposes_ordinary_tools_immediately():
+    agent, ordinary_tools = _make_host_gate_agent(
+        "",
+        [_response(content="Direct answer.", finish_reason="stop")],
+    )
+
+    result, persisted = _run_host_gate(agent)
+
+    assert result["final_response"] == "Direct answer."
+    assert result["api_calls"] == 1
+    assert _sent_tools(agent) == [ordinary_tools]
 
 
 def test_substantive_tool_only_turn_invalidates_older_housekeeping_fallback():

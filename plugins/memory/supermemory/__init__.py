@@ -83,12 +83,6 @@ class _EvidenceProvenance(str, Enum):
     USER_CONVERSATION = "user_conversation"
 
 
-class _SufficientCanonicalResults(list):
-    """Selected records carrying a request-local sufficiency receipt."""
-
-    canonical_evidence_sufficient = True
-
-
 _ROLE_BLOCK_RE = re.compile(
     r"\[role: (user|assistant)\]\n([\s\S]*?)\n\[\1:end\]",
 )
@@ -1101,8 +1095,6 @@ def _scope_owner_person_sections(query: str, items: list[dict]) -> list[dict]:
         copy = dict(item)
         copy["memory"] = (memory[:headings[0].start()] + memory[selected.start():end]).strip()
         scoped.append(copy)
-    if getattr(items, "canonical_evidence_sufficient", False):
-        return _SufficientCanonicalResults(scoped)
     return scoped
 
 
@@ -1166,9 +1158,6 @@ def _format_prefetch_context(
         return ""
 
     intro = "The following is background context from long-term memory. Use it silently when relevant. "
-    sufficient_canonical = bool(
-        getattr(search_results, "canonical_evidence_sufficient", False)
-    )
     if owner_context:
         intro += (
             "The authenticated Owner/requester is Dennis. Never infer that Dennis is another person merely because "
@@ -1190,11 +1179,6 @@ def _format_prefetch_context(
             "person attribution and relationship direction, and never infer that a described person is the requester. "
             "Canonical Family Shared evidence is authoritative. Prefer a terse direct answer, state when evidence is "
             "missing or ambiguous, and never emit Obsidian wikilinks. "
-        )
-    if sufficient_canonical:
-        intro += (
-            "The canonical evidence below has been validated as relevant and sufficient for the current read-only factual question. "
-            "Answer it directly in this response without calling any tool to search, read, or revalidate notes or memory. "
         )
     intro += "Do not force memories into the conversation."
     body = "\n\n".join(sections)
@@ -1902,8 +1886,6 @@ class SupermemoryMemoryProvider(MemoryProvider):
         if len(candidates) <= 1:
             outcome = "selected" if candidates else "insufficient"
             selected_items = [by_id[candidates[0]["id"]]] if candidates else []
-            if selected_items and candidates[0]["provenance"] is _EvidenceProvenance.CANONICAL_DOCUMENT:
-                selected_items = _SufficientCanonicalResults(selected_items)
             logger.warning(
                 "supermemory_prefetch stage=reranker outcome=%s candidates=%d selected=%d "
                 "score_min=na score_max=na elapsed_ms=0 bypass=single",
@@ -1949,15 +1931,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         selected_items = _suppress_direct_conversation_conflicts(
             [by_id[candidate_id] for candidate_id in selected]
         )
-        # Transient request state: only the reranker's explicit sufficiency
-        # decision over validated canonical evidence may close note fallback.
-        has_sufficient_canonical = any(
-            candidate["provenance"] is _EvidenceProvenance.CANONICAL_DOCUMENT
-            for candidate in candidates if candidate["id"] in selected
-        )
         selected_items = selected_items[:self._max_recall_results]
-        if has_sufficient_canonical:
-            selected_items = _SufficientCanonicalResults(selected_items)
         logger.warning(
             "supermemory_prefetch stage=reranker outcome=selected candidates=%d selected=%d score_min=%s score_max=%s elapsed_ms=%d",
             len(candidates), len(selected_items),
