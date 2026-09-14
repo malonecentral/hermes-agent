@@ -568,3 +568,25 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
+
+
+@pytest.mark.parametrize('query', ['Tell me about Aaron', 'Tell me about Aaron?', 'Tell me about Aaron.', 'Tell me about Aaron!'])
+def test_family_clean_retrieval_override_staging_preserves_requester_and_cached_history(query):
+    import copy
+    agent, mm = _agent_with_memory_manager()
+    agent._memory_prefetch_query = query
+    history = [{'role': 'user', 'content': 'Earlier question', 'api_content': 'Earlier exact API content'},
+               {'role': 'assistant', 'content': 'Earlier answer'}]
+    before = copy.deepcopy(history)
+    wrapped = 'Authenticated requester: Pat. Device: device-secret.\nCurrent question: ' + query
+    ctx = _build(agent, user_message=wrapped, conversation_history=history)
+    assert mm.prefetch_all.call_args.args == (query,)
+    assert ctx.messages[:2] == before
+    assert ctx.active_system_prompt == 'SYSTEM'
+    assert ctx.messages[-1]['content'] == wrapped
+    assert 'REMEMBERED CONTEXT' in ctx.messages[-1]['api_content']
+    assert 'Authenticated requester: Pat' in ctx.messages[-1]['api_content']
+    assert agent._memory_prefetch_query == ''
+    mm.prefetch_all.reset_mock()
+    _build(agent, user_message='What happens next?')
+    assert mm.prefetch_all.call_args.args == ('What happens next?',)

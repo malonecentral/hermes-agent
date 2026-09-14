@@ -33,7 +33,7 @@ from plugins.memory.supermemory import (
 
 class FakeClient:
     def __init__(self, api_key: str, timeout: float, container_tag: str, search_mode: str = "hybrid",
-                 base_url: str = ""):
+                 base_url: str = "", canonical_document_search_mode: str = "documents"):
         self.api_key = api_key
         self.profile_queries = []
         self.timeout = timeout
@@ -512,17 +512,31 @@ def test_client_rejects_result_parent_metadata_or_timestamp_disagreement(field):
 
 
 def test_v4_import_gate_requires_search_metadata_convergence_receipt(tmp_path):
-    row = {"index_schema_version": 4, "final_status": "done"}
+    row = {"index_schema_version": 4, "final_status": "done",
+           "visibility": "owner_private", "container": "owner_primary"}
     base = {"schema_version": 4, "reconciliation_complete": True,
             "documents": [row], "expected_count": 1, "backend_reconciled_count": 1,
             "submission_failure_count": 0, "still_pending_count": 0}
     path = tmp_path / "obsidian-supermemory-import.json"
     path.write_text(json.dumps(base), encoding="utf-8")
     assert _verified_v4_import_ready(str(tmp_path)) is False
-    path.write_text(json.dumps(base | {"search_readiness_complete": True,
+    ready = base | {"search_readiness_complete": True,
                                        "search_verified_count": 1,
-                                       "search_failure_count": 0}), encoding="utf-8")
+                                       "search_failure_count": 0,
+                                       "inventory_complete": True,
+                                       "canonical_containers": ["owner_primary", "family_shared"],
+                                       "canonical_container_counts": {"owner_primary": 1, "family_shared": 0}}
+    path.write_text(json.dumps(ready), encoding="utf-8")
     assert _verified_v4_import_ready(str(tmp_path)) is True
+    for mutation in (
+        {"inventory_complete": False},
+        {"canonical_containers": ["owner_primary"]},
+        {"canonical_container_counts": {"owner_primary": 0, "family_shared": 0}},
+        {"documents": [row | {"container": "family_shared"}]},
+        {"documents": [row | {"visibility": "invalid"}]},
+    ):
+        path.write_text(json.dumps(ready | mutation), encoding="utf-8")
+        assert _verified_v4_import_ready(str(tmp_path)) is False
 
 
 def test_owner_capture_identity_ignores_forged_metadata_custom_id(provider):
@@ -2480,3 +2494,201 @@ def test_family_acl_requires_authenticated_server_context_and_never_returns_priv
     )] == ["shared"]
     assert [item["id"] for item in _visible_canonical_results(items, family=False)] == [
         "private", "shared"]
+
+
+def _v4_chunk(path, *, text="Canonical fact", ident="chunk-1", **changes):
+    meta = _v4_canonical_metadata(path, visibility=(
+        "family_shared" if path.startswith("Jarvis/Family Shared/") else "owner_private"))
+    meta.update(canonical_path=path, entity_name=path.rsplit("/", 1)[-1][:-3], entity_type="person")
+    # Captured local Supermemory 0.0.8 /v4/search shape: associated
+    # documents do not expose customId or containerTags.
+    parent_id = "backend-" + hashlib.sha256(path.encode()).hexdigest()[:12]
+    return {"id": ident, "chunk": text, "metadata": meta,
+            "documents": [{"id": parent_id, "metadata": meta}], **changes}
+
+
+def _v4_parent(path, *, ident=None, container=None, custom_id=None):
+    return {"id": ident or "backend-" + hashlib.sha256(path.encode()).hexdigest()[:12],
+            "customId": custom_id or "obsidian-" + hashlib.sha256(path.encode()).hexdigest(),
+            "containerTags": [container or (
+                "family_shared" if path.startswith("Jarvis/Family Shared/") else "owner_primary")],
+            "metadata": _v4_canonical_metadata(path, visibility=(
+                "family_shared" if path.startswith("Jarvis/Family Shared/") else "owner_private"))}
+
+
+def _real_v4_client(handler, tag="family_shared"):
+    import httpx
+    from supermemory import Supermemory
+    client = object.__new__(_SupermemoryClient)
+    client._client = Supermemory(api_key="test-secret", base_url="https://example.invalid",
+                                max_retries=0, http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    client._container_tag = tag
+    client._search_mode = "hybrid"
+    client._canonical_document_search_mode = "documents"
+    return client
+
+
+@pytest.mark.parametrize("query", ["Tell me about Aaron", "Tell me about Aaron?", "Tell me about Aaron.", "Tell me about Aaron!"])
+def test_clean_aaron_family_query_uses_real_v4_shape_and_stays_separate_from_requester(
+    family_provider, monkeypatch, caplog, query,
+):
+    import httpx
+    requests = []
+    path = "Jarvis/Family Shared/People/Aaron.md"
+    paths = [path, "Jarvis/Family Shared/People/Other.md"]
+    parents = {_v4_parent(value)["id"]: _v4_parent(value) for value in paths}
+    def handle(request):
+        payload = json.loads(request.content) if request.content else None
+        requests.append((request.url.path, payload))
+        if request.url.path.startswith("/v3/documents/"):
+            return httpx.Response(200, json=parents[request.url.path.rsplit("/", 1)[-1]])
+        return httpx.Response(200, json={"results": [
+            _v4_chunk(path, text="Aaron enjoys hiking."),
+            _v4_chunk("Jarvis/Family Shared/People/Other.md", ident="chunk-2", text="Other enjoys chess."),
+        ], "total": 2, "timing": 1})
+    family_provider._client = _real_v4_client(handle)
+    family_provider._temporal_filters_schema_v4_ready = True
+    family_provider._max_recall_results = 1
+    calls = []
+    def rerank(clean_query, candidates, **kwargs):
+        calls.append((clean_query, candidates))
+        return {"selected_ids": ["chunk-1"], "rejected_ids": ["chunk-2"], "sufficient": True}
+    monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker", rerank)
+    caplog.set_level("INFO", logger="plugins.memory.supermemory")
+    context = family_provider.prefetch(query, session_id="requester-device-session-secret")
+    assert requests[0] == ("/v4/search", {"q": query, "containerTag": "family_shared", "limit": 20,
+        "searchMode": "documents", "rerank": False, "rewriteQuery": False,
+        "aggregate": False, "include": {"documents": True}})
+    assert len([path for path, _ in requests if path.startswith("/v3/documents/")]) == 2
+    assert len(calls) == 1 and calls[0][0] == query and len(calls[0][1]) == 2
+    assert "Aaron enjoys hiking" in context and "Other enjoys chess" not in context
+    assert "never infer that a described person is the requester" in context
+    assert "requester-device-session-secret" not in context
+    receipts = [json.loads(record.message.split("supermemory_stage ", 1)[1])
+                for record in caplog.records if record.message.startswith("supermemory_stage ")]
+    assert {r["stage"] for r in receipts} >= {"normalize", "qwen_pool", "selection", "injection"}
+    encoded = json.dumps(receipts)
+    for secret in (query, "Aaron", "hiking", "chunk-1", path, "test-secret", "requester-device-session-secret"):
+        assert secret not in encoded
+
+
+@pytest.mark.parametrize("mutation", ["missing_parent", "two_parents", "metadata", "timestamp", "container", "aggregate", "memory", "document_id", "custom_id"])
+def test_v4_normalizer_fails_closed_on_unproven_chunk_provenance(mutation):
+    from plugins.memory.supermemory.search_v4 import normalize_document_chunk
+    raw = _v4_chunk("Jarvis/Family Shared/People/Aaron.md")
+    if mutation == "missing_parent": raw["documents"] = []
+    if mutation == "two_parents": raw["documents"] *= 2
+    if mutation == "metadata": raw["documents"][0]["metadata"] = dict(raw["metadata"], visibility="owner_private")
+    if mutation == "timestamp":
+        raw["updatedAt"] = "2026-01-01"; raw["documents"][0]["updatedAt"] = "2026-01-02"
+    parent = _v4_parent("Jarvis/Family Shared/People/Aaron.md")
+    if mutation == "container": parent["containerTags"] = ["owner_primary"]
+    if mutation == "aggregate": raw["isAggregated"] = True
+    if mutation == "memory": raw["memory"] = raw.pop("chunk")
+    if mutation == "document_id": raw["documentId"] = "wrong-parent"
+    if mutation == "custom_id": parent["customId"] = "obsidian-wrong"
+    assert normalize_document_chunk(raw, "family_shared", parent) is None
+
+
+def test_v4_container_and_custom_identity_validation_cannot_be_spoofed():
+    from plugins.memory.supermemory import _is_canonical_result
+    from plugins.memory.supermemory.search_v4 import normalize_document_chunk
+    private = _v4_chunk("Jarvis/Owner Private/People/Aaron.md")
+    normalized = normalize_document_chunk(private, "family_shared", _v4_parent("Jarvis/Owner Private/People/Aaron.md"))
+    assert normalized is None
+    shared = _v4_chunk("Jarvis/Family Shared/People/Aaron.md")
+    assert normalize_document_chunk(shared, "family_shared", _v4_parent(
+        "Jarvis/Family Shared/People/Aaron.md", custom_id="obsidian-wrong")) is None
+
+
+def test_v4_parent_hydration_is_deduped_and_fail_closed_on_get_failure_or_deadline():
+    path = "Jarvis/Family Shared/People/Aaron.md"
+    first = _v4_chunk(path)
+    second = _v4_chunk(path, ident="chunk-2", text="More canonical detail")
+    calls = []
+    parent = _v4_parent(path)
+
+    class Search:
+        @staticmethod
+        def memories(**kwargs):
+            return {"results": [first, second]}
+
+    class Documents:
+        @staticmethod
+        def get(ident, **kwargs):
+            calls.append((ident, kwargs["timeout"]))
+            return SimpleNamespace(id=parent["id"], custom_id=parent["customId"],
+                                   container_tags=parent["containerTags"], metadata=parent["metadata"])
+
+    client = object.__new__(_SupermemoryClient)
+    client._client = SimpleNamespace(search=Search(), documents=Documents())
+    client._canonical_document_search_mode = "documents"
+    assert len(client.search_documents("q", container_tag="family_shared", timeout=1.0)) == 2
+    assert len(calls) == 1
+
+    client.begin_turn()
+    Documents.get = staticmethod(lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
+    assert client.search_documents("q", container_tag="family_shared", timeout=1.0) == []
+    client.begin_turn()
+    Documents.get = staticmethod(lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("past deadline")))
+    assert client.search_documents("q", container_tag="family_shared", timeout=0.0) == []
+
+
+def test_canonical_config_is_independent_of_conversation_mode(tmp_path):
+    (tmp_path / "supermemory.json").write_text(json.dumps({"search_mode": "memories"}))
+    config = _load_supermemory_config(str(tmp_path))
+    assert config["canonical_document_search_mode"] == "documents"
+    assert config["search_mode"] == "memories"
+
+
+def test_owner_v4_independent_container_limits_feed_full_deduped_qwen_pool(provider, monkeypatch):
+    import httpx
+    from plugins.memory.supermemory.search_v4 import normalize_document_chunk
+    provider._container_tag = "owner_primary"
+    provider._temporal_filters_schema_v4_ready = True
+    provider._max_recall_results = 3
+    requests, pools = [], []
+    parent_by_id = {}
+    for shared in (False, True):
+        prefix = "Jarvis/Family Shared" if shared else "Jarvis/Owner Private"
+        for i in range(20):
+            path = f"{prefix}/People/Person {i}.md"
+            parent = _v4_parent(path)
+            parent_by_id[parent["id"]] = parent
+    def handle(request):
+        if request.url.path.startswith("/v3/documents/"):
+            return httpx.Response(200, json=parent_by_id[request.url.path.rsplit("/", 1)[-1]])
+        payload = json.loads(request.content); requests.append(payload)
+        shared = payload["containerTag"] == "family_shared"
+        prefix = "Jarvis/Family Shared" if shared else "Jarvis/Owner Private"
+        rows = [_v4_chunk(f"{prefix}/People/Person {i}.md", ident=f"{shared}-{i}",
+                         text=f"Fact for {shared} person {i}") for i in range(20)]
+        return httpx.Response(200, json={"results": rows, "total": 20, "timing": 1})
+    client = _real_v4_client(handle, tag="owner_primary")
+    provider._client.search_documents = client.search_documents
+    provider._client.search_results = []
+    def rerank(query, candidates, **kwargs):
+        pools.append(candidates)
+        return {"selected_ids": [c["id"] for c in reversed(candidates)], "rejected_ids": [], "sufficient": True}
+    monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker", rerank)
+    context = provider.prefetch("What facts are available?")
+    assert len(requests) == 2 and {r["containerTag"] for r in requests} == {"owner_primary", "family_shared"}
+    assert all(r["limit"] == 20 and r["searchMode"] == "documents" for r in requests)
+    assert len(pools) == 1 and len(pools[0]) == 40
+    assert context.count("[authority: canonical]") == 3
+    provider._client.search_results = [{
+        "id": f"conversation-{i}", "memory": f"[role: user]\nMy distinct fact {i}\n[user:end]",
+        "metadata": {"type": "owner_conversation", "authority": "non-authoritative",
+                     "provenance": "user-authored role-delimited statement"},
+    } for i in range(20)]
+    pools.clear()
+    provider.prefetch("What facts are available?")
+    assert len(pools) == 1 and len(pools[0]) == 60
+    one_path = "Jarvis/Owner Private/People/One.md"
+    item = normalize_document_chunk(_v4_chunk(one_path), "owner_primary", _v4_parent(one_path))
+    pools.clear()
+    two_path = "Jarvis/Owner Private/People/Two.md"
+    other = normalize_document_chunk(_v4_chunk(two_path, ident="other", text="Different"),
+                                     "owner_primary", _v4_parent(two_path))
+    provider._rerank_owner_candidates("facts", [item, dict(item), other])
+    assert len(pools) == 1 and len(pools[0]) == 2

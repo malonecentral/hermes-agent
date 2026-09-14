@@ -53,11 +53,12 @@ Config file: `$HERMES_HOME/supermemory.json`
 | `temporal_filters_schema_v4_ready` | `false` | Request temporal filtering; it activates only when the local import receipt is schema v4, reconciled, has the expected backend count, and every eligible row is terminal `done`/v4 with zero failures or pending work. A v3 or incomplete receipt stays off. |
 | `context_char_budget` | `12000` | Maximum final memory-envelope characters; runtime context measurement may lower it. |
 | `context_byte_budget` | `24000` | Maximum UTF-8 bytes in the final memory envelope. Truncation is deterministic and preserves the envelope and authority labels. |
-| `reranker_input_token_budget` | `8192` | Measured Qwen reranker context. The request builder reserves 512 tokens for the runner template and conservatively bounds the complete serialized JSON by UTF-8 bytes (safe for byte-fallback/pathological Unicode). This is independent of the final context budget. |
-| `max_recall_results` | `10` | Max recalled items to format into context (hard configuration clamp: 20); no authority-specific quota is applied. |
+| `reranker_input_token_budget` | `8192` | Measured Qwen reranker context. The request builder reserves 768 tokens for the runner template and bounds each query/document pair by UTF-8 bytes (safe for byte-fallback/pathological Unicode). This is independent of the final context budget. |
+| `max_recall_results` | `5` | Max recalled items to format into context (hard configuration clamp: 20); no authority-specific quota is applied. |
 | `profile_frequency` | `50` | Include profile facts on first turn and every N turns |
 | `capture_mode` | `all` | Skip tiny or trivial turns by default |
-| `search_mode` | `hybrid` | Search mode: `hybrid` (profile + memories), `memories` (memories only), `documents` (documents only) |
+| `search_mode` | `hybrid` | Conversation search mode: `hybrid`, `memories`, or `documents`. |
+| `canonical_document_search_mode` | `documents` | Canonical retrieval uses `/v4/search` in document-only mode; other values normalize to `documents`. Independent of conversation search. |
 | `entity_context` | built-in default | Extraction guidance passed to Supermemory |
 | `api_timeout` | `5.0` | Timeout for SDK and ingest requests |
 
@@ -97,7 +98,8 @@ Supermemory app, so you can filter, browse, and bulk-manage them per source agen
 When enabled, Hermes can:
 
 - prefetch relevant memory context before each turn
-- for Owner recall, admit up to 20 independently retrieved canonical candidates and 20 independently retrieved conversation candidates to one Qwen rerank call, with no lexical, rank-fusion, or quota gate before Qwen; final evidence remains capped at 5. The measured 40-candidate p95 is about 1.124s (+463ms versus 20 candidates), accepted to guarantee both sources reach the common scorer.
+- retrieve up to 20 canonical chunks independently per authorized container through `/v4/search`, with provider rewriting, aggregation, and reranking disabled. Family searches only Family Shared. Owner searches both canonical containers and independently retrieves up to 20 conversation candidates. After provenance, ACL, entity, and temporal guards and deduplication, one Qwen request scores the full eligible pool (at most 60 candidates). The existing single-candidate bypass is preserved. `max_recall_results` and the final context byte/character budgets apply separately.
+- emit structured `supermemory_stage` receipts containing stage names, outcomes, counts, limits, and durations; receipts contain no queries, content, credentials, or source/requester/session identifiers.
 - buffer the full conversation and ingest it as **one session** at session end (or on `/reset`, branch, compression, or shutdown)
 - ingest the full session to the conversations endpoint for richer profile/graph updates
 - route every SDK, probe, and conversation-ingest request through the configured hosted or self-hosted endpoint

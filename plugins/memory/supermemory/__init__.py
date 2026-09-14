@@ -22,11 +22,23 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+from .search_v4 import field as _v4_field, normalize_document_chunk, search_documents_v4
+
 from agent.memory_provider import MemoryProvider
 from agent.secret_scope import get_secret, is_multiplex_active
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
+
+
+def _stage_receipt(stage: str, **values) -> None:
+    allowed = {"received", "eligible", "rejected", "selected", "limit", "elapsed_ms", "chars", "bytes"}
+    receipt = {"stage": stage}
+    receipt.update({key: value for key, value in values.items()
+                    if key in allowed and isinstance(value, int) and not isinstance(value, bool)})
+    if values.get("outcome") in {"ok", "error", "deadline", "overflow"}:
+        receipt["outcome"] = values["outcome"]
+    logger.info("supermemory_stage %s", json.dumps(receipt, sort_keys=True))
 
 
 class OwnerAppCaptureUnavailable(RuntimeError):
@@ -52,6 +64,8 @@ _OWNER_RERANK_URL = "http://mcomen.malonecentral.com:8082/rerank"
 _OWNER_RERANK_MODEL = "qwen3-reranker-0.6b-q8_0.gguf"
 _OWNER_RERANK_TIMEOUT_SECONDS = 6.0
 _OWNER_SOURCE_CANDIDATE_LIMIT = 20
+# Two canonical containers plus the independently authorized conversation source.
+_OWNER_QWEN_POOL_LIMIT = 3 * _OWNER_SOURCE_CANDIDATE_LIMIT
 _FAMILY_RERANK_FAILURE_FALLBACK_LIMIT = 3
 _DEFAULT_RERANKER_INPUT_TOKEN_BUDGET = 8192
 # llama.cpp /rerank evaluates every (query, document) pair independently.  A
@@ -540,6 +554,7 @@ def _default_config() -> dict:
         "profile_frequency": _DEFAULT_PROFILE_FREQUENCY,
         "capture_mode": _DEFAULT_CAPTURE_MODE,
         "search_mode": _DEFAULT_SEARCH_MODE,
+        "canonical_document_search_mode": "documents",
         "entity_context": _DEFAULT_ENTITY_CONTEXT,
         "api_timeout": _DEFAULT_API_TIMEOUT,
         "prefetch_timeout": _DEFAULT_PREFETCH_TIMEOUT,
@@ -629,6 +644,8 @@ def _load_supermemory_config(hermes_home: str) -> dict:
     config["capture_mode"] = "everything" if config.get("capture_mode") == "everything" else "all"
     raw_search_mode = str(config.get("search_mode", _DEFAULT_SEARCH_MODE)).strip().lower()
     config["search_mode"] = raw_search_mode if raw_search_mode in _VALID_SEARCH_MODES else _DEFAULT_SEARCH_MODE
+    # Canonical reads never inherit the conversation search mode.
+    config["canonical_document_search_mode"] = "documents"
     config["entity_context"] = _clamp_entity_context(str(config.get("entity_context", _DEFAULT_ENTITY_CONTEXT)))
     try:
         config["api_timeout"] = max(0.5, min(15.0, float(config.get("api_timeout", _DEFAULT_API_TIMEOUT))))
@@ -661,6 +678,9 @@ def _verified_v4_import_ready(hermes_home: str) -> bool:
         payload = json.loads((Path(hermes_home) / "obsidian-supermemory-import.json").read_text())
         rows = payload.get("documents")
         expected = payload.get("expected_count", payload.get("eligible_file_count"))
+        counts = payload.get("canonical_container_counts")
+        containers = payload.get("canonical_containers")
+        row_containers = {"owner_private": "owner_primary", "family_shared": "family_shared"}
         return bool(
             payload.get("schema_version") == 4
             and payload.get("reconciliation_complete") is True
@@ -672,8 +692,16 @@ def _verified_v4_import_ready(hermes_home: str) -> bool:
             and payload.get("search_failure_count") == 0
             and payload.get("submission_failure_count") == 0
             and payload.get("still_pending_count") == 0
+            and payload.get("inventory_complete") is True
+            and containers == ["owner_primary", "family_shared"]
+            and isinstance(counts, dict)
+            and set(counts) == {"owner_primary", "family_shared"}
+            and all(isinstance(value, int) and value >= 0 for value in counts.values())
+            and sum(counts.values()) == expected
             and all(isinstance(row, dict) and row.get("index_schema_version") == 4
-                    and row.get("final_status") == "done" for row in rows)
+                    and row.get("final_status") == "done"
+                    and row_containers.get(row.get("visibility")) == row.get("container")
+                    for row in rows)
         )
     except (OSError, ValueError, TypeError):
         return False
@@ -765,6 +793,18 @@ def _is_canonical_result(item: dict, *, schema_v4_ready: bool = False) -> bool:
         return False
     raw_metadata = item.get("metadata")
     metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+    source_container = item.get("_source_container")
+    if source_container is not None:
+        expected_container = (_FAMILY_CANONICAL_CONTAINER
+                              if metadata.get("visibility") == "family_shared"
+                              else _OWNER_CANONICAL_CONTAINER)
+        if source_container != expected_container:
+            return False
+        custom_id = item.get("_source_custom_id")
+        if custom_id:
+            path = metadata.get("relative_path")
+            if not isinstance(path, str) or custom_id != "obsidian-" + hashlib.sha256(path.encode()).hexdigest():
+                return False
     legacy_valid = (
         metadata.get("schema_version") in {None, 3, "3", 4}
         and not isinstance(metadata.get("schema_version"), bool)
@@ -1188,7 +1228,10 @@ def _format_prefetch_context(
     available_bytes = max(0, byte_budget - len(opening.encode()) - len(closing.encode()))
     if len(body.encode()) > available_bytes:
         body = body.encode()[:available_bytes].decode("utf-8", "ignore")
-    return opening + body.rstrip() + closing
+    context = opening + body.rstrip() + closing
+    _stage_receipt("injection", selected=len(search), limit=max_results,
+                   chars=len(context), bytes=len(context.encode()))
+    return context
 
 
 def _clean_text_for_capture(text: str) -> str:
@@ -1203,7 +1246,8 @@ def _is_trivial_message(text: str) -> bool:
 
 class _SupermemoryClient:
     def __init__(self, api_key: str, timeout: float, container_tag: str,
-                 search_mode: str = "hybrid", base_url: str = ""):
+                 search_mode: str = "hybrid", base_url: str = "",
+                 canonical_document_search_mode: str = "documents"):
         # Lazy-install the supermemory SDK on demand. ensure() honors
         # security.allow_lazy_installs (default true) and, on a sealed Docker
         # venv, redirects the install to the durable target. On failure we
@@ -1221,6 +1265,7 @@ class _SupermemoryClient:
         self._api_key = api_key
         self._container_tag = container_tag
         self._search_mode = search_mode if search_mode in _VALID_SEARCH_MODES else _DEFAULT_SEARCH_MODE
+        self._canonical_document_search_mode = canonical_document_search_mode
         self._timeout = timeout
         self._base_url = _resolve_base_url(base_url)
         self._client = Supermemory(
@@ -1329,59 +1374,47 @@ class _SupermemoryClient:
                          container_tag: Optional[str] = None,
                          filters: Optional[dict] = None,
                          timeout: Optional[float] = None) -> list[dict]:
-        """Search canonical superrag chunks rather than extracted memories."""
+        """Search canonical chunks through the generic v4 endpoint."""
         tag = container_tag or self._container_tag
-        kwargs: dict[str, Any] = dict(
-            q=query,
-            container_tags=[tag],
+        started = time.monotonic()
+        deadline = started + timeout if timeout is not None else None
+        response = search_documents_v4(
+            self._client, query, container_tag=tag, limit=limit, filters=filters,
+            timeout=timeout, search_mode=getattr(self, "_canonical_document_search_mode", "documents"),
         )
-        if filters:
-            kwargs["filters"] = filters
-        kwargs.update(limit=limit, rerank=False, rewrite_query=False, only_matching_chunks=True)
-        if timeout is not None:
-            kwargs["timeout"] = max(0.001, timeout)
-        response = self._client.search.documents(**kwargs)
+        raw = _v4_field(response, "results", []) or []
         results = []
-        for document in (getattr(response, "results", None) or []):
-            document_id = (
-                getattr(document, "document_id", None)
-                or getattr(document, "documentId", None)
-                or ""
+        for item in raw[:limit]:
+            parents = _v4_field(item, "documents")
+            parent_id = (
+                _v4_field(parents[0], "id")
+                if isinstance(parents, list) and len(parents) == 1 else ""
             )
-            metadata = getattr(document, "metadata", None)
-            updated_at = (
-                getattr(document, "updated_at", None)
-                or getattr(document, "updatedAt", None)
-            )
-            chunks = getattr(document, "chunks", None) or []
-            for index, chunk in enumerate(chunks):
-                text = getattr(chunk, "content", "") or ""
-                if not text:
-                    continue
-                identity = []
-                if isinstance(metadata, dict):
-                    for key in (
-                        "canonical_path", "entity_type", "entity_name",
-                        "venue_name", "branch", "schema_version",
-                    ):
-                        value = metadata.get(key)
-                        if value not in (None, ""):
-                            identity.append(f"{key}: {value}")
-                if identity:
-                    text = "[canonical-identity]\n" + "\n".join(identity) + "\n[/canonical-identity]\n\n" + text
-                results.append({
-                    "id": f"{document_id}:{index}" if document_id else "",
-                    "memory": text,
-                    "similarity": (
-                        getattr(chunk, "score", None)
-                        if getattr(chunk, "score", None) is not None
-                        else getattr(document, "score", None)
-                    ),
-                    "updated_at": updated_at,
-                    "metadata": metadata,
-                    "_parent_document_id": document_id,
-                })
-        return results[:limit]
+            hydrated = None
+            cache = getattr(self, "_canonical_parent_cache", None)
+            if cache is None:
+                cache = self._canonical_parent_cache = {}
+            if isinstance(parent_id, str) and parent_id:
+                if parent_id in cache:
+                    hydrated = cache[parent_id]
+                elif deadline is None or time.monotonic() < deadline:
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    try:
+                        hydrated = self.get_document(parent_id, timeout=remaining)
+                    except Exception:
+                        hydrated = None
+                    cache[parent_id] = hydrated
+            normalized = normalize_document_chunk(item, tag, hydrated)
+            if normalized is not None:
+                results.append(normalized)
+        _stage_receipt("normalize", received=len(raw), eligible=len(results),
+                       rejected=min(len(raw), limit) - len(results), limit=limit,
+                       elapsed_ms=round((time.monotonic() - started) * 1000))
+        return results
+
+    def begin_turn(self) -> None:
+        """Drop parent proofs at turn boundaries; dedupe them within a turn."""
+        self._canonical_parent_cache = {}
 
     def get_document(self, document_id: str, *, timeout: Optional[float] = None) -> dict:
         """Fetch one document by its provider-issued parent ID."""
@@ -1776,6 +1809,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
                     container_tag=self._container_tag,
                     search_mode=self._search_mode,
                     base_url=self._base_url,
+                    canonical_document_search_mode=self._config["canonical_document_search_mode"],
                 )
             except Exception:
                 logger.warning("Supermemory initialization failed", exc_info=True)
@@ -1784,6 +1818,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._turn_count = max(turn_number, 0)
+        if self._client is not None and hasattr(self._client, "begin_turn"):
+            self._client.begin_turn()
 
     def system_prompt_block(self) -> str:
         if not self._active:
@@ -1881,8 +1917,17 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 "score_min=na score_max=na elapsed_ms=%d fallback=family_acl",
                 outcome, len(candidates), len(selected_items), elapsed_ms,
             )
+            _stage_receipt("selection", outcome="error", eligible=len(candidates),
+                           selected=len(selected_items), elapsed_ms=elapsed_ms)
             return selected_items
 
+        _stage_receipt("qwen_pool", received=len(items), eligible=len(candidates),
+                       rejected=len(items) - len(candidates), limit=_OWNER_QWEN_POOL_LIMIT)
+        # Overflow means a source broke its bounded contract. Do not silently
+        # drop eligible evidence before the common scorer.
+        if len(candidates) > _OWNER_QWEN_POOL_LIMIT:
+            _stage_receipt("qwen_pool", outcome="overflow", eligible=len(candidates))
+            return []
         if len(candidates) <= 1:
             outcome = "selected" if candidates else "insufficient"
             selected_items = [by_id[candidates[0]["id"]]] if candidates else []
@@ -1891,6 +1936,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 "score_min=na score_max=na elapsed_ms=0 bypass=single",
                 outcome, len(candidates), len(selected_items),
             )
+            _stage_receipt("selection", eligible=len(candidates), selected=len(selected_items),
+                           limit=self._max_recall_results)
             return selected_items
         started = time.monotonic()
         logger.warning("owner reranker request model=%s candidates=%d", _OWNER_RERANK_MODEL, len(candidates))
@@ -1926,12 +1973,15 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 "invalid", round((time.monotonic() - started) * 1000),
             )
         if not sufficient or not selected:
+            _stage_receipt("selection", eligible=len(candidates), selected=0, limit=self._max_recall_results)
             logger.warning("supermemory_prefetch stage=reranker outcome=insufficient candidates=%d selected=0 score_min=na score_max=na elapsed_ms=%d", len(candidates), round((time.monotonic() - started) * 1000))
             return []
         selected_items = _suppress_direct_conversation_conflicts(
             [by_id[candidate_id] for candidate_id in selected]
         )
         selected_items = selected_items[:self._max_recall_results]
+        _stage_receipt("selection", eligible=len(candidates), selected=len(selected_items),
+                       limit=self._max_recall_results)
         logger.warning(
             "supermemory_prefetch stage=reranker outcome=selected candidates=%d selected=%d score_min=%s score_max=%s elapsed_ms=%d",
             len(candidates), len(selected_items),
@@ -2155,6 +2205,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
                     outcomes[name] = outcome
                     if outcome == "ok":
                         values[name] = value
+                    _stage_receipt(name, outcome=outcome, elapsed_ms=elapsed_ms,
+                                   received=len(value) if isinstance(value, list) else 0)
                     logger.info(
                         "supermemory_prefetch stage=%s outcome=%s elapsed_ms=%d required=%s",
                         name, outcome, elapsed_ms, str(stages[name][0]).lower(),
@@ -2167,6 +2219,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         for future in pending:
             name = futures[future]
             outcomes[name] = "deadline"
+            _stage_receipt(name, outcome="deadline", elapsed_ms=elapsed_ms)
             logger.warning(
                 "supermemory_prefetch stage=%s outcome=deadline elapsed_ms=%d required=%s",
                 name, elapsed_ms, str(stages[name][0]).lower(),
@@ -2194,7 +2247,9 @@ class SupermemoryMemoryProvider(MemoryProvider):
         results += self._client.search_documents(
             recall_query[:511], limit=20, container_tag=_FAMILY_CANONICAL_CONTAINER,
         )
-        results = _authoritative_search_results(results)
+        results = _authoritative_search_results(
+            results, schema_v4_ready=self._temporal_filters_schema_v4_ready,
+        )
         results = _scope_owner_named_person_results(owner_query, results)
         results, _named_restaurant = _scope_owner_restaurant_results(owner_query, results)
         results = _rank_owner_canonical_results(owner_query, results)
@@ -2244,6 +2299,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 family_results = _visible_canonical_results(
                     list(raw or []), family=True, authenticated_family=True,
                     schema_v4_ready=self._temporal_filters_schema_v4_ready,
+                )
+                family_results = _scope_owner_named_person_results(retrieval_query, family_results)
+                family_results = _scope_owner_dated_event_results(
+                    retrieval_query, family_results, retrieval_context=temporal_scope,
                 )
                 search_results = self._rerank_owner_candidates(
                     retrieval_query, family_results, deadline=deadline,
@@ -2331,7 +2390,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             )
             return context
         except Exception:
-            logger.debug("Supermemory prefetch failed", exc_info=True)
+            _stage_receipt("prefetch", outcome="error")
             return ""
 
     @staticmethod
