@@ -2014,6 +2014,7 @@ def run_conversation(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    host_staged_memory_gate: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -2162,6 +2163,16 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+
+    # A trusted embedding host may require canonical memory to be considered
+    # before any general-purpose capability is exposed.  This is enforced at
+    # the request-schema boundary, not by prompt instructions.  Empty recall
+    # intentionally retains the ordinary tool path.
+    _host_memory_gate_active = bool(host_staged_memory_gate and _ext_prefetch_cache)
+    _host_memory_gate_stage = "initial" if _host_memory_gate_active else "off"
+    _host_memory_gate_sentinel = str(
+        (host_staged_memory_gate or {}).get("sentinel") or '{"insufficient_evidence":true}'
+    )
 
     # One-shot retrieval-only callers may require selected memory evidence.
     # Enforce that contract before the first model API call; prompt wording is
@@ -2815,7 +2826,15 @@ def run_conversation(
         # exactly the point the breakpoints were meant to protect. Marking
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
-        tools_for_api = agent.tools
+        if _host_memory_gate_stage == "initial":
+            tools_for_api = []
+        elif _host_memory_gate_stage == "refinement":
+            tools_for_api = [(host_staged_memory_gate or {}).get("refinement_schema")]
+            tools_for_api = [schema for schema in tools_for_api if isinstance(schema, dict)]
+        elif _host_memory_gate_stage == "post_refinement":
+            tools_for_api = []
+        else:
+            tools_for_api = agent.tools
         if agent._use_prompt_caching and agent.provider != "moa":
             from agent.prompt_caching import (
                 envelope_tool_part_cache_markers_supported,
@@ -7682,6 +7701,17 @@ def run_conversation(
             
             # Check for tool calls
             if assistant_message.tool_calls:
+                if _host_memory_gate_stage == "refinement":
+                    # The advertised schema is already query-only and provider
+                    # scoped.  Refuse batches/retries here as a second host
+                    # boundary, then make the following synthesis call tool-free.
+                    if (len(assistant_message.tool_calls) != 1
+                            or assistant_message.tool_calls[0].function.name != "supermemory_search"):
+                        assistant_message.tool_calls = []
+                        assistant_message.content = _host_memory_gate_sentinel
+                    else:
+                        _host_memory_gate_stage = "post_refinement"
+                        agent.valid_tool_names.add("supermemory_search")
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
                 
@@ -8336,6 +8366,16 @@ def run_conversation(
                 # chokepoint below, after final_msg is built, so it catches
                 # every path that reaches turn finalization, not just this one.)
                 final_response = assistant_message.content or ""
+                if (_host_memory_gate_stage in {"initial", "refinement", "post_refinement"}
+                        and final_response.strip() == _host_memory_gate_sentinel):
+                    # The sentinel is control flow only: do not append, persist,
+                    # stream, or retain it.  First occurrence admits one scoped
+                    # refinement; the next admits one ordinary bounded fallback.
+                    _host_memory_gate_stage = (
+                        "refinement" if _host_memory_gate_stage == "initial" else "fallback"
+                    )
+                    final_response = None
+                    continue
                 
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery
