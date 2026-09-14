@@ -1605,6 +1605,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._hermes_home = ""
         self._write_enabled = True
         self._active = False
+        # Safe pre-initialize defaults are required because MemoryManager
+        # inspects tool schemas when the provider is added, before initialize_all.
+        self._audience = "owner"
+        self._family_mobile_reader = False
         # Multi-container support
         self._enable_custom_containers = False
         self._custom_containers: List[str] = []

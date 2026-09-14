@@ -87,6 +87,18 @@ class FakeClient:
         self.ingest_calls.append({"session_id": session_id, "messages": messages, "metadata": metadata})
 
 
+def test_provider_can_join_manager_before_initialize(monkeypatch):
+    """AIAgent adds providers before initialize_all; pre-init policy must be safe."""
+    from agent.memory_manager import MemoryManager
+
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "family-read-key")
+    manager = MemoryManager()
+    provider = SupermemoryMemoryProvider()
+    manager.add_provider(provider)
+    assert manager.providers == [provider]
+    assert provider.get_tool_schemas() != []  # owner-safe constructor default
+
+
 @pytest.fixture
 def provider(monkeypatch, tmp_path):
     monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
