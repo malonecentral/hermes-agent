@@ -51,6 +51,7 @@ _OWNER_RERANK_URL = "http://mcomen.malonecentral.com:8082/rerank"
 _OWNER_RERANK_MODEL = "qwen3-reranker-0.6b-q8_0.gguf"
 _OWNER_RERANK_TIMEOUT_SECONDS = 6.0
 _OWNER_SOURCE_CANDIDATE_LIMIT = 20
+_FAMILY_RERANK_FAILURE_FALLBACK_LIMIT = 3
 _DEFAULT_RERANKER_INPUT_TOKEN_BUDGET = 8192
 # llama.cpp /rerank evaluates every (query, document) pair independently.  A
 # valid UTF-8 byte is a conservative upper bound on tokenizer output, so these
@@ -1856,6 +1857,27 @@ class SupermemoryMemoryProvider(MemoryProvider):
         # The independently bounded v3/v4 sources are deliberately combined
         # without quotas or pre-Qwen lexical admission. One request gives every
         # unique candidate identical pointwise scoring semantics.
+        def family_failure_fallback(outcome: str, elapsed_ms: int) -> list[dict]:
+            """Retain only revalidated Family Shared evidence when scoring fails."""
+            if not self.allows_automatic_context_without_tools():
+                selected_items: list[dict] = []
+            else:
+                approved = _visible_canonical_results(
+                    items, family=True, authenticated_family=True,
+                    schema_v4_ready=self._temporal_filters_schema_v4_ready,
+                )
+                approved_object_ids = {id(item) for item in approved}
+                selected_items = [
+                    by_id[candidate["id"]] for candidate in candidates
+                    if id(by_id[candidate["id"]]) in approved_object_ids
+                ][:_FAMILY_RERANK_FAILURE_FALLBACK_LIMIT]
+            logger.warning(
+                "supermemory_prefetch stage=reranker outcome=%s candidates=%d selected=%d "
+                "score_min=na score_max=na elapsed_ms=%d fallback=family_acl",
+                outcome, len(candidates), len(selected_items), elapsed_ms,
+            )
+            return selected_items
+
         if len(candidates) <= 1:
             outcome = "selected" if candidates else "insufficient"
             logger.warning(
@@ -1868,40 +1890,35 @@ class SupermemoryMemoryProvider(MemoryProvider):
         logger.warning("owner reranker request model=%s candidates=%d", _OWNER_RERANK_MODEL, len(candidates))
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None and remaining <= 0:
-            logger.warning(
-                "supermemory_prefetch stage=reranker outcome=deadline candidates=%d selected=0 "
-                "score_min=na score_max=na elapsed_ms=0",
-                len(candidates),
-            )
-            return []
+            return family_failure_fallback("deadline", 0)
         try:
             result = _call_owner_reranker(
                 query, candidates, timeout=remaining,
                 input_token_budget=self._reranker_input_token_budget,
             )
         except Exception:
-            logger.warning(
-                "supermemory_prefetch stage=reranker outcome=exception candidates=%d selected=0 "
-                "score_min=na score_max=na elapsed_ms=%d",
-                len(candidates), round((time.monotonic() - started) * 1000),
+            return family_failure_fallback(
+                "exception", round((time.monotonic() - started) * 1000),
             )
-            return []
         allowed_keys = {"selected_ids", "rejected_ids", "sufficient", "scores"}
         if not isinstance(result, dict) or not {"selected_ids", "rejected_ids", "sufficient"}.issubset(result) or not set(result).issubset(allowed_keys):
-            logger.warning("supermemory_prefetch stage=reranker outcome=invalid candidates=%d selected=0 score_min=na score_max=na elapsed_ms=%d", len(candidates), round((time.monotonic() - started) * 1000))
-            return []
+            return family_failure_fallback(
+                "invalid", round((time.monotonic() - started) * 1000),
+            )
         selected = result.get("selected_ids")
         rejected = result.get("rejected_ids")
         sufficient = result.get("sufficient")
         if not isinstance(selected, list) or not isinstance(rejected, list) or not isinstance(sufficient, bool):
-            logger.warning("supermemory_prefetch stage=reranker outcome=invalid candidates=%d selected=0 score_min=na score_max=na elapsed_ms=%d", len(candidates), round((time.monotonic() - started) * 1000))
-            return []
+            return family_failure_fallback(
+                "invalid", round((time.monotonic() - started) * 1000),
+            )
         combined = selected + rejected
         expected = set(by_id)
         if (not all(isinstance(value, str) for value in combined)
                 or len(combined) != len(set(combined)) or set(combined) != expected):
-            logger.warning("supermemory_prefetch stage=reranker outcome=invalid candidates=%d selected=0 score_min=na score_max=na elapsed_ms=%d", len(candidates), round((time.monotonic() - started) * 1000))
-            return []
+            return family_failure_fallback(
+                "invalid", round((time.monotonic() - started) * 1000),
+            )
         if not sufficient or not selected:
             logger.warning("supermemory_prefetch stage=reranker outcome=insufficient candidates=%d selected=0 score_min=na score_max=na elapsed_ms=%d", len(candidates), round((time.monotonic() - started) * 1000))
             return []

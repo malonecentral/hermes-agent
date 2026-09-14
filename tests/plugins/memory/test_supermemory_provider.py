@@ -240,6 +240,70 @@ def test_family_rejects_spoofed_visibility_and_malformed_shared_paths(family_pro
     assert "VALID" in result and "SPOOF" not in result
 
 
+@pytest.mark.parametrize("failure", ["exception", "malformed"])
+def test_family_reranker_failure_preserves_bounded_shared_evidence(
+    family_provider, monkeypatch, failure,
+):
+    family_provider._temporal_filters_schema_v4_ready = True
+    family_provider._max_recall_results = 8
+    family_provider._client.search_results = [
+        _canonical("Molly likes Little Caesars pizza.", "Jarvis/Family Shared/People/Molly.md", "family_shared"),
+        _canonical("Little Caesars is a family restaurant option.", "Jarvis/Family Shared/Food/Restaurants/Little Caesars.md", "family_shared"),
+        _canonical("THIRD SHARED", "Jarvis/Family Shared/People/Third.md", "family_shared"),
+        _canonical("FOURTH SHARED", "Jarvis/Family Shared/People/Fourth.md", "family_shared"),
+        _canonical("OWNER PRIVATE", "Jarvis/Private/Dennis.md", "owner_private"),
+        {"id": "conversation", "memory": "CONVERSATION PRIVATE", "metadata": {
+            "type": "owner_conversation", "source": "conversation",
+        }},
+    ]
+    def raise_reranker_error(*args, **kwargs):
+        raise RuntimeError("reranker unavailable")
+
+    reranker = (
+        raise_reranker_error
+        if failure == "exception"
+        else lambda *args, **kwargs: {"selected_ids": "not-a-list"}
+    )
+    monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker", reranker)
+
+    result = family_provider.prefetch("What does Molly like from Little Caesars?")
+
+    assert "Molly likes Little Caesars pizza." in result
+    assert "Little Caesars is a family restaurant option." in result
+    assert "THIRD SHARED" in result
+    assert "FOURTH SHARED" not in result  # failure fallback is independently bounded
+    assert "OWNER PRIVATE" not in result
+    assert "CONVERSATION PRIVATE" not in result
+
+
+def test_family_reranker_deadline_preserves_only_acl_approved_canonical_items(family_provider):
+    family_provider._temporal_filters_schema_v4_ready = True
+    shared = _canonical("Molly likes Little Caesars.", "Jarvis/Family Shared/People/Molly.md", "family_shared")
+    private = _canonical("OWNER PRIVATE", "Jarvis/Private/Dennis.md", "owner_private")
+    conversation = {"id": "conversation", "memory": "CONVERSATION PRIVATE", "metadata": {
+        "type": "owner_conversation", "source": "conversation",
+    }}
+
+    result = family_provider._rerank_owner_candidates(
+        "Molly", [shared, private, conversation, shared], deadline=time.monotonic() - 1,
+    )
+
+    assert result == [shared]
+
+
+def test_owner_reranker_failure_remains_fail_closed(provider, monkeypatch):
+    items = [
+        _canonical("ONE", "Jarvis/Private/One.md", "owner_private"),
+        _canonical("TWO", "Jarvis/Private/Two.md", "owner_private"),
+    ]
+    monkeypatch.setattr(
+        "plugins.memory.supermemory._call_owner_reranker",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+
+    assert provider._rerank_owner_candidates("query", items) == []
+
+
 
 def test_owner_dated_event_scope_prefers_matching_meal_header():
     dinner = {"id": "dinner", "memory": "### 2026-09-11 — dine-in dinner\n- Location: Ghost Ranch"}
