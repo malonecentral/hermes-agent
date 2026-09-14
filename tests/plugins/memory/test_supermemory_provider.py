@@ -311,6 +311,7 @@ def test_family_reranker_failure_preserves_bounded_shared_evidence(
             "type": "owner_conversation", "source": "conversation",
         }},
     ]
+    family_provider._client.search_results[1]["_parent_document_id"] = "little-caesars-parent"
     def raise_reranker_error(*args, **kwargs):
         raise RuntimeError("reranker unavailable")
 
@@ -329,6 +330,8 @@ def test_family_reranker_failure_preserves_bounded_shared_evidence(
     assert "FOURTH SHARED" not in result  # failure fallback is independently bounded
     assert "OWNER PRIVATE" not in result
     assert "CONVERSATION PRIVATE" not in result
+    assert "validated as relevant and sufficient" in result
+    assert "without calling any tool" in result
 
 
 def test_family_reranker_deadline_preserves_only_acl_approved_canonical_items(family_provider):
