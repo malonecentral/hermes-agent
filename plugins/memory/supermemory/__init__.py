@@ -806,7 +806,7 @@ def _is_canonical_result(item: dict, *, schema_v4_ready: bool = False) -> bool:
             if not isinstance(path, str) or custom_id != "obsidian-" + hashlib.sha256(path.encode()).hexdigest():
                 return False
     legacy_valid = (
-        metadata.get("schema_version") in {None, 3, "3", 4}
+        metadata.get("schema_version") in {None, 3, "3", 4, "4"}
         and not isinstance(metadata.get("schema_version"), bool)
         and metadata.get("authority") == "canonical"
         and metadata.get("source") == "obsidian"

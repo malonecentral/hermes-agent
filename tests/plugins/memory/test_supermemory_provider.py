@@ -21,6 +21,7 @@ from plugins.memory.supermemory import (
     _empty_direct_recall_guidance,
     _format_connection_summary,
     _format_prefetch_context,
+    _is_canonical_result,
     _load_supermemory_config,
     _verified_v4_import_ready,
 
@@ -144,6 +145,19 @@ def _canonical(memory, path, visibility):
         "identity_scope": "owner", "canonical_root": "owner",
         "visibility": visibility, "relative_path": path,
     }}
+
+
+def test_legacy_canonical_admission_accepts_string_schema_v4():
+    item = _canonical(
+        "evidence", "Jarvis/Family Shared/Food/Restaurants/Example.md", "family_shared",
+    )
+    item["metadata"]["schema_version"] = "4"
+    item["_source_container"] = "family_shared"
+    item["_source_custom_id"] = "obsidian-" + hashlib.sha256(
+        item["metadata"]["relative_path"].encode()
+    ).hexdigest()
+
+    assert _is_canonical_result(item, schema_v4_ready=False) is True
 
 
 def test_family_prefetch_is_canonical_shared_only_and_one_bounded_search(family_provider):
