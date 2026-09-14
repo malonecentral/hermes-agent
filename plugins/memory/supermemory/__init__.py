@@ -1892,11 +1892,6 @@ class SupermemoryMemoryProvider(MemoryProvider):
                     by_id[candidate["id"]] for candidate in candidates
                     if id(by_id[candidate["id"]]) in approved_object_ids
                 ][:_FAMILY_RERANK_FAILURE_FALLBACK_LIMIT]
-                # A scorer outage must not reopen Shared Notes when the
-                # provider returned one unambiguous schema-v4 restaurant
-                # parent. This is structural proof, not a venue-specific rule.
-                if _exact_restaurant_parent(selected_items) is not None:
-                    selected_items = _SufficientCanonicalResults(selected_items)
             logger.warning(
                 "supermemory_prefetch stage=reranker outcome=%s candidates=%d selected=%d "
                 "score_min=na score_max=na elapsed_ms=%d fallback=family_acl",
