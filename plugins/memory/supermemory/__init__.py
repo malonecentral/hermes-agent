@@ -1103,6 +1103,7 @@ def _format_prefetch_context(
     max_results: int,
     *,
     owner_context: bool = False,
+    family_context: bool = False,
     char_budget: int = _DEFAULT_CONTEXT_CHAR_BUDGET,
     byte_budget: int = _DEFAULT_CONTEXT_BYTE_BUDGET,
 ) -> str:
@@ -1124,7 +1125,7 @@ def _format_prefetch_context(
             memory = item.get("memory", "")
             if not memory:
                 continue
-            if owner_context:
+            if owner_context or family_context:
                 memory = re.sub(
                     r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]",
                     lambda match: (match.group(2) or match.group(1).rsplit("/", 1)[-1]).strip(),
@@ -1168,6 +1169,14 @@ def _format_prefetch_context(
             "order is not stated, answer that no usual order is recorded; never promote liked foods, occasional choices, or "
             "drinks into a usual order. If the requested identity differs from the selected record, "
             "state the mismatch rather than treating them as the same person. Answer in plain text facts; never emit Obsidian wikilinks. "
+        )
+    elif family_context:
+        intro += (
+            "This is read-only canonical Family Shared evidence for an authenticated Family requester. "
+            "It contains no Owner-private or conversational memory. Use only explicit facts below, preserve "
+            "person attribution and relationship direction, and never infer that a described person is the requester. "
+            "Canonical Family Shared evidence is authoritative. Prefer a terse direct answer, state when evidence is "
+            "missing or ambiguous, and never emit Obsidian wikilinks. "
         )
     intro += "Do not force memories into the conversation."
     body = "\n\n".join(sections)
@@ -1697,6 +1706,12 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._turn_count = 0
         self._config = _load_supermemory_config(self._hermes_home)
         self._api_key = get_secret("SUPERMEMORY_API_KEY", "") or ""
+        self._audience = os.environ.get("HERMES_MEMORY_AUDIENCE", "owner").strip().casefold()
+        if self._audience not in {"owner", "family"}:
+            self._audience = "owner"
+        self._family_mobile_reader = (
+            self._audience == "family" and kwargs.get("platform") == "api"
+        )
 
         # Resolve container tag: env var > config > default.
         # Supports {identity} template for profile-scoped containers.
@@ -1706,7 +1721,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._container_tag = _sanitize_tag(raw_tag.replace("{identity}", identity))
 
         self._auto_recall = self._config["auto_recall"]
-        self._auto_capture = self._config["auto_capture"]
+        self._auto_capture = self._config["auto_capture"] and self._audience != "family"
         self._max_recall_results = self._config["max_recall_results"]
         self._profile_frequency = self._config["profile_frequency"]
         self._capture_mode = self._config["capture_mode"]
@@ -1735,8 +1750,13 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._session_turns = []
 
         agent_context = kwargs.get("agent_context", "")
-        self._write_enabled = agent_context not in {"cron", "flush", "subagent"}
-        self._active = bool(self._api_key)
+        self._write_enabled = (
+            self._audience != "family"
+            and agent_context not in {"cron", "flush", "subagent"}
+        )
+        self._active = bool(self._api_key) and (
+            self._audience != "family" or self._family_mobile_reader
+        )
         self._client = None
         if self._active:
             try:
@@ -1758,6 +1778,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         if not self._active:
             return ""
+        if self._audience == "family":
+            return "# Family Shared memory\nRead-only canonical Family Shared evidence is prefetched automatically. No memory tools or conversational capture are available."
         lines = [
             "# Supermemory",
             f"Active. Container: {self._container_tag}.",
@@ -2151,7 +2173,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
             logger.warning("supermemory_prefetch stage=temporal outcome=invalid action=discard")
             return ""
         try:
-            canonical_owner = self._container_tag == _OWNER_CANONICAL_CONTAINER
+            family_reader = self._audience == "family"
+            canonical_owner = self._container_tag == _OWNER_CANONICAL_CONTAINER and not family_reader
             retrieval_query = _contextual_retrieval_query(query, retrieval_history)
             recall_query = _owner_canonical_query(retrieval_query) if canonical_owner else retrieval_query
             values: dict[str, Any] = {}
@@ -2163,6 +2186,25 @@ class SupermemoryMemoryProvider(MemoryProvider):
             deadline = configured_deadline - _PREFETCH_FORMAT_MARGIN
             if deadline <= time.monotonic():
                 return ""
+            if family_reader:
+                raw = self._client.search_documents(
+                    retrieval_query[:511], limit=_OWNER_SOURCE_CANDIDATE_LIMIT,
+                    container_tag=_OWNER_CANONICAL_CONTAINER,
+                    timeout=max(0.001, deadline - time.monotonic()),
+                )
+                family_results = _visible_canonical_results(
+                    list(raw or []), family=True, authenticated_family=True,
+                    schema_v4_ready=self._temporal_filters_schema_v4_ready,
+                )
+                search_results = self._rerank_owner_candidates(
+                    retrieval_query, family_results, deadline=deadline,
+                )
+                return _format_prefetch_context(
+                    static_facts=[], dynamic_facts=[], search_results=search_results,
+                    max_results=self._max_recall_results, family_context=True,
+                    char_budget=self._context_char_budget,
+                    byte_budget=self._context_byte_budget,
+                )
             if canonical_owner:
                 values, outcomes = self._parallel_owner_retrieval(
                     query, retrieval_query, recall_query, deadline, temporal_scope,
@@ -2443,6 +2485,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
         return sanitized
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        if self._audience == "family":
+            return []
         def with_kebab_aliases(schemas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             aliases = {
                 "supermemory_store": "supermemory-save",
@@ -2573,6 +2617,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return tool_error(f"Profile failed: {exc}")
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        if getattr(self, "_audience", "owner") == "family":
+            return tool_error("Memory tools are unavailable")
         if not self._active or not self._client:
             return tool_error("Supermemory is not configured")
         aliases = {

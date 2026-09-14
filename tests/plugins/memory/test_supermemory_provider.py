@@ -104,6 +104,82 @@ def provider(monkeypatch, tmp_path):
     return p
 
 
+@pytest.fixture
+def family_provider(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "family-read-key")
+    monkeypatch.setenv("HERMES_MEMORY_AUDIENCE", "family")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    monkeypatch.setattr(
+        "plugins.memory.supermemory._call_owner_reranker",
+        lambda query, candidates, **kwargs: {
+            "selected_ids": [candidate["id"] for candidate in candidates],
+            "rejected_ids": [], "sufficient": True,
+        },
+    )
+    p = SupermemoryMemoryProvider()
+    p.initialize("family-session", hermes_home=str(tmp_path), platform="api")
+    return p
+
+
+def _canonical(memory, path, visibility):
+    return {"id": path, "memory": memory, "metadata": {
+        "index_schema_version": 4, "authority": "canonical", "source": "obsidian",
+        "identity_scope": "owner", "canonical_root": "owner",
+        "visibility": visibility, "relative_path": path,
+    }}
+
+
+def test_family_prefetch_is_canonical_shared_only_and_one_bounded_search(family_provider):
+    family_provider._temporal_filters_schema_v4_ready = True
+    family_provider._client.search_results = [
+        _canonical("SHARED FACT", "Jarvis/Family Shared/People/Alice.md", "family_shared"),
+        _canonical("OWNER SECRET", "Jarvis/Private/Dennis.md", "owner_private"),
+        {"id": "conversation", "memory": "DENNIS CONVERSATION", "metadata": {
+            "type": "owner_conversation", "authority": "non-authoritative",
+        }},
+    ]
+    result = family_provider.prefetch("Who is Alice?")
+    assert "SHARED FACT" in result
+    assert "OWNER SECRET" not in result and "DENNIS CONVERSATION" not in result
+    assert len(family_provider._client.search_calls) == 1
+    call = family_provider._client.search_calls[0]
+    assert call["container_tag"] == "owner_primary" and call["search_mode"] == "documents"
+    assert family_provider._client.profile_queries == []
+
+
+def test_family_memory_is_read_only_without_model_tools_or_capture(family_provider):
+    assert family_provider.get_tool_schemas() == []
+    assert "unavailable" in family_provider.handle_tool_call("supermemory_search", {}).lower()
+    assert "No memory tools" in family_provider.system_prompt_block()
+    family_provider.sync_turn("remember my secret", "certainly", messages=[
+        {"role": "user", "content": "remember my secret"},
+    ])
+    family_provider.on_memory_write("add", "MEMORY.md", "private fact")
+    assert family_provider._client.add_calls == []
+
+
+def test_family_memory_audience_is_mobile_only(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "family-read-key")
+    monkeypatch.setenv("HERMES_MEMORY_AUDIENCE", "family")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    provider = SupermemoryMemoryProvider()
+    provider.initialize("discord-session", hermes_home=str(tmp_path), platform="discord")
+    assert provider.prefetch("shared fact") == ""
+    assert provider.system_prompt_block() == ""
+    assert provider.get_tool_schemas() == []
+
+
+def test_family_rejects_spoofed_visibility_and_malformed_shared_paths(family_provider):
+    family_provider._temporal_filters_schema_v4_ready = True
+    family_provider._client.search_results = [
+        _canonical("SPOOF A", "Jarvis/Private/Secret.md", "family_shared"),
+        _canonical("SPOOF B", "Jarvis/Family Shared/../Private.md", "family_shared"),
+        _canonical("VALID", "Jarvis/Family Shared/People/Valid.md", "family_shared"),
+    ]
+    result = family_provider.prefetch("valid")
+    assert "VALID" in result and "SPOOF" not in result
+
+
 
 def test_owner_dated_event_scope_prefers_matching_meal_header():
     dinner = {"id": "dinner", "memory": "### 2026-09-11 — dine-in dinner\n- Location: Ghost Ranch"}
