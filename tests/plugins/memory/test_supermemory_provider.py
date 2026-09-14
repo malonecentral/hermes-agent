@@ -4,11 +4,13 @@ import os
 import stat
 import threading
 import time
+from types import SimpleNamespace
 
 
 import pytest
 
 from agent.memory_manager import MemoryManager
+from agent.turn_context import compose_user_api_content
 from plugins.memory.supermemory import (
     SupermemoryMemoryProvider,
     _SupermemoryClient,
@@ -161,6 +163,7 @@ def test_family_prefetch_is_canonical_shared_only_and_one_bounded_search(family_
 
 def test_family_memory_is_read_only_without_model_tools_or_capture(family_provider):
     assert family_provider.get_tool_schemas() == []
+    assert family_provider.allows_automatic_context_without_tools() is True
     assert "unavailable" in family_provider.handle_tool_call("supermemory_search", {}).lower()
     assert "No memory tools" in family_provider.system_prompt_block()
     family_provider.sync_turn("remember my secret", "certainly", messages=[
@@ -168,6 +171,51 @@ def test_family_memory_is_read_only_without_model_tools_or_capture(family_provid
     ])
     family_provider.on_memory_write("add", "MEMORY.md", "private fact")
     assert family_provider._client.add_calls == []
+
+
+def test_family_manager_without_memory_toolset_injects_shared_evidence_first_call(family_provider):
+    from agent.memory_manager import inject_memory_provider_tools, memory_provider_prompt_exposed
+
+    family_provider._temporal_filters_schema_v4_ready = True
+    family_provider._client.search_results = [
+        _canonical("SHARED EVIDENCE", "Jarvis/Family Shared/People/Allowed.md", "family_shared"),
+        _canonical("OWNER PRIVATE", "Jarvis/Owner Private/Denied.md", "owner_private"),
+        {"id": "conversation", "memory": "CONVERSATION EVIDENCE", "metadata": {
+            "type": "owner_conversation", "source": "conversation",
+        }},
+    ]
+    manager = MemoryManager()
+    manager.add_provider(family_provider)
+    agent = SimpleNamespace(
+        _memory_manager=manager,
+        enabled_toolsets=["web_search"],
+        disabled_toolsets=None,
+        tools=[],
+        valid_tool_names=set(),
+    )
+
+    assert inject_memory_provider_tools(agent) == 0
+    assert agent.tools == []
+    assert memory_provider_prompt_exposed(agent) is True
+    evidence = manager.prefetch_all("Who is allowed?")
+    first_call_content = compose_user_api_content("Who is allowed?", evidence, "")
+
+    assert isinstance(first_call_content, str)
+    assert "SHARED EVIDENCE" in first_call_content
+    assert "OWNER PRIVATE" not in first_call_content
+    assert "CONVERSATION EVIDENCE" not in first_call_content
+
+
+@pytest.mark.parametrize("attribute,value", [
+    ("_active", False),
+    ("_family_mobile_reader", False),
+    ("_audience", "owner"),
+    ("_auto_capture", True),
+    ("_write_enabled", True),
+])
+def test_family_context_only_capability_fails_closed(family_provider, attribute, value):
+    setattr(family_provider, attribute, value)
+    assert family_provider.allows_automatic_context_without_tools() is False
 
 
 def test_family_memory_audience_is_mobile_only(monkeypatch, tmp_path):

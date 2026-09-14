@@ -1797,6 +1797,17 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 lines.append(f"\n{self._custom_container_instructions}")
         return "\n".join(lines)
 
+    def allows_automatic_context_without_tools(self) -> bool:
+        """Allow only authenticated Family mobile read-only evidence mode."""
+        return bool(
+            self._active
+            and self._family_mobile_reader
+            and self._audience == "family"
+            and not self._auto_capture
+            and not self._write_enabled
+            and not self.get_tool_schemas()
+        )
+
     def _rerank_owner_candidates(
         self, query: str, items: list[dict], *, deadline: Optional[float] = None,
         trusted_conversation_items: Optional[list[dict]] = None,

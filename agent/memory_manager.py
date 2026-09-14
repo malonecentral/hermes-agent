@@ -166,6 +166,31 @@ def memory_provider_tools_exposed(agent: Any) -> bool:
     )
 
 
+def memory_provider_prompt_exposed(agent: Any) -> bool:
+    """Whether provider system context may be included for ``agent``.
+
+    Ordinarily prompt and tool exposure remain coupled. A provider can narrowly
+    opt into context-only operation for an initialized read-only mode; failures
+    and legacy providers remain fail-closed.
+    """
+    if memory_provider_tools_exposed(agent):
+        return True
+    manager = getattr(agent, "_memory_manager", None)
+    for provider in (getattr(manager, "providers", None) or []):
+        allow = getattr(provider, "allows_automatic_context_without_tools", None)
+        if callable(allow):
+            try:
+                if allow():
+                    return True
+            except Exception:
+                logger.warning(
+                    "Memory provider %s context-only capability check failed",
+                    getattr(provider, "name", type(provider).__name__),
+                    exc_info=True,
+                )
+    return False
+
+
 def inject_memory_provider_tools(agent: Any) -> int:
     """Append external memory-provider tool schemas to an agent tool surface."""
     memory_manager = getattr(agent, "_memory_manager", None)
@@ -191,8 +216,7 @@ def inject_memory_provider_tools(agent: Any) -> int:
             logger.info(
                 "Memory provider(s) %s configured but the 'memory' toolset is "
                 "gated off for this session (platform_toolsets / "
-                "agent.disabled_toolsets) — provider tools and system-prompt "
-                "block are both withheld.",
+                "agent.disabled_toolsets) — provider tools are withheld.",
                 [getattr(p, "name", type(p).__name__) for p in _providers],
             )
         return 0

@@ -1000,12 +1000,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 volatile_parts.append(user_block)
 
     # External memory provider system prompt block (additive to built-in).
-    # Gated on the same check ``inject_memory_provider_tools`` uses so we
-    # never advertise provider tools that the agent's toolset configuration
-    # has already gated off (#81014).
+    # Normally gated with provider tools so we never advertise tools that do
+    # not exist (#81014). Initialized read-only providers may explicitly opt
+    # into automatic context-only operation.
     if agent._memory_manager:
         try:
-            from agent.memory_manager import memory_provider_tools_exposed as _mem_exposed
+            from agent.memory_manager import memory_provider_prompt_exposed as _mem_exposed
         except Exception:
             _mem_exposed = None
         if _mem_exposed is None or _mem_exposed(agent):

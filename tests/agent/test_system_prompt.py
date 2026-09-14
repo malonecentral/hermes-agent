@@ -3,7 +3,7 @@
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
@@ -590,6 +590,38 @@ class TestMemoryProviderSystemPromptGating:
         )
         full = _build(build_system_prompt, _memory_manager=agent._memory_manager,
                       enabled_toolsets=["web_search"], disabled_toolsets=None)
+        assert block not in full
+
+    def test_context_only_provider_block_survives_absent_memory_toolset(self):
+        block = "READ_ONLY_AUTOMATIC_EVIDENCE_SENTINEL"
+        manager = self._make_fake_manager(block)
+        provider = MagicMock()
+        provider.allows_automatic_context_without_tools.return_value = True
+        manager.providers = [provider]
+
+        full = _build(
+            build_system_prompt,
+            _memory_manager=manager,
+            enabled_toolsets=["web_search"],
+            disabled_toolsets=None,
+        )
+
+        assert block in full
+
+    def test_context_only_capability_failure_is_fail_closed(self):
+        block = "CONTEXT_MUST_STAY_HIDDEN"
+        manager = self._make_fake_manager(block)
+        provider = MagicMock()
+        provider.allows_automatic_context_without_tools.side_effect = RuntimeError("bad state")
+        manager.providers = [provider]
+
+        full = _build(
+            build_system_prompt,
+            _memory_manager=manager,
+            enabled_toolsets=["web_search"],
+            disabled_toolsets=None,
+        )
+
         assert block not in full
 
 

@@ -175,6 +175,15 @@ class MemoryProvider(ABC):
         """
         return ""
 
+    def allows_automatic_context_without_tools(self) -> bool:
+        """Whether this provider may supply prompt context with no tool surface.
+
+        The default is deliberately fail-closed. Providers should opt in only
+        for an initialized, read-only mode whose evidence is injected
+        automatically and whose prompt block does not advertise callable tools.
+        """
+        return False
+
     def prefetch(
         self, query: str, *, session_id: str = "", deadline: Optional[float] = None,
     ) -> str:
