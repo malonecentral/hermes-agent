@@ -157,11 +157,62 @@ def test_family_prefetch_is_canonical_shared_only_and_one_bounded_search(family_
     ]
     result = family_provider.prefetch("Who is Alice?")
     assert "SHARED FACT" in result
+    assert "validated as relevant and sufficient" in result
+    assert "without calling any tool" in result
     assert "OWNER SECRET" not in result and "DENNIS CONVERSATION" not in result
     assert len(family_provider._client.search_calls) == 1
     call = family_provider._client.search_calls[0]
     assert call["container_tag"] == "family_shared" and call["search_mode"] == "documents"
     assert family_provider._client.profile_queries == []
+
+
+def test_single_canonical_candidate_requires_explicit_sufficiency(family_provider, monkeypatch):
+    family_provider._temporal_filters_schema_v4_ready = True
+    family_provider._client.search_results = [
+        _canonical("THIN MATCH", "Jarvis/Family Shared/People/Alice.md", "family_shared"),
+        _canonical("UNRELATED MATCH", "Jarvis/Family Shared/People/Bob.md", "family_shared"),
+    ]
+    calls = []
+    monkeypatch.setattr(
+        "plugins.memory.supermemory._call_owner_reranker",
+        lambda query, candidates, **kwargs: (
+            calls.append((query, candidates))
+            or {"selected_ids": [], "rejected_ids": [candidate["id"] for candidate in candidates], "sufficient": False}
+        ),
+    )
+
+    assert family_provider.prefetch("What does Alice order?") == ""
+    assert len(calls) == 1
+
+
+def test_owner_sufficient_canonical_evidence_closes_tool_fallback(provider, monkeypatch):
+    provider._temporal_filters_schema_v4_ready = True
+    item = _canonical("Dennis prefers tea.", "Jarvis/Owner Private/People/Dennis.md", "owner_private")
+    monkeypatch.setattr(
+        "plugins.memory.supermemory._call_owner_reranker",
+        lambda query, candidates, **kwargs: {
+            "selected_ids": [candidates[0]["id"]], "rejected_ids": [], "sufficient": True,
+        },
+    )
+    selected = provider._rerank_owner_candidates("What does Dennis prefer?", [item])
+    context = _format_prefetch_context([], [], selected, 5, owner_context=True)
+
+    assert "validated as relevant and sufficient" in context
+    assert "without calling any tool" in context
+
+
+def test_conversation_only_sufficiency_does_not_close_tool_fallback(provider):
+    item = {"id": "conversation", "memory": "[role: user]\nI like tea.\n[user:end]", "metadata": {
+        "type": "owner_conversation", "authority": "non-authoritative",
+        "provenance": "user-authored role-delimited statement",
+    }}
+    selected = provider._rerank_owner_candidates(
+        "What do I like?", [item], trusted_conversation_items=[item],
+    )
+    context = _format_prefetch_context([], [], selected, 5, owner_context=True)
+
+    assert "validated as relevant and sufficient" not in context
+    assert "without calling any tool" not in context
 
 
 def test_family_memory_is_read_only_without_model_tools_or_capture(family_provider):
