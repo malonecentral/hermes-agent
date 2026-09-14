@@ -123,6 +123,9 @@ def family_provider(monkeypatch, tmp_path):
     monkeypatch.setenv("SUPERMEMORY_API_KEY", "family-read-key")
     monkeypatch.setenv("HERMES_MEMORY_AUDIENCE", "family")
     monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    (tmp_path / "supermemory.json").write_text(
+        json.dumps({"container_tag": "family_shared"}), encoding="utf-8"
+    )
     monkeypatch.setattr(
         "plugins.memory.supermemory._call_owner_reranker",
         lambda query, candidates, **kwargs: {
@@ -157,7 +160,7 @@ def test_family_prefetch_is_canonical_shared_only_and_one_bounded_search(family_
     assert "OWNER SECRET" not in result and "DENNIS CONVERSATION" not in result
     assert len(family_provider._client.search_calls) == 1
     call = family_provider._client.search_calls[0]
-    assert call["container_tag"] == "owner_primary" and call["search_mode"] == "documents"
+    assert call["container_tag"] == "family_shared" and call["search_mode"] == "documents"
     assert family_provider._client.profile_queries == []
 
 
@@ -222,6 +225,7 @@ def test_family_memory_audience_is_mobile_only(monkeypatch, tmp_path):
     monkeypatch.setenv("SUPERMEMORY_API_KEY", "family-read-key")
     monkeypatch.setenv("HERMES_MEMORY_AUDIENCE", "family")
     monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    (tmp_path / "supermemory.json").write_text(json.dumps({"container_tag": "family_shared"}))
     provider = SupermemoryMemoryProvider()
     provider.initialize("discord-session", hermes_home=str(tmp_path), platform="discord")
     assert provider.prefetch("shared fact") == ""
@@ -1160,7 +1164,7 @@ def _v4_restaurant(path, source, *, document_id="doc-venue"):
         "id": document_id,
         "custom_id": "obsidian-" + hashlib.sha256(path.encode()).hexdigest(),
         "content": prefix + source, "metadata": metadata,
-        "container_tags": ["owner_primary"], "task_type": "superrag", "status": "done",
+        "container_tags": ["family_shared"], "task_type": "superrag", "status": "done",
         "updated_at": "2026-09-13T00:00:00Z",
     }
     return chunk, document

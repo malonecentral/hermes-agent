@@ -46,6 +46,7 @@ _MAX_ENTITY_CONTEXT_LENGTH = 1500
 _DEFAULT_BASE_URL = "https://api.supermemory.ai"
 _API_KEY_URL = "http://app.supermemory.ai/integrations?connect=hermes"
 _OWNER_CANONICAL_CONTAINER = "owner_primary"
+_FAMILY_CANONICAL_CONTAINER = "family_shared"
 _OWNER_CONVERSATION_CONTAINER = "owner_conversations"
 _OWNER_RERANK_URL = "http://mcomen.malonecentral.com:8082/rerank"
 _OWNER_RERANK_MODEL = "qwen3-reranker-0.6b-q8_0.gguf"
@@ -1724,6 +1725,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
         raw_tag = env_tag or self._config["container_tag"]
         identity = kwargs.get("agent_identity", "default")
         self._container_tag = _sanitize_tag(raw_tag.replace("{identity}", identity))
+        # Provider-level namespace separation is the primary Family boundary;
+        # metadata/path admission below remains defense in depth.
+        if self._family_mobile_reader and self._container_tag != _FAMILY_CANONICAL_CONTAINER:
+            self._family_mobile_reader = False
 
         self._auto_recall = self._config["auto_recall"]
         self._auto_capture = self._config["auto_capture"] and self._audience != "family"
@@ -1975,7 +1980,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
         valid = (
             parent_id in {document.get("id"), document.get("custom_id")}
             and document.get("custom_id") == expected_custom_id
-            and _OWNER_CANONICAL_CONTAINER in document.get("container_tags", [])
+            and (
+                (_FAMILY_CANONICAL_CONTAINER if metadata.get("visibility") == "family_shared"
+                 else _OWNER_CANONICAL_CONTAINER) in document.get("container_tags", [])
+            )
             and document.get("task_type") == "superrag"
             and document.get("status") == "done"
             and metadata == (candidate.get("metadata") or {})
@@ -2087,8 +2095,13 @@ class SupermemoryMemoryProvider(MemoryProvider):
             "profile": (False, lambda timeout: client.get_profile(
                 query=recall_query[:200], timeout=timeout, augment_search=False,
             )),
-            "canonical": (True, lambda timeout: client.search_documents(
+            "canonical_private": (True, lambda timeout: client.search_documents(
                 recall_query[:511], limit=_OWNER_SOURCE_CANDIDATE_LIMIT, container_tag=_OWNER_CANONICAL_CONTAINER,
+                **({"filters": temporal_filters} if temporal_filters else {}),
+                timeout=timeout,
+            )),
+            "canonical_shared": (True, lambda timeout: client.search_documents(
+                recall_query[:511], limit=_OWNER_SOURCE_CANDIDATE_LIMIT, container_tag=_FAMILY_CANONICAL_CONTAINER,
                 **({"filters": temporal_filters} if temporal_filters else {}),
                 timeout=timeout,
             )),
@@ -2177,6 +2190,9 @@ class SupermemoryMemoryProvider(MemoryProvider):
         results = self._client.search_documents(
             recall_query[:511], limit=20, container_tag=_OWNER_CANONICAL_CONTAINER,
         )
+        results += self._client.search_documents(
+            recall_query[:511], limit=20, container_tag=_FAMILY_CANONICAL_CONTAINER,
+        )
         results = _authoritative_search_results(results)
         results = _scope_owner_named_person_results(owner_query, results)
         results, _named_restaurant = _scope_owner_restaurant_results(owner_query, results)
@@ -2221,7 +2237,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             if family_reader:
                 raw = self._client.search_documents(
                     retrieval_query[:511], limit=_OWNER_SOURCE_CANDIDATE_LIMIT,
-                    container_tag=_OWNER_CANONICAL_CONTAINER,
+                    container_tag=_FAMILY_CANONICAL_CONTAINER,
                     timeout=max(0.001, deadline - time.monotonic()),
                 )
                 family_results = _visible_canonical_results(
@@ -2241,15 +2257,16 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 values, outcomes = self._parallel_owner_retrieval(
                     query, retrieval_query, recall_query, deadline, temporal_scope,
                 )
-                if outcomes.get("canonical") != "ok":
+                if any(outcomes.get(name) != "ok" for name in ("canonical_private", "canonical_shared")):
                     logger.warning(
                         "supermemory_prefetch stage=canonical outcome=%s required=true action=discard",
-                        outcomes.get("canonical", "missing"),
+                        "error",
                     )
                     return ""
                 profile = values.get("profile") or {"static": [], "dynamic": [], "search_results": []}
                 profile_results = list(profile.get("search_results") or [])
-                profile_results += list(values.get("canonical") or [])
+                profile_results += list(values.get("canonical_private") or [])
+                profile_results += list(values.get("canonical_shared") or [])
                 profile_results += list(values.get("fallback") or [])
             else:
                 # Preserve the common provider's historical one-call fast path.
@@ -2286,7 +2303,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 search_results = _scope_owner_person_sections(retrieval_query, search_results)
                 if (
                     not search_results
-                    and outcomes.get("canonical") == "ok"
+                    and outcomes.get("canonical_private") == "ok"
+                    and outcomes.get("canonical_shared") == "ok"
                     and outcomes.get("conversation") == "ok"
                 ):
                     guidance = _empty_direct_recall_guidance(query, retrieval_context)

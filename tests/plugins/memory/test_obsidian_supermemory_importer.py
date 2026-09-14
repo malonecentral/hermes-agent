@@ -23,6 +23,8 @@ def test_exact_acl_path_and_immutable_identity(importer):
     shared = importer.item("Jarvis/Family Shared/Food.md", b"hello")
     assert shared["visibility"] == "family_shared"
     assert shared["identity_scope"] == shared["canonical_root"] == "owner"
+    assert importer.container_for_doc(shared) == "family_shared"
+    assert importer.container_for_doc(importer.item("People/Dennis.md", b"hello")) == "owner_primary"
     for similar in ("Family Shared/Food.md", "Jarvis/family shared/Food.md", "Jarvis/Family Sharedness/Food.md", "JarvisX/Family Shared/Food.md"):
         assert importer.item(similar, b"hello")["visibility"] == "owner_private"
 
@@ -545,8 +547,9 @@ def test_schema_v3_delete_fault_is_fail_closed_and_resumable(importer, tmp_path)
 
 def test_schema_v4_backfill_container_isolation_never_touches_conversations(importer):
     assert importer.CONTAINER == "owner_primary"
+    assert importer.FAMILY_CONTAINER == "family_shared"
     assert importer.CONVERSATION_CONTAINER == "owner_conversations"
-    assert importer.CONTAINER != importer.CONVERSATION_CONTAINER
+    assert len({importer.CONTAINER, importer.FAMILY_CONTAINER, importer.CONVERSATION_CONTAINER}) == 3
 
 
 def test_schema_v4_backfill_cli_requires_all_explicit_counts(importer, monkeypatch):
