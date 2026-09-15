@@ -17,6 +17,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from supermemory import Supermemory
+from plugins.memory.supermemory.canonical_policy import (
+    CANONICAL_CONTAINERS,
+    FAMILY_CONTAINER,
+    OWNER_CONTAINER,
+    canonical_scope_from_path,
+    canonical_visibility_from_path,
+    stable_custom_id_from_path,
+)
 from plugins.memory.supermemory.search_v4 import normalize_document_chunk, search_documents_v4
 
 ROOT = Path('/Users/dennis/Documents/ObsidianVault/Personal/Hermes').resolve()
@@ -24,8 +32,7 @@ ENV = Path('/Users/dennis/.hermes/.env')
 OUT = Path('/Users/dennis/.hermes/obsidian-supermemory-import.json')
 LOCK = Path('/Users/dennis/.hermes/obsidian-supermemory-sync.lock')
 BASE_URL = 'http://127.0.0.1:6767'
-CONTAINER = 'owner_primary'
-FAMILY_CONTAINER = 'family_shared'
+CONTAINER = OWNER_CONTAINER
 CONVERSATION_CONTAINER = 'owner_conversations'
 INDEX_SCHEMA_VERSION = 4
 SENSITIVE_CONTENT = re.compile(
@@ -38,19 +45,22 @@ class ReconciliationRequired(RuntimeError):
     """Backend identity could not be proven; mutation must stop."""
 
 def normalized_relative_path(rel: str) -> Path:
-    if not isinstance(rel, str) or not rel or "\\" in rel or "\x00" in rel:
+    if canonical_scope_from_path(rel) is None:
         raise ValueError("invalid canonical path")
-    path = Path(rel)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts) or path.as_posix() != rel or not rel.endswith(".md"):
-        raise ValueError("invalid canonical path")
-    return path
+    return Path(rel)
 
 def visibility_for_path(rel: str) -> str:
-    return "family_shared" if normalized_relative_path(rel).parts[:2] == ("Jarvis", "Family Shared") else "owner_private"
+    normalized_relative_path(rel)
+    visibility = canonical_visibility_from_path(rel)
+    assert visibility is not None
+    return visibility
 
 
 def container_for_doc(doc: dict[str, Any]) -> str:
-    return FAMILY_CONTAINER if doc['visibility'] == 'family_shared' else CONTAINER
+    scope = canonical_scope_from_path(doc.get('relative_path'))
+    if scope is None or doc.get('visibility') != canonical_visibility_from_path(doc.get('relative_path')):
+        raise ValueError('invalid canonical projection')
+    return scope
 
 
 def container_for_row(row: dict[str, Any]) -> str:
@@ -120,6 +130,8 @@ def canonical_documents() -> list[dict[str, Any]]:
             for name in sorted(names):
                 if name == '.obsidian' or name.startswith('.'):
                     continue
+                if directory_key == '.' and name not in {'Jarvis', 'Skills'}:
+                    continue
                 mode = os.stat(name, dir_fd=directory_fd, follow_symlinks=False).st_mode
                 if stat.S_ISLNK(mode):
                     raise OSError(f'Canonical directory symlink is not allowed: {Path(directory) / name}')
@@ -169,7 +181,7 @@ def item(rel: str, raw: bytes) -> dict[str, Any]:
     governed = {k: fields[k] for k in ("fact_subject", "fact_key", "fact_value", "person_id", "entity_id") if fields.get(k)}
     event_date = trusted_event_date(parsed); parsed_date = date.fromisoformat(event_date) if event_date else None
     identity_lines = ["[canonical-identity]"] + [f"{k}: {v}" for k, v in identity.items() if v] + ["[/canonical-identity]"]
-    return {"relative_path": rel, "sha256": hashlib.sha256(raw).hexdigest(), "custom_id": "obsidian-" + hashlib.sha256(rel.encode()).hexdigest(), "bytes": len(raw), "content": "\n".join(identity_lines) + "\n\n" + source, "identity": identity, "governed_identity": governed, "event_date": event_date, "event_date_ordinal": parsed_date.toordinal() if parsed_date else None, "event_year": parsed_date.year if parsed_date else None, "event_month": parsed_date.month if parsed_date else None, "visibility": visibility_for_path(rel), "identity_scope": "owner", "canonical_root": "owner", "is_template": entity_type.endswith("-template") or path.stem.lower().endswith("template")}
+    return {"relative_path": rel, "sha256": hashlib.sha256(raw).hexdigest(), "custom_id": stable_custom_id_from_path(rel), "bytes": len(raw), "content": "\n".join(identity_lines) + "\n\n" + source, "identity": identity, "governed_identity": governed, "event_date": event_date, "event_date_ordinal": parsed_date.toordinal() if parsed_date else None, "event_year": parsed_date.year if parsed_date else None, "event_month": parsed_date.month if parsed_date else None, "visibility": visibility_for_path(rel), "identity_scope": "owner", "canonical_root": "owner", "is_template": entity_type.endswith("-template") or path.stem.lower().endswith("template")}
 
 
 def metadata(doc: dict[str, Any]) -> dict[str, Any]:
@@ -352,6 +364,7 @@ def verify_search_readiness(
     return {
         'search_verified_count': verified,
         'search_failure_count': len(failed_paths),
+        'search_failed_paths': failed_paths,
         'search_readiness_complete': verified == len(current) and not failed_paths,
     }
 
@@ -424,6 +437,316 @@ def schema_v4_backend_inventory(client: Supermemory, expected_custom_ids: set[st
                 raise ReconciliationRequired('backend pagination could not prove identity')
             page += 1
     return found
+
+
+def _alias(obj: Any, snake: str, camel: str, default: Any = None) -> Any:
+    """Read one SDK/wire alias, rejecting disagreeing duplicate representations."""
+    marker = object()
+    left = _field(obj, snake, marker)
+    right = _field(obj, camel, marker)
+    if left is not marker and right is not marker and left != right:
+        raise ReconciliationRequired('ambiguous provider response aliases')
+    return left if left is not marker else right if right is not marker else default
+
+
+def _page_integer(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ReconciliationRequired('provider pagination metadata is invalid')
+    if isinstance(value, float) and (not value.is_integer() or not value < float('inf')):
+        raise ReconciliationRequired('provider pagination metadata is invalid')
+    return int(value)
+
+
+def provider_inventory(client: Supermemory) -> dict[str, tuple[dict[str, Any], ...]]:
+    """Exhaustively list each canonical container without filtering or mutation."""
+    result: dict[str, tuple[dict[str, Any], ...]] = {}
+    for container in sorted(CANONICAL_CONTAINERS):
+        collected: list[dict[str, Any]] = []
+        requested = 1
+        seen: set[int] = set()
+        declared_total: int | None = None
+        declared_items: int | None = None
+        while True:
+            response = client.documents.list(
+                container_tags=[container], include_content=False, limit=100,
+                page=requested, timeout=30.0,
+            )
+            rows = _field(response, 'memories')
+            if not isinstance(rows, (list, tuple)):
+                raise ReconciliationRequired('provider inventory rows are malformed')
+            pagination = _field(response, 'pagination')
+            if pagination is None:
+                raise ReconciliationRequired('provider pagination metadata is unavailable')
+            current = _page_integer(_alias(pagination, 'current_page', 'currentPage'))
+            total = _page_integer(_alias(pagination, 'total_pages', 'totalPages'))
+            total_items = _page_integer(_alias(pagination, 'total_items', 'totalItems'))
+            if declared_total is not None and total != declared_total:
+                raise ReconciliationRequired('provider pagination is inconsistent')
+            if declared_items is not None and total_items != declared_items:
+                raise ReconciliationRequired('provider pagination is inconsistent')
+            declared_total = total
+            declared_items = total_items
+            if total == 0:
+                if current == requested == 1 and total_items == 0 and not rows:
+                    break
+                raise ReconciliationRequired('provider pagination could not prove inventory')
+            if current != requested or current in seen or current < 1 or total < current or total > 10000:
+                raise ReconciliationRequired('provider pagination could not prove inventory')
+            seen.add(current)
+            if current < total and not rows:
+                raise ReconciliationRequired('provider pagination has a missing page')
+            for raw in rows:
+                if not isinstance(raw, dict) and not hasattr(raw, 'model_dump'):
+                    raise ReconciliationRequired('provider inventory row is malformed')
+                row = dict(raw) if isinstance(raw, dict) else raw.model_dump()
+                row['_inventory_container'] = container
+                collected.append(row)
+            if current == total:
+                break
+            requested = current + 1
+        if declared_total and seen != set(range(1, declared_total + 1)):
+            raise ReconciliationRequired('provider pagination has missing pages')
+        if declared_total and declared_items != len(collected):
+            raise ReconciliationRequired('provider pagination item count is inconsistent')
+        result[container] = tuple(collected)
+    return result
+
+
+def _explicit_container_claim_agrees(row: dict[str, Any], container: str) -> bool:
+    """Accept at most one exact provider container claim and reject alias ambiguity."""
+    claims: list[tuple[Any, bool]] = []
+    marker = object()
+    for name, plural in (
+        ('container_tags', True), ('containerTags', True),
+        ('container_tag', False), ('containerTag', False),
+    ):
+        value = _field(row, name, marker)
+        if value is not marker:
+            claims.append((value, plural))
+    if not claims:
+        return True
+    if len(claims) != 1:
+        return False
+    value, plural = claims[0]
+    return (type(value) is list and value == [container]) if plural else (
+        type(value) is str and value == container
+    )
+
+
+def _trusted_orphan_path(row: dict[str, Any], source_container: str) -> str | None:
+    """Return a delete-safe path only when the row independently proves identity."""
+    try:
+        custom_id = _alias(row, 'custom_id', 'customId')
+        metadata_value = _field(row, 'metadata')
+        ident = _field(row, 'id')
+        inventory_container = _field(row, '_inventory_container', source_container)
+        state = status_name(row)
+        if (not isinstance(custom_id, str) or not isinstance(ident, str) or not ident
+                or not isinstance(metadata_value, dict) or source_container not in CANONICAL_CONTAINERS
+                or inventory_container != source_container or state != 'done'):
+            return None
+        rel = metadata_value.get('relative_path')
+        derived_container = canonical_scope_from_path(rel)
+        expected_visibility = canonical_visibility_from_path(rel)
+        if (derived_container is None or derived_container != source_container
+                or custom_id != stable_custom_id_from_path(rel)):
+            return None
+        if not _explicit_container_claim_agrees(row, derived_container):
+            return None
+        sha256 = metadata_value.get('content_sha256')
+        byte_count = metadata_value.get('content_bytes')
+        required = {
+            'source': 'obsidian', 'authority': 'canonical',
+            'relative_path': rel, 'index_schema_version': INDEX_SCHEMA_VERSION,
+            'visibility': expected_visibility, 'identity_scope': 'owner',
+            'canonical_root': 'owner', 'canonical_path': rel,
+        }
+        if (any(metadata_value.get(key) != value for key, value in required.items())
+                or not isinstance(sha256, str) or re.fullmatch(r'[0-9a-f]{64}', sha256) is None
+                or isinstance(byte_count, bool) or not isinstance(byte_count, int) or byte_count < 0):
+            return None
+        return rel
+    except ReconciliationRequired:
+        return None
+
+
+def _raw_identity_tokens(row: Any) -> tuple[set[tuple[str, str]], bool]:
+    """Extract every usable raw identity claim without trusting normalization."""
+    if not isinstance(row, dict):
+        return set(), True
+    claims: dict[str, set[str]] = {'path': set(), 'custom_id': set(), 'backend_id': set()}
+    for name in ('custom_id', 'customId'):
+        value = row.get(name)
+        if isinstance(value, str) and value:
+            claims['custom_id'].add(value)
+    for name in ('id', 'document_id', 'documentId'):
+        value = row.get(name)
+        if isinstance(value, str) and value:
+            claims['backend_id'].add(value)
+    metadata_value = row.get('metadata')
+    if isinstance(metadata_value, dict):
+        for name in ('relative_path', 'relativePath', 'canonical_path', 'canonicalPath'):
+            value = metadata_value.get(name)
+            if isinstance(value, str) and value:
+                claims['path'].add(value)
+    ambiguous = any(len(values) > 1 for values in claims.values())
+    return {(kind, value) for kind, values in claims.items() for value in values}, ambiguous
+
+
+def _globally_tainted_rows(rows: list[tuple[str, Any]]) -> tuple[set[int], set[tuple[str, str]]]:
+    """Taint complete raw-identity components containing a collision or ambiguity."""
+    tokens_by_row: list[set[tuple[str, str]]] = []
+    ambiguous_rows: set[int] = set()
+    owners: dict[tuple[str, str], list[int]] = {}
+    for index, (_, row) in enumerate(rows):
+        tokens, ambiguous = _raw_identity_tokens(row)
+        tokens_by_row.append(tokens)
+        if ambiguous:
+            ambiguous_rows.add(index)
+        for token in tokens:
+            owners.setdefault(token, []).append(index)
+
+    parent = list(range(len(rows)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    collision_rows: set[int] = set()
+    for indexes in owners.values():
+        if len(indexes) > 1:
+            collision_rows.update(indexes)
+            for index in indexes[1:]:
+                union(indexes[0], index)
+    tainted_roots = {find(index) for index in collision_rows | ambiguous_rows}
+    tainted_rows = {index for index in range(len(rows)) if find(index) in tainted_roots}
+    tainted_tokens = set().union(*(tokens_by_row[index] for index in tainted_rows)) if tainted_rows else set()
+    return tainted_rows, tainted_tokens
+
+
+def classify_inventory(
+        current: dict[str, dict[str, Any]],
+        inventory: dict[str, tuple[dict[str, Any], ...]]) -> dict[str, tuple[str, ...]]:
+    """Classify the closed canonical/provider sets using path-only diagnostics."""
+    categories: dict[str, set[str]] = {name: set() for name in (
+        'expected', 'missing', 'duplicate_expected_custom_ids', 'wrong_container',
+        'trusted_orphans', 'untrusted_orphans', 'pending', 'failed', 'malformed',
+        'stale_hash', 'stale_byte_count', 'status', 'identity_collision',
+    )}
+    expected_by_id = {doc['custom_id']: doc for doc in current.values()}
+    matches: dict[str, list[dict[str, Any]]] = {key: [] for key in expected_by_id}
+    orphan_candidates: list[tuple[str | None, dict[str, Any], str | None]] = []
+    raw_rows = [(container, raw) for container in sorted(inventory) for raw in inventory[container]]
+    tainted_rows, tainted_tokens = _globally_tainted_rows(raw_rows)
+    if tainted_rows:
+        categories['identity_collision'].add('*')
+    for row_index, (container, raw) in enumerate(raw_rows):
+        if not isinstance(raw, dict):
+            categories['malformed'].add('*')
+            continue
+        row = dict(raw)
+        row['_identity_tainted'] = row_index in tainted_rows
+        try:
+            custom_id = _alias(row, 'custom_id', 'customId')
+            metadata_value = _field(row, 'metadata')
+            ident = _field(row, 'id')
+            if (not isinstance(custom_id, str) or not isinstance(ident, str) or not ident
+                    or not isinstance(metadata_value, dict)):
+                raise ValueError
+        except (ValueError, ReconciliationRequired):
+            categories['malformed'].add('*')
+            if str(_field(row, 'custom_id', _field(row, 'customId', ''))).startswith('obsidian-'):
+                categories['untrusted_orphans'].add('*')
+            continue
+        row.setdefault('_inventory_container', container)
+        if custom_id in matches:
+            matches[custom_id].append(row)
+        elif custom_id.startswith('obsidian-'):
+            candidate_path = metadata_value.get('relative_path')
+            if (canonical_scope_from_path(candidate_path) is None
+                    or custom_id != stable_custom_id_from_path(candidate_path)):
+                candidate_path = None
+            orphan_candidates.append(
+                (_trusted_orphan_path(row, container), row, candidate_path)
+            )
+
+    for path, row, candidate_path in orphan_candidates:
+        if (path is not None and candidate_path is not None
+                and not row['_identity_tainted']):
+            categories['trusted_orphans'].add(path)
+        else:
+            categories['untrusted_orphans'].add('*')
+
+    for custom_id, doc in expected_by_id.items():
+        rel = doc['relative_path']
+        rows = matches[custom_id]
+        if not rows:
+            if ('custom_id', custom_id) in tainted_tokens:
+                categories['expected'].add(rel)
+                continue
+            categories['missing'].add(rel)
+            continue
+        categories['expected'].add(rel)
+        if any(row['_identity_tainted'] for row in rows):
+            continue
+        if len(rows) > 1:
+            categories['duplicate_expected_custom_ids'].add(rel)
+        for row in rows:
+            if row['_inventory_container'] != container_for_doc(doc):
+                categories['wrong_container'].add(rel)
+            actual = row['metadata']
+            if actual.get('content_sha256') != doc['sha256']:
+                categories['stale_hash'].add(rel)
+            if actual.get('content_bytes') != doc['bytes']:
+                categories['stale_byte_count'].add(rel)
+            state = status_name(row)
+            if state != 'done':
+                categories['status'].add(rel)
+            if state in {'queued', 'extracting', 'chunking', 'embedding', 'indexing', 'processing'}:
+                categories['pending'].add(rel)
+            elif state in {'failed', 'error'}:
+                categories['failed'].add(rel)
+            elif state != 'done':
+                categories['malformed'].add(rel)
+    return {name: tuple(sorted(paths)) for name, paths in categories.items()}
+
+
+def reconciliation_plan(classification: dict[str, tuple[str, ...]]) -> tuple[dict[str, str], ...]:
+    """Return a deterministic, path-only plan; this function cannot mutate."""
+    replace_reasons = ('duplicate_expected_custom_ids', 'wrong_container', 'pending',
+                       'failed', 'malformed', 'stale_hash', 'stale_byte_count', 'status')
+    reasons_by_path: dict[str, set[str]] = {}
+    for reason in replace_reasons:
+        for path in classification.get(reason, ()):
+            if path != '*':
+                reasons_by_path.setdefault(path, set()).add(reason)
+    plan = [
+        {'action': 'add', 'relative_path': path, 'reason': 'missing'}
+        for path in classification.get('missing', ())
+    ]
+    plan.extend(
+        {'action': 'replace', 'relative_path': path, 'reason': ','.join(sorted(reasons))}
+        for path, reasons in reasons_by_path.items() if path not in classification.get('missing', ())
+    )
+    plan.extend(
+        {'action': 'delete', 'relative_path': path, 'reason': 'trusted_orphan'}
+        for path in classification.get('trusted_orphans', ())
+    )
+    review_reasons = tuple(sorted(
+        reason for reason in ('identity_collision', 'malformed', 'untrusted_orphans')
+        if '*' in classification.get(reason, ())
+    ))
+    if review_reasons:
+        plan.append({'action': 'operator_review', 'relative_path': '*',
+                     'reason': ','.join(review_reasons)})
+    return tuple(sorted(plan, key=lambda row: (row['relative_path'], row['action'], row['reason'])))
 
 
 def build_schema_v4_backfill_plan(
@@ -850,8 +1173,31 @@ def parse_args() -> argparse.Namespace:
 
 
 def eligible_documents(scanned: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    return {doc['relative_path']: doc for doc in scanned
-            if not SENSITIVE_CONTENT.search(doc['content']) and not doc['is_template']}
+    return project_canonical_documents(scanned)['documents']
+
+
+def project_canonical_documents(scanned: list[dict[str, Any]]) -> dict[str, Any]:
+    """Validate and filter a scan into a deterministic path-only projection."""
+    documents: dict[str, dict[str, Any]] = {}
+    excluded: list[dict[str, str]] = []
+    for doc in sorted(scanned, key=lambda value: value.get('relative_path', '')):
+        rel = doc.get('relative_path')
+        scope = canonical_scope_from_path(rel)
+        if scope is None or not isinstance(rel, str) or doc.get('custom_id') != stable_custom_id_from_path(rel):
+            raise ValueError('invalid canonical projection')
+        if doc.get('visibility') != canonical_visibility_from_path(rel):
+            raise ValueError('invalid canonical projection')
+        if not isinstance(doc.get('sha256'), str) or not isinstance(doc.get('bytes'), int):
+            raise ValueError('invalid canonical projection')
+        reason = ('sensitive_content' if SENSITIVE_CONTENT.search(doc.get('content', ''))
+                  else 'template' if doc.get('is_template') else '')
+        if reason:
+            excluded.append({'relative_path': rel, 'reason': reason})
+        else:
+            if rel in documents:
+                raise ValueError('duplicate canonical path')
+            documents[rel] = doc
+    return {'documents': documents, 'excluded': tuple(excluded)}
 
 
 def backend_reconcile_all(client: Supermemory, current: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -876,6 +1222,7 @@ def verify_backend(client: Supermemory, current: dict[str, dict[str, Any]]) -> d
     return {
         'backend_verified_count': verified,
         'failure_count': len(failed_paths),
+        'failed_paths': failed_paths,
         'verification_complete': verified == len(current) and not failed_paths,
     }
 

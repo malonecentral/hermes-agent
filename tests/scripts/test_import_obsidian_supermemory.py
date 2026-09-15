@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path.home() / ".hermes/scripts/import-obsidian-supermemory.py"
+SCRIPT = Path(__file__).resolve().parents[2] / "scripts/import-obsidian-supermemory.py"
 
 
 @pytest.fixture(scope="module")
@@ -24,9 +24,12 @@ def test_exact_acl_path_and_immutable_identity(importer):
     assert shared["visibility"] == "family_shared"
     assert shared["identity_scope"] == shared["canonical_root"] == "owner"
     assert importer.container_for_doc(shared) == "family_shared"
-    assert importer.container_for_doc(importer.item("People/Dennis.md", b"hello")) == "owner_primary"
-    for similar in ("Family Shared/Food.md", "Jarvis/family shared/Food.md", "Jarvis/Family Sharedness/Food.md", "JarvisX/Family Shared/Food.md"):
+    assert importer.container_for_doc(importer.item("Skills/Dennis.md", b"hello")) == "owner_primary"
+    for similar in ("Jarvis/family shared/Food.md", "Jarvis/Family Sharedness/Food.md"):
         assert importer.item(similar, b"hello")["visibility"] == "owner_private"
+    for unapproved in ("Family Shared/Food.md", "JarvisX/Family Shared/Food.md"):
+        with pytest.raises(ValueError, match="canonical path"):
+            importer.item(unapproved, b"hello")
 
 
 @pytest.mark.parametrize("path", ["../x.md", "Jarvis/../x.md", "/x.md", "Jarvis\\Family Shared\\x.md", "./x.md", "x.txt"])
@@ -205,14 +208,14 @@ def test_verify_only_is_read_only_and_does_not_consult_manifest_or_lock(importer
     lock = tmp_path / "sync.lock"
     monkeypatch.setattr(importer, "OUT", manifest)
     monkeypatch.setattr(importer, "LOCK", lock)
-    private = importer.item("People/Ada.md", b"private")
+    private = importer.item("Skills/Ada.md", b"private")
     shared = importer.item("Jarvis/Family Shared/Food.md", b"shared")
     calls = []
 
     class Documents:
         def list(self, **kwargs):
             calls.append(("list", kwargs["page"]))
-            doc = private if "People/Ada.md" in str(kwargs["filters"]) else shared
+            doc = private if "Skills/Ada.md" in str(kwargs["filters"]) else shared
             return {"memories": [_remote(importer, doc)],
                     "pagination": {"current_page": 1, "total_pages": 1}}
         def add(self, **kwargs): raise AssertionError("verify-only called add")
@@ -224,6 +227,9 @@ def test_verify_only_is_read_only_and_does_not_consult_manifest_or_lock(importer
     monkeypatch.setattr(importer, "atomic_receipt", lambda payload: (_ for _ in ()).throw(AssertionError("manifest write")))
     monkeypatch.setattr(importer, "Supermemory", lambda **kwargs: type("Client", (), {"documents": Documents()})())
     monkeypatch.setattr(importer, "api_key", lambda: "key")
+    monkeypatch.setattr(importer, "completion_readiness", lambda client, current: {
+        "reconciliation_complete": True,
+    })
     monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--verify-only"])
 
     importer.main()
@@ -233,6 +239,7 @@ def test_verify_only_is_read_only_and_does_not_consult_manifest_or_lock(importer
                       "owner_private_count": 1, "family_shared_count": 1,
                       "backend_verified_count": 2, "failure_count": 0,
                       "failed_paths": [], "verification_complete": True,
+                      "reconciliation_complete": True,
                       "verify_only": True, "filesystem_mutated": False,
                       "backend_mutated": False}
     assert calls == [("list", 1), ("list", 1)]
@@ -252,7 +259,7 @@ def test_verify_only_exits_nonzero_when_any_document_is_incomplete(importer, mon
     with pytest.raises(SystemExit) as exc:
         importer.main()
     assert exc.value.code == 1
-    assert [call[0] for call in calls] == ["list"]
+    assert [call[0] for call in calls] and all(call[0] == "list" for call in calls)
     result = json.loads(capsys.readouterr().out)
     assert result["failed_paths"] == ["x.md"]
     assert result["verification_complete"] is False
@@ -308,13 +315,13 @@ def test_verify_only_exhausts_pagination_and_rejects_duplicates(importer):
     {"metadata": {}},
 ])
 def test_verify_only_reports_path_only_for_backend_mismatch(importer, change):
-    doc = importer.item("private/secret-name.md", b"content")
+    doc = importer.item("Skills/secret-name.md", b"content")
     remote = _remote(importer, doc, **change)
     client, _ = _recovery_client(listed=[remote])
     result = importer.verify_backend(client, {doc["relative_path"]: doc})
     assert result["verification_complete"] is False
     assert result["failure_count"] == 1
-    assert result["failed_paths"] == ["private/secret-name.md"]
+    assert result["failed_paths"] == ["Skills/secret-name.md"]
     assert set(result) == {"backend_verified_count", "failure_count", "failed_paths", "verification_complete"}
 
 
@@ -379,7 +386,7 @@ def _previous_row(importer, doc, **overrides):
 
 
 def test_schema_v4_backfill_plans_all_verified_legacy_records(importer):
-    private = [importer.item(f"People/Private-{index}.md", f"private-{index}".encode())
+    private = [importer.item(f"Skills/Private-{index}.md", f"private-{index}".encode())
                for index in range(133)]
     shared = [importer.item(f"Jarvis/Family Shared/Shared-{index}.md", f"shared-{index}".encode())
               for index in range(104)]
@@ -390,12 +397,14 @@ def test_schema_v4_backfill_plans_all_verified_legacy_records(importer):
 
     class Documents:
         def list(self, **kwargs):
-            assert kwargs["container_tags"] == ["owner_primary"]
             assert kwargs["include_content"] is True
+            container = kwargs["container_tags"][0]
             page = kwargs["page"]
-            values = list(remotes.values())
+            values = [remote for rel, remote in remotes.items()
+                      if importer.container_for_doc(docs[rel]) == container]
+            total_pages = (len(values) + 99) // 100
             return {"memories": values[(page - 1) * 100:page * 100],
-                    "pagination": {"current_page": page, "total_pages": 3}}
+                    "pagination": {"current_page": page, "total_pages": total_pages}}
 
     plan = importer.build_schema_v4_backfill_plan(
         type("Client", (), {"documents": Documents()})(), docs, previous,
@@ -446,7 +455,12 @@ def test_schema_v4_backfill_rejects_unexpected_removed_paths(importer):
 def test_schema_v4_backfill_rejects_unverified_legacy_record(importer, change, message):
     doc = importer.item("x.md", b"content")
     remote = _legacy_remote(importer, doc) | change
-    client, _ = _recovery_client(listed=[remote])
+    class Documents:
+        def list(self, **kwargs):
+            rows = [remote] if kwargs["container_tags"] == [importer.CONTAINER] else []
+            return {"memories": rows, "pagination": {
+                "current_page": 1, "total_pages": 1 if rows else 0}}
+    client = type("Client", (), {"documents": Documents()})()
     with pytest.raises(importer.ReconciliationRequired, match=message):
         importer.build_schema_v4_backfill_plan(
             client, {"x.md": doc}, {"x.md": _previous_row(importer, doc)},
@@ -479,7 +493,7 @@ def test_schema_v4_backfill_requires_exact_canonical_byte_metadata(importer, key
 
 def test_logical_v3_snapshot_is_private_hashed_and_exact(importer, tmp_path):
     doc = importer.item("x.md", b"content")
-    remote = _legacy_remote(importer, doc)
+    remote = _legacy_remote(importer, doc) | {"_inventory_container": importer.CONTAINER}
     path = tmp_path / "private" / "logical-v3.json"
     plan = {"already_v4": 0, "replacements": {"x.md": {}},
             "inventory": {doc["custom_id"]: remote}}
@@ -496,7 +510,9 @@ def test_logical_v3_snapshot_is_private_hashed_and_exact(importer, tmp_path):
 
 
 def _write_snapshot(importer, tmp_path, doc):
-    legacy = _legacy_remote(importer, doc)
+    legacy = _legacy_remote(importer, doc) | {
+        "_inventory_container": importer.container_for_doc(doc),
+    }
     path = tmp_path / "logical-v3.json"
     importer.create_logical_v3_snapshot(path, {doc["relative_path"]: doc},
         {"already_v4": 0, "replacements": {doc["relative_path"]: {}},
@@ -512,6 +528,8 @@ def test_schema_v3_inverse_deletes_only_verified_v4_and_restores_exact_snapshot(
     class Documents:
         def list(self, **kwargs):
             calls.append(("list", kwargs["container_tags"]))
+            if kwargs["container_tags"] != [importer.CONTAINER]:
+                return {"memories": [], "pagination": {"current_page": 1, "total_pages": 0}}
             row = replacement if any(c[0] == "add" for c in calls) else v4
             return {"memories": [row], "pagination": {"current_page": 1, "total_pages": 1}}
         def delete(self, ident, timeout): calls.append(("delete", ident))
@@ -534,7 +552,9 @@ def test_schema_v3_delete_fault_is_fail_closed_and_resumable(importer, tmp_path)
     v4 = _remote(importer, doc, content=doc["content"])
     class Documents:
         def list(self, **kwargs):
-            return {"memories": [v4], "pagination": {"current_page": 1, "total_pages": 1}}
+            rows = [v4] if kwargs["container_tags"] == [importer.CONTAINER] else []
+            return {"memories": rows, "pagination": {
+                "current_page": 1, "total_pages": 1 if rows else 0}}
         def delete(self, ident, timeout): raise RuntimeError("injected delete fault")
         def add(self, **kwargs): raise AssertionError("add after failed delete")
     with pytest.raises(RuntimeError, match="injected"):
