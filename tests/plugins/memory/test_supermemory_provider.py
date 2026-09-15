@@ -1203,6 +1203,7 @@ def test_owner_named_parlay_recall_excludes_zipps_person_collision(provider):
         ("What do I like from Ike's?", "Ike's Love & Sandwiches"),
         ("What do I like from McDonald's?", "McDonald's"),
         ("What do I like from Zipp's?", "Zipp's"),
+        ("Have my parents been to Jay Alexander's?", "J. Alexander's - Chandler"),
     ],
 )
 def test_possessive_restaurant_names_scope_exact_canonical_venue_without_leakage(query, venue):

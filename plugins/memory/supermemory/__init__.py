@@ -906,14 +906,27 @@ def _scope_owner_restaurant_results(query: str, results: list) -> tuple[list, bo
         # when ordinary questions name only the venue. Both are canonical IDs.
         # Canonical chain names can likewise extend a possessive brand
         # ("Ike's Love & Sandwiches") that people naturally shorten to
-        # "Ike's".  Derive that alias from the canonical name itself rather
-        # than maintaining a venue-specific alias table.
+        # "Ike's".  Derive aliases from the canonical name itself rather than
+        # maintaining a venue-specific alias table. A leading written initial
+        # may also be spoken as its English letter name ("J." -> "Jay").
         variants = [name]
         if " - " in name:
             variants.append(name.split(" - ", 1)[0])
         possessive_brand = re.match(r"^(.+?['’]s)(?:\s|$)", name, re.IGNORECASE)
         if possessive_brand:
             variants.append(possessive_brand.group(1))
+        spoken_letters = {
+            "a": "ay", "b": "bee", "c": "see", "d": "dee", "e": "ee",
+            "f": "ef", "g": "gee", "h": "aitch", "i": "eye", "j": "jay",
+            "k": "kay", "l": "el", "m": "em", "n": "en", "o": "oh",
+            "p": "pee", "q": "cue", "r": "ar", "s": "ess", "t": "tee",
+            "u": "you", "v": "vee", "w": "double you", "x": "ex",
+            "y": "why", "z": "zee",
+        }
+        for value in list(variants):
+            initial = re.match(r"^([A-Za-z])\.\s*(.+)$", value)
+            if initial:
+                variants.append(f"{spoken_letters[initial.group(1).casefold()]} {initial.group(2)}")
         return [key for key in (_restaurant_key(value) for value in variants) if key]
 
     named = [
