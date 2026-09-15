@@ -572,7 +572,26 @@ def _default_config() -> dict:
         "enable_custom_container_tags": False,
         "custom_containers": [],
         "custom_container_instructions": "",
+        # Production topology contract. These defaults intentionally reproduce
+        # the currently deployed routes; requester-specific capture remains off.
+        "owner_canonical_container": "owner_primary",
+        "owner_explicit_container": "owner_primary",
+        "family_shared_container": "family_shared",
+        "owner_conversation_container": "owner_conversations",
+        "requester_conversation_projection": False,
+        "requester_identity_server": "",
+        "requester_conversation_namespace_key": "",
     }
+
+
+def _validated_topology_tag(value: Any, default: str) -> str:
+    """Return one exact provider-safe tag or its backward-compatible default."""
+    return (
+        value
+        if isinstance(value, str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_]{0,127}", value)
+        else default
+    )
 
 
 def _sanitize_tag(raw: str) -> str:
@@ -674,6 +693,32 @@ def _load_supermemory_config(hermes_home: str) -> dict:
     else:
         config["custom_containers"] = []
     config["custom_container_instructions"] = str(config.get("custom_container_instructions", "")).strip()
+
+    topology_defaults = {
+        "owner_canonical_container": "owner_primary",
+        "owner_explicit_container": "owner_primary",
+        "family_shared_container": "family_shared",
+        "owner_conversation_container": "owner_conversations",
+    }
+    for key, default in topology_defaults.items():
+        config[key] = _validated_topology_tag(config.get(key), default)
+    config["requester_identity_server"] = _validated_topology_tag(
+        config.get("requester_identity_server"), ""
+    )
+    namespace_key = config.get("requester_conversation_namespace_key")
+    config["requester_conversation_namespace_key"] = (
+        namespace_key
+        if isinstance(namespace_key, str) and len(namespace_key.encode("utf-8")) >= 32
+        else ""
+    )
+    requested_projection = _as_bool(
+        config.get("requester_conversation_projection"), False
+    )
+    config["requester_conversation_projection"] = bool(
+        requested_projection
+        and config["requester_identity_server"]
+        and config["requester_conversation_namespace_key"]
+    )
 
     return config
 

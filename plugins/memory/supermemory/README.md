@@ -61,6 +61,15 @@ Config file: `$HERMES_HOME/supermemory.json`
 | `canonical_document_search_mode` | `documents` | Canonical retrieval uses `/v4/search` in document-only mode; other values normalize to `documents`. Independent of conversation search. |
 | `entity_context` | built-in default | Extraction guidance passed to Supermemory |
 | `api_timeout` | `5.0` | Timeout for SDK and ingest requests |
+| `owner_canonical_container` | `owner_primary` | Validated Owner canonical-document topology tag. Contract-only in A1; current retrieval behavior is unchanged. |
+| `owner_explicit_container` | `owner_primary` | Validated Owner explicit-memory topology tag. Contract-only in A1. |
+| `family_shared_container` | `family_shared` | Validated Family Shared canonical-document topology tag. Contract-only in A1. |
+| `owner_conversation_container` | `owner_conversations` | Validated Owner conversation topology tag. Contract-only in A1. |
+| `requester_conversation_projection` | `false` | Advertise requester-specific Family conversation routing. It remains disabled unless both trusted identity projection and a namespace key are configured; A1 does not wire capture or retrieval. |
+| `requester_identity_server` | empty | MCP server name whose request-local `jarvisRequester.person_id` projection is supplied by the authenticated registry integration. Display names and local registry files are never accepted. |
+| `requester_conversation_namespace_key` | empty | At least 32 UTF-8 bytes used as the HMAC-SHA256 namespace key for opaque stable container tags. Keep `$HERMES_HOME/supermemory.json` owner-only. Missing/invalid keys disable the capability. |
+
+The topology fields above define routing contracts for staged production work.
 
 ### Environment Variables
 
