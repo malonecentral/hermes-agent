@@ -5,6 +5,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -93,6 +95,48 @@ def test_public_reseal_and_wrong_missing_replaced_keys_fail(importer, tmp_path):
     assert importer.read_receipt_key(key_path) is None
     key_path.write_bytes(b"y" * 32); key_path.chmod(0o600)
     assert importer.read_receipt_key(key_path) != key
+
+
+@pytest.mark.parametrize("boundary", [
+    "after_stage_storage", "after_stage_vector", "after_stage_manifest",
+    "after_prepared_marker", "after_recover_storage", "after_recover_vector",
+    "after_recover_manifest", "after_committed_marker", "after_marker_cleanup",
+])
+def test_publication_recovers_after_abrupt_process_death(importer, tmp_path, boundary):
+    docs, inventory, observations, _, _, _, _, _, now = _proofs(importer, tmp_path)
+    root = tmp_path / "private"
+    importer.publish_readiness_pair(root, docs, inventory, observations, "old:generation", now)
+    children = [child for _, child in importer.PUBLICATION_ARTIFACTS]
+    old = [importer.private_json_read(root, child) for child in children]
+    payload = json.dumps({"root": str(root), "docs": docs, "inventory": inventory,
+                          "observations": observations, "now": now.isoformat(),
+                          "boundary": boundary})
+    code = f'''\
+import importlib.util, json, os, sys
+from datetime import datetime
+spec=importlib.util.spec_from_file_location("crash_importer", {str(SCRIPT)!r})
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+p=json.loads(sys.stdin.read())
+def die(point):
+    if point == p["boundary"]: os._exit(91)
+m.publish_readiness_pair(m.Path(p["root"]), p["docs"], p["inventory"],
+    p["observations"], "new:generation", datetime.fromisoformat(p["now"]),
+    fault_injector=die)
+'''
+    result = subprocess.run([sys.executable, "-c", code], input=payload, text=True,
+                            cwd=SCRIPT.parents[1], check=False)
+    assert result.returncode == 91
+    importer.recover_publication(root)
+    after = [importer.private_json_read(root, child) for child in children]
+    generations = {row["generation"] for row in after}
+    assert generations in ({"old:generation"}, {"new:generation"})
+    assert after == old or generations == {"new:generation"}
+    key = importer.read_receipt_key(root / "readiness/receipt-hmac.key")
+    assert importer.validate_readiness_receipts(
+        after[0], after[1], key=key,
+        current_fingerprint=importer.source_fingerprint_from_documents(docs), now=now)
+    assert after[2]["generation"] == after[0]["generation"] == after[1]["generation"]
+    assert not (root / importer.PUBLICATION_MARKER).exists()
 
 
 def test_key_file_security_generation_and_rotation_are_explicit(importer, tmp_path):

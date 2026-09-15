@@ -4,17 +4,20 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import hmac
 import inspect
 import json
 import os
+import plistlib
 import re
 import secrets
 import stat
+import sys
 import tempfile
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable
@@ -1227,6 +1230,50 @@ def _open_private_parent(root_fd: int, parts: tuple[str, ...], *, create: bool) 
         raise
 
 
+def _read_confined_regular(path: Path, *, label: str) -> bytes:
+    """Read an absolute regular file through a no-follow descriptor walk."""
+    _require_private_io_capabilities()
+    path = Path(path)
+    if not path.is_absolute() or path == Path('/') or any(part in {'.', '..'} for part in path.parts[1:]):
+        raise PrivateArtifactError(f'{label} must be a canonical absolute path')
+    current = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for name in path.parts[1:-1]:
+            before = os.stat(name, dir_fd=current, follow_symlinks=False)
+            _verify_trusted_ancestor(before, label=f'{label} ancestor')
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+            after = os.fstat(child)
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                os.close(child)
+                raise PrivateArtifactError(f'{label} ancestry changed during open')
+            os.close(current)
+            current = child
+        before = os.stat(path.name, dir_fd=current, follow_symlinks=False)
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current)
+        try:
+            after = os.fstat(fd)
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                raise PrivateArtifactError(f'{label} identity changed during open')
+            if not stat.S_ISREG(after.st_mode) or after.st_uid != os.getuid():
+                raise PrivateArtifactError(f'{label} is not a trusted regular file')
+            chunks = []
+            while True:
+                block = os.read(fd, 65536)
+                if not block:
+                    break
+                chunks.append(block)
+            linked = os.stat(path.name, dir_fd=current, follow_symlinks=False)
+            if (linked.st_dev, linked.st_ino) != (after.st_dev, after.st_ino):
+                raise PrivateArtifactError(f'{label} changed during read')
+            return b''.join(chunks)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise PrivateArtifactError(f'{label} is unavailable: {type(exc).__name__}') from None
+    finally:
+        os.close(current)
+
+
 def _json_bytes(payload: Any) -> bytes:
     try:
         return (json.dumps(_plain_json(payload), ensure_ascii=False, sort_keys=True,
@@ -1402,8 +1449,10 @@ class DurableReconciliationExecutor:
         self.sleep = sleep
         self.poll_limit = poll_attempts if poll_attempts is not None else poll_limit
         self.fault_injector = fault_injector
-        self.snapshot_path = self.private_root / 'snapshots/forward.json'
-        self.journal_path = self.private_root / 'journals/forward.json'
+        self.snapshot_path = self.private_root / 'transactions/unbound/snapshot.json'
+        self.journal_path = self.private_root / 'transactions/unbound/forward-journal.json'
+        self._snapshot_child = ''
+        self._journal_child = ''
         self._plan: tuple[dict[str, Any], ...] = ()
         self._transaction_id = ''
         self._snapshot_digest: str | None = None
@@ -1419,10 +1468,10 @@ class DurableReconciliationExecutor:
         )
         state = thaw_transaction_journal(validated)
         self._fault('before_journal_write')
-        digest = private_json_write(self.private_root, 'journals/forward.json', state)
+        digest = private_json_write(self.private_root, self._journal_child, state)
         self._fault('after_journal_write')
         persisted = private_json_read(
-            self.private_root, 'journals/forward.json', expected_sha256=digest,
+            self.private_root, self._journal_child, expected_sha256=digest,
         )
         validate_transaction_journal(
             persisted, self._plan, expected_transaction_id=self._transaction_id,
@@ -1522,10 +1571,10 @@ class DurableReconciliationExecutor:
                                  for c in sorted(CANONICAL_CONTAINERS)},
         }
         self._fault('before_snapshot_write')
-        digest = private_json_write(self.private_root, 'snapshots/forward.json', payload)
+        digest = private_json_write(self.private_root, self._snapshot_child, payload)
         self._fault('after_snapshot_write')
         if not _exact_json_equal(private_json_read(
-                self.private_root, 'snapshots/forward.json', expected_sha256=digest), payload):
+                self.private_root, self._snapshot_child, expected_sha256=digest), payload):
             raise ReconciliationRequired('snapshot read-back mismatch')
         self._fault('snapshot_verified')
         return digest
@@ -1632,6 +1681,11 @@ class DurableReconciliationExecutor:
         self._plan = _validated_transaction_plan(plan)
         self._transaction_id = transaction_id
         _validate_transaction_id(transaction_id)
+        prefix = f'transactions/{transaction_id}'
+        self._snapshot_child = f'{prefix}/snapshot.json'
+        self._journal_child = f'{prefix}/forward-journal.json'
+        self.snapshot_path = self.private_root / self._snapshot_child
+        self.journal_path = self.private_root / self._journal_child
         self._validate_current(current)
         journal_exists = self.journal_path.is_file()
         if not journal_exists:
@@ -1672,7 +1726,7 @@ class DurableReconciliationExecutor:
                 transaction_id, self._plan, snapshot_digest=self._snapshot_digest,
             ))
         else:
-            raw = private_json_read(self.private_root, 'journals/forward.json')
+            raw = private_json_read(self.private_root, self._journal_child)
             snapshot_digest = raw.get('snapshot_digest') if isinstance(raw, dict) else None
             if not _is_sha256(snapshot_digest):
                 raise TransactionJournalError('transaction snapshot digest mismatch')
@@ -1682,7 +1736,7 @@ class DurableReconciliationExecutor:
                 expected_snapshot_digest=snapshot_digest,
             )
             private_json_read(
-                self.private_root, 'snapshots/forward.json', expected_sha256=snapshot_digest,
+                self.private_root, self._snapshot_child, expected_sha256=snapshot_digest,
             )
             state = thaw_transaction_journal(validate_transaction_journal(
                 raw, self._plan, expected_transaction_id=transaction_id,
@@ -1966,6 +2020,7 @@ class DurableRollbackExecutor:
         self.plan: tuple[dict[str, Any], ...] = ()
         self.expected_pre: list[dict[str, Any]] = []
         self.expected_post: dict[str, dict[str, Any]] = {}
+        self._rollback_child = ''
 
     def _fault(self, point: str) -> None:
         if self.fault_injector:
@@ -1993,9 +2048,9 @@ class DurableRollbackExecutor:
     def _write(self, state: dict[str, Any]) -> dict[str, Any]:
         validate_rollback_journal(state, self.plan, **self.bindings)
         self._fault('before_rollback_journal_write')
-        digest = private_json_write(self.private_root, 'journals/rollback.json', state)
+        digest = private_json_write(self.private_root, self._rollback_child, state)
         self._fault('after_rollback_journal_write')
-        persisted = private_json_read(self.private_root, 'journals/rollback.json', expected_sha256=digest)
+        persisted = private_json_read(self.private_root, self._rollback_child, expected_sha256=digest)
         validate_rollback_journal(persisted, self.plan, **self.bindings)
         return persisted
 
@@ -2085,7 +2140,7 @@ class DurableRollbackExecutor:
                 or stable_custom_id_from_path(rel) != expected['custom_id']
                 or any(meta.get(key) != value for key, value in required.items())):
             return False
-        logical_content = content.split(marker, 1)[1].rstrip(' \t\r\n')
+        logical_content = content.split(marker, 1)[1]
         return (hashlib.sha256(logical_content.encode()).hexdigest() == expected['sha256']
                 and len(logical_content.encode()) == expected['bytes'])
 
@@ -2202,14 +2257,18 @@ class DurableRollbackExecutor:
     def execute(self, forward_plan: Any, forward_transaction_id: str,
                 rollback_transaction_id: str = 'rollback') -> dict[str, Any]:
         forward_plan = _validated_transaction_plan(forward_plan)
-        forward_raw = private_json_read(self.private_root, 'journals/forward.json')
+        _validate_transaction_id(forward_transaction_id)
+        _validate_transaction_id(rollback_transaction_id)
+        forward_prefix = f'transactions/{forward_transaction_id}'
+        self._rollback_child = f'transactions/{rollback_transaction_id}/rollback-journal.json'
+        forward_raw = private_json_read(self.private_root, f'{forward_prefix}/forward-journal.json')
         snapshot_digest = forward_raw.get('snapshot_digest')
         if not _is_sha256(snapshot_digest): raise TransactionJournalError('forward snapshot binding is invalid')
         forward = validate_transaction_journal(forward_raw, forward_plan,
             expected_transaction_id=forward_transaction_id, expected_snapshot_digest=snapshot_digest)
         if any(row['stage'] != 'done' for row in forward['records']):
             raise ReconciliationRequired('forward transaction is not complete')
-        snapshot = private_json_read(self.private_root, 'snapshots/forward.json',
+        snapshot = private_json_read(self.private_root, f'{forward_prefix}/snapshot.json',
                                      expected_sha256=snapshot_digest)
         if (snapshot.get('transaction_id') != forward_transaction_id
                 or snapshot.get('plan_digest') != transaction_plan_digest(forward_plan)):
@@ -2223,12 +2282,12 @@ class DurableRollbackExecutor:
         self.expected_pre = expected_pre
         self.plan = _rollback_plan(forward_plan, snapshot)
         forward_digest = _canonical_digest(forward_raw)
-        journal_path = self.private_root / 'journals/rollback.json'
+        journal_path = self.private_root / self._rollback_child
         if journal_path.is_file():
             # Once inverse mutations begin the forward post-state intentionally no
             # longer exists. Re-derive it from the validated forward plan and bound
             # pre-snapshot before trusting any rollback journal field or provider read.
-            state = private_json_read(self.private_root, 'journals/rollback.json')
+            state = private_json_read(self.private_root, self._rollback_child)
             self.bindings = dict(rollback_transaction_id=rollback_transaction_id,
                 forward_transaction_id=forward_transaction_id,
                 forward_plan_digest=transaction_plan_digest(forward_plan),
@@ -3056,7 +3115,7 @@ def write_verified_readiness_receipts(
     }
 
 
-def main() -> None:
+def legacy_main() -> None:
     global OUT
     args = parse_args()
     if args.manifest is not None:
@@ -3345,6 +3404,789 @@ def main() -> None:
         if (not receipt['reconciliation_complete'] or failures or pending or final_counts.get('pending', 0)
                 or final_counts.get('failed', 0) or final_counts.get('error', 0)):
             raise SystemExit(1)
+
+
+# Phase-2 command surface.  The original flags above remain accepted for the
+# migration utility, but all scheduled/new invocations use these explicit
+# subcommands and the durable executors.
+PHASE2_COMMANDS = frozenset({
+    'dry-run', 'plan', 'verify-only', 'reconcile', 'rollback', 'key-init', 'key-rotate',
+    'install', 'reload-instructions', 'legacy-reconcile',
+})
+
+
+def _phase2_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description='Secure canonical-memory reconciliation')
+    sub = parser.add_subparsers(dest='command', required=True)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument('--source-root', type=Path, required=True)
+    common.add_argument('--private-root', type=Path, required=True)
+    common.add_argument('--manifest', type=Path)
+    common.add_argument('--base-url', default=BASE_URL)
+    sub.add_parser('dry-run', parents=[common])
+    plan = sub.add_parser('plan', parents=[common])
+    plan.add_argument('--transaction-id', required=True, type=_transaction_id_argument)
+    sub.add_parser('verify-only', parents=[common])
+    reconcile = sub.add_parser('reconcile', parents=[common])
+    reconcile.add_argument('--execute', action='store_true', required=True)
+    reconcile.add_argument('--transaction-id', required=True, type=_transaction_id_argument)
+    reconcile.add_argument('--confirm-plan', required=True, type=_plan_digest_argument)
+    reconcile.add_argument('--confirm', required=True,
+                           help='Must exactly equal the transaction id')
+    reconcile.add_argument('--plist', type=Path, required=True,
+                           help='Installed LaunchAgent plist to preserve in the backup')
+    reconcile.add_argument('--first-install', action='store_true',
+                           help='Approve absent legacy manifest/plist only for a reviewed first install')
+    rollback = sub.add_parser('rollback')
+    rollback.add_argument('--private-root', type=Path, required=True)
+    rollback.add_argument('--transaction-id', required=True, type=_transaction_id_argument)
+    rollback.add_argument('--forward-transaction-id', required=True, type=_transaction_id_argument)
+    rollback.add_argument('--confirm', required=True,
+                          help='Must exactly equal ROLLBACK:<forward transaction id>')
+    rollback.add_argument('--base-url', default=BASE_URL)
+    for name in ('key-init', 'key-rotate'):
+        key = sub.add_parser(name)
+        key.add_argument('--private-root', type=Path, required=True)
+    install = sub.add_parser('install')
+    install.add_argument('--tracked-importer', type=Path, required=True)
+    install.add_argument('--expected-sha256', required=True)
+    install.add_argument('--stable-path', type=Path, required=True)
+    install.add_argument('--backup-root', type=Path, required=True)
+    install.add_argument('--plist', type=Path, required=True)
+    install.add_argument('--interpreter', type=Path, required=True)
+    reload_parser = sub.add_parser('reload-instructions')
+    reload_parser.add_argument('--plist', type=Path, required=True)
+    legacy = sub.add_parser('legacy-reconcile', add_help=False)
+    legacy.add_argument('legacy_args', nargs=argparse.REMAINDER)
+    return parser
+
+
+def _transaction_id_argument(value: str) -> str:
+    try:
+        _validate_transaction_id(value)
+    except TransactionJournalError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return value
+
+
+def _plan_digest_argument(value: str) -> str:
+    if not _is_sha256(value):
+        raise argparse.ArgumentTypeError('plan digest must be 64 lowercase hexadecimal characters')
+    return value
+
+
+def _phase2_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
+    root = Path(args.private_root)
+    manifest = args.manifest or root / 'manifest/current.json'
+    return (root, manifest, root / 'readiness/storage-reconciliation.json',
+            root / 'readiness/vector-readiness.json')
+
+
+def _preflight_phase2_paths(args: argparse.Namespace) -> None:
+    """Reject unsafe input/output topology before clients, locks, or writes."""
+    root = Path(args.private_root)
+    source = Path(args.source_root)
+    if (not root.is_absolute() or not source.is_absolute()
+            or any(part in {'.', '..'} for part in root.parts[1:] + source.parts[1:])):
+        raise SystemExit('source and private roots must be canonical absolute paths')
+    if source.is_symlink() or not source.is_dir():
+        raise SystemExit('source root must be a real directory')
+    manifest = Path(args.manifest) if args.manifest is not None else root / 'manifest/current.json'
+    if not manifest.is_absolute():
+        raise SystemExit('manifest path must be absolute')
+    try:
+        child = manifest.relative_to(root).as_posix()
+    except ValueError:
+        raise SystemExit('manifest must be confined below private root') from None
+    _private_child_parts(child)
+    if root.exists():
+        fd = _open_private_root(root, create=False)
+        os.close(fd)
+        if manifest.exists():
+            private_json_read(root, child)
+    elif args.command not in {'dry-run'}:
+        raise SystemExit('private root must already exist')
+
+
+def _client(base_url: str) -> Supermemory:
+    # Credentials are obtained only from private configuration and are never
+    # accepted on argv or included in summaries.
+    return Supermemory(api_key=api_key(), base_url=base_url, timeout=30.0, max_retries=1)
+
+
+def _scan_at(root: Path) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    global ROOT
+    old = ROOT
+    try:
+        ROOT = Path(root).resolve()
+        scanned = canonical_documents()
+        return scanned, eligible_documents(scanned)
+    finally:
+        ROOT = old
+
+
+def _manifest_rows(root: Path, path: Path) -> dict[str, dict[str, Any]]:
+    try:
+        relative = path.relative_to(root).as_posix()
+    except ValueError:
+        raise PrivateArtifactError('manifest must be below the private root') from None
+    try:
+        payload = private_json_read(root, relative)
+    except PrivateArtifactError as exc:
+        if not path.exists():
+            return {}
+        raise exc
+    rows = payload.get('documents')
+    if not isinstance(rows, list):
+        raise ReconciliationRequired('current manifest is malformed')
+    return {row['relative_path']: row for row in rows
+            if isinstance(row, dict) and isinstance(row.get('relative_path'), str)}
+
+
+def _safe_summary(classification: dict[str, tuple[str, ...]], plan: Any) -> dict[str, Any]:
+    # Paths and provider identifiers are intentionally absent from CLI output.
+    actions: dict[str, int] = {}
+    for row in plan:
+        actions[row['action']] = actions.get(row['action'], 0) + 1
+    return {'inventory': {key: len(value) for key, value in classification.items()},
+            'actions': actions, 'change_count': sum(actions.values())}
+
+
+def transaction_plan_from_inventory(
+        current: dict[str, dict[str, Any]], inventory: dict[str, tuple[dict[str, Any], ...]],
+        plan: Any) -> tuple[dict[str, Any], ...]:
+    """Bind a privacy-safe approved plan to exact provider/canonical identities."""
+    if any(row['action'] == 'operator_review' for row in plan):
+        raise ReconciliationRequired('operator review is required before mutation')
+    by_path: dict[str, list[dict[str, Any]]] = {}
+    for container, rows in inventory.items():
+        for raw in rows:
+            row = dict(raw); row['_inventory_container'] = container
+            meta = row.get('metadata')
+            rel = meta.get('relative_path') if isinstance(meta, dict) else None
+            if isinstance(rel, str):
+                by_path.setdefault(rel, []).append(row)
+    bound = []
+    for approved in plan:
+        action, rel = approved['action'], approved['relative_path']
+        doc = current.get(rel)
+        matches = by_path.get(rel, [])
+        if action in {'replace', 'delete'} and len(matches) != 1:
+            raise ReconciliationRequired('planned destructive identity is not unique')
+        pre = provider_identity(matches[0], matches[0]['_inventory_container']) if matches else None
+        post = None if action == 'delete' else {
+            'custom_id': doc['custom_id'], 'container': container_for_doc(doc),
+            'sha256': doc['sha256'], 'bytes': doc['bytes'], 'document_id': None,
+        }
+        expected = pre if action == 'delete' else post
+        bound.append({'action': action, 'relative_path': rel,
+                      'custom_id': expected['custom_id'],
+                      'source_container': pre['container'] if pre else None,
+                      'target_container': post['container'] if post else None,
+                      'expected_sha256': expected['sha256'], 'expected_bytes': expected['bytes'],
+                      'expected_pre_identity': pre, 'expected_post_identity': post})
+    return _validated_transaction_plan(bound)
+
+
+def _receipt_inventory(client: Supermemory, current: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    inventory = provider_inventory(client)
+    rows = []
+    for rel, doc in sorted(current.items()):
+        matches = [(container, raw) for container, values in inventory.items() for raw in values
+                   if _alias(raw, 'custom_id', 'customId') == doc['custom_id']]
+        if len(matches) != 1:
+            raise ReconciliationRequired('storage receipt identity count is not one')
+        container, listed = matches[0]
+        hydrated = client.documents.get(str(_field(listed, 'id')), timeout=15.0)
+        validated = validate_backend_document(hydrated, doc)
+        rows.append({'relative_path': rel, 'document_id': validated['document_id'],
+                     'custom_id': doc['custom_id'], 'container': container,
+                     'sha256': doc['sha256'], 'bytes': doc['bytes'], 'status': 'done',
+                     'index_schema_version': INDEX_SCHEMA_VERSION, 'task_type': 'superrag',
+                     'provenance': 'canonical_obsidian'})
+    if len(rows) != sum(len(value) for value in inventory.values()):
+        raise ReconciliationRequired('storage inventory contains collateral objects')
+    return rows
+
+
+def _vector_observations(client: Supermemory,
+                         current: dict[str, dict[str, Any]]) -> dict[str, list[Any]]:
+    observations = {}
+    for rel, doc in sorted(current.items()):
+        accepted = None
+        for probe in indexed_content_probes(doc):
+            response = search_documents_v4(
+                client, probe, container_tag=container_for_doc(doc), limit=1, timeout=30.0,
+                filters={'AND': [{'key': 'source', 'value': 'obsidian'},
+                                 {'key': 'relative_path', 'value': rel}]},
+            )
+            results = _field(response, 'results')
+            total = _field(response, 'total')
+            if (isinstance(results, list) and len(results) == 1 and total == 1
+                    and indexed_chunk_proves_probe(str(_field(results[0], 'chunk', '')),
+                                                   probe, doc['content'])):
+                accepted = results
+                break
+        if accepted is None:
+            raise ReconciliationRequired('vector proof failed for one or more documents')
+        observations[rel] = accepted
+    return observations
+
+
+def _write_storage_receipt(root: Path, current: dict[str, dict[str, Any]], inventory: list[dict[str, Any]],
+                           generation: str, generated_at: datetime) -> str:
+    key = read_receipt_key(root / 'readiness/receipt-hmac.key')
+    if key is None:
+        raise ReconciliationRequired('readiness receipt key is unavailable or unsafe')
+    value = build_storage_reconciliation_receipt(
+        current, inventory, generation=generation, generated_at=generated_at, key=key)
+    return private_json_write(root, 'readiness/storage-reconciliation.json', value)
+
+
+def _write_vector_receipt(root: Path, current: dict[str, dict[str, Any]], observations: dict[str, list[Any]],
+                          generation: str, generated_at: datetime) -> str:
+    key = read_receipt_key(root / 'readiness/receipt-hmac.key')
+    if key is None:
+        raise ReconciliationRequired('readiness receipt key is unavailable or unsafe')
+    value = build_vector_readiness_receipt(
+        current, observations, generation=generation, generated_at=generated_at, key=key)
+    return private_json_write(root, 'readiness/vector-readiness.json', value)
+
+
+PUBLICATION_ARTIFACTS = (
+    ('storage', 'readiness/storage-reconciliation.json'),
+    ('vector', 'readiness/vector-readiness.json'),
+    ('manifest', 'manifest/current.json'),
+)
+PUBLICATION_MARKER = 'publication/prepared.json'
+
+
+def _private_unlink(root: Path, child: str) -> None:
+    parts = _private_child_parts(child)
+    root_fd = _open_private_root(root, create=False)
+    parent_fd = _open_private_parent(root_fd, parts, create=False)
+    try:
+        try:
+            os.unlink(parts[-1], dir_fd=parent_fd)
+        except FileNotFoundError:
+            return
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+        os.close(root_fd)
+
+
+def _publication_marker_mac(marker: dict[str, Any], key: bytes) -> str:
+    unsigned = {name: value for name, value in marker.items() if name != 'marker_hmac'}
+    return hmac.new(key, canonical_bytes(unsigned), hashlib.sha256).hexdigest()
+
+
+def _private_regular_exists(root: Path, child: str) -> bool:
+    """Check for a confined regular file without creating or following anything."""
+    parts = _private_child_parts(child)
+    root_fd = parent_fd = -1
+    try:
+        root_fd = _open_private_root(root, create=False)
+        try:
+            parent_fd = _open_private_parent(root_fd, parts, create=False)
+        except FileNotFoundError:
+            return False
+        try:
+            info = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        _verify_private_stat(info, directory=False, label='private artifact')
+        return True
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
+def publication_recovery_required_read_only(root: Path) -> bool:
+    """Inspect an interrupted publication without repairing or changing it."""
+    try:
+        marker_present = _private_regular_exists(root, PUBLICATION_MARKER)
+    except Exception:
+        # An unsafe marker entry is still an interrupted publication requiring
+        # an operator-controlled mutating recovery path.
+        return True
+    if not marker_present:
+        return False
+    try:
+        key = read_receipt_key(root / 'readiness/receipt-hmac.key')
+        marker = private_json_read(root, PUBLICATION_MARKER)
+        mac = marker.get('marker_hmac') if isinstance(marker, dict) else None
+        if (key is None or not isinstance(mac, str)
+                or not hmac.compare_digest(mac, _publication_marker_mac(marker, key))
+                or marker.get('schema_version') != 1
+                or marker.get('state') not in {'prepared', 'committed'}):
+            raise ReconciliationRequired('invalid publication marker')
+        artifacts = marker.get('artifacts')
+        if not isinstance(artifacts, dict) or set(artifacts) != {
+                name for name, _ in PUBLICATION_ARTIFACTS}:
+            raise ReconciliationRequired('invalid publication marker')
+        for name, canonical_live in PUBLICATION_ARTIFACTS:
+            row = artifacts.get(name)
+            if not isinstance(row, dict) or set(row) != {'live', 'old', 'new'}:
+                raise ReconciliationRequired('invalid publication marker')
+            live_child = row.get('live')
+            if not isinstance(live_child, str):
+                raise ReconciliationRequired('invalid publication marker')
+            if name != 'manifest' and live_child != canonical_live:
+                raise ReconciliationRequired('invalid publication marker')
+            _private_child_parts(live_child)
+            for version in ('old', 'new'):
+                binding = row.get(version)
+                if (not isinstance(binding, dict) or set(binding) != {'stage', 'sha256'}
+                        or not isinstance(binding.get('stage'), str)):
+                    raise ReconciliationRequired('invalid publication marker')
+                _private_child_parts(binding['stage'])
+                digest = binding.get('sha256')
+                if digest is not None:
+                    if not _is_sha256(digest):
+                        raise ReconciliationRequired('invalid publication marker')
+                    private_json_read(root, binding['stage'], expected_sha256=digest)
+    except Exception:
+        # Presence alone requires mutating recovery. Authentication failures and
+        # partial triples deliberately collapse to the same privacy-safe result.
+        pass
+    return True
+
+
+def _read_artifact(root: Path, child: str) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        value = private_json_read(root, child)
+    except PrivateArtifactError:
+        if not (root / child).exists():
+            return None, None
+        raise
+    return value, hashlib.sha256(_json_bytes(value)).hexdigest()
+
+
+def recover_publication(root: Path, *, fault_injector: Callable[[str], None] | None = None) -> bool:
+    """Finish or restore an interrupted receipt+manifest generation."""
+    marker_path = root / PUBLICATION_MARKER
+    if not marker_path.exists():
+        return False
+    key = read_receipt_key(root / 'readiness/receipt-hmac.key')
+    if key is None:
+        raise ReconciliationRequired('publication marker cannot be authenticated')
+    marker = private_json_read(root, PUBLICATION_MARKER)
+    mac = marker.get('marker_hmac') if isinstance(marker, dict) else None
+    if (not isinstance(mac, str) or not hmac.compare_digest(mac, _publication_marker_mac(marker, key))
+            or marker.get('schema_version') != 1 or marker.get('state') not in {'prepared', 'committed'}):
+        raise ReconciliationRequired('publication marker is malformed or unauthenticated')
+    artifacts = marker.get('artifacts')
+    if not isinstance(artifacts, dict) or set(artifacts) != {name for name, _ in PUBLICATION_ARTIFACTS}:
+        raise ReconciliationRequired('publication marker artifact set is invalid')
+
+    # Prefer completing the new generation whenever its complete staged triple
+    # remains hash-exact. Otherwise restore the complete old triple.
+    target = 'new'
+    for name, _ in PUBLICATION_ARTIFACTS:
+        row = artifacts[name]
+        if not isinstance(row, dict) or set(row) != {'live', 'old', 'new'}:
+            raise ReconciliationRequired('publication marker artifact binding is invalid')
+        staged, digest = _read_artifact(root, row['new']['stage'])
+        if staged is None or digest != row['new']['sha256']:
+            target = 'old'
+    if target == 'old':
+        for name, _ in PUBLICATION_ARTIFACTS:
+            old = artifacts[name]['old']
+            if old['sha256'] is not None:
+                staged, digest = _read_artifact(root, old['stage'])
+                if staged is None or digest != old['sha256']:
+                    raise ReconciliationRequired('neither publication generation is recoverable')
+
+    for name, _ in PUBLICATION_ARTIFACTS:
+        row = artifacts[name]
+        selected = row[target]
+        if selected['sha256'] is None:
+            _private_unlink(root, row['live'])
+        else:
+            value = private_json_read(root, selected['stage'], expected_sha256=selected['sha256'])
+            observed = private_json_write(root, row['live'], value)
+            if observed != selected['sha256']:
+                raise ReconciliationRequired('publication recovery write mismatch')
+        if fault_injector:
+            fault_injector(f'after_recover_{name}')
+    marker['state'] = 'committed'
+    marker['outcome'] = target
+    marker['marker_hmac'] = _publication_marker_mac(marker, key)
+    private_json_write(root, PUBLICATION_MARKER, marker)
+    if fault_injector:
+        fault_injector('after_committed_marker')
+    _private_unlink(root, PUBLICATION_MARKER)
+    if fault_injector:
+        fault_injector('after_marker_cleanup')
+    return True
+
+
+def publish_readiness_pair(
+        root: Path, current: dict[str, dict[str, Any]], inventory: list[dict[str, Any]],
+        observations: dict[str, list[Any]], generation: str, generated_at: datetime,
+        *, manifest: dict[str, Any] | None = None,
+        manifest_child: str = 'manifest/current.json',
+        fault_injector: Callable[[str], None] | None = None) -> tuple[str, str]:
+    """Durably publish storage receipt, vector receipt, and manifest together."""
+    recover_publication(root, fault_injector=fault_injector)
+    key = read_receipt_key(root / 'readiness/receipt-hmac.key')
+    if key is None:
+        raise ReconciliationRequired('readiness receipt key is unavailable or unsafe')
+    storage = build_storage_reconciliation_receipt(
+        current, inventory, generation=generation, generated_at=generated_at, key=key)
+    vector = build_vector_readiness_receipt(
+        current, observations, generation=generation, generated_at=generated_at, key=key)
+    fingerprint = source_fingerprint_from_documents(current)
+    if not validate_readiness_receipts(storage, vector, key=key,
+                                       current_fingerprint=fingerprint, now=generated_at):
+        raise ReconciliationRequired('staged readiness receipt pair failed validation')
+    tx = generation.split(':', 1)[0]
+    if manifest is None:
+        manifest = {'schema_version': INDEX_SCHEMA_VERSION, 'transaction_id': tx,
+                    'generation': generation,
+                    'documents': sorted(inventory, key=lambda row: row['relative_path'])}
+    if manifest.get('generation') != generation or manifest.get('transaction_id') != tx:
+        raise ReconciliationRequired('manifest generation is not bound to publication')
+    values = {'storage': storage, 'vector': vector, 'manifest': manifest}
+    live = dict(PUBLICATION_ARTIFACTS)
+    live['manifest'] = manifest_child
+    artifacts: dict[str, Any] = {}
+    for name in ('storage', 'vector', 'manifest'):
+        old, old_digest = _read_artifact(root, live[name])
+        old_stage = f'transactions/{tx}/publication/old-{name}.json'
+        if old is not None:
+            assert private_json_write(root, old_stage, old) == old_digest
+        new_stage = f'transactions/{tx}/publication/new-{name}.json'
+        new_digest = private_json_write(root, new_stage, values[name])
+        artifacts[name] = {'live': live[name],
+                           'old': {'stage': old_stage, 'sha256': old_digest},
+                           'new': {'stage': new_stage, 'sha256': new_digest}}
+        if fault_injector:
+            fault_injector(f'after_stage_{name}')
+    marker = {'schema_version': 1, 'transaction_id': tx, 'generation': generation,
+              'source_fingerprint': fingerprint, 'state': 'prepared', 'artifacts': artifacts}
+    marker['marker_hmac'] = _publication_marker_mac(marker, key)
+    private_json_write(root, PUBLICATION_MARKER, marker)
+    if fault_injector:
+        fault_injector('after_prepared_marker')
+    recover_publication(root, fault_injector=fault_injector)
+    return artifacts['storage']['new']['sha256'], artifacts['vector']['new']['sha256']
+
+
+def _copy_private(source: Path, destination: Path, *, private_root: Path | None = None) -> str:
+    data = _read_confined_regular(source, label='backup source')
+    root = private_root or destination.parent
+    try:
+        child = destination.relative_to(root).as_posix()
+    except ValueError:
+        raise PrivateArtifactError('backup destination escapes private root') from None
+    parts = _private_child_parts(child)
+    root_fd = parent_fd = fd = -1
+    try:
+        root_fd = _open_private_root(root, create=True)
+        parent_fd = _open_private_parent(root_fd, parts, create=True)
+        fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=parent_fd)
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError('short private backup write')
+            view = view[written:]
+        os.fsync(fd); os.close(fd); fd = -1; os.fsync(parent_fd)
+    except OSError as exc:
+        raise PrivateArtifactError(f'private backup write failed: {type(exc).__name__}') from None
+    finally:
+        if fd >= 0: os.close(fd)
+        if parent_fd >= 0: os.close(parent_fd)
+        if root_fd >= 0: os.close(root_fd)
+    root_fd = parent_fd = fd = -1
+    try:
+        root_fd = _open_private_root(root, create=False)
+        parent_fd = _open_private_parent(root_fd, parts, create=False)
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        info = os.fstat(fd)
+        _verify_private_stat(info, directory=False, label='private backup')
+        observed = bytearray()
+        while len(observed) <= len(data):
+            block = os.read(fd, min(65536, len(data) + 1 - len(observed)))
+            if not block: break
+            observed.extend(block)
+        if bytes(observed) != data:
+            raise PrivateArtifactError('backup read-back mismatch')
+    finally:
+        if fd >= 0: os.close(fd)
+        if parent_fd >= 0: os.close(parent_fd)
+        if root_fd >= 0: os.close(root_fd)
+    return hashlib.sha256(data).hexdigest()
+
+
+def create_release_backup(root: Path, transaction_id: str, *, importer_path: Path | None = None,
+                          manifest_path: Path | None = None, plist_path: Path | None = None,
+                          first_install: bool = False) -> dict[str, Any]:
+    """Create an immutable dated private backup without exposing key contents."""
+    private_fd = _open_private_root(root, create=True)
+    os.close(private_fd)
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    child = f'backups/{stamp}-{transaction_id}'
+    hashes = {}
+    artifacts = {}
+    sources = (('importer', importer_path), ('legacy-manifest', manifest_path),
+               ('launch-agent.plist', plist_path))
+    classified = []
+    # Classify the complete required set before creating any backup artifact.
+    for label, source in sources:
+        if source is None:
+            if not first_install:
+                raise PrivateArtifactError(f'required backup source is unspecified: {label}')
+            artifacts[label] = {'status': 'absent', 'reason': 'approved-first-install'}
+            continue
+        try:
+            _read_confined_regular(source, label=f'backup source {label}')
+        except PrivateArtifactError:
+            if source.exists():
+                raise
+            if not first_install:
+                raise PrivateArtifactError(f'required backup source is unexpectedly absent: {label}') from None
+            artifacts[label] = {'status': 'absent', 'reason': 'approved-first-install'}
+            continue
+        classified.append((label, source))
+    for label, source in classified:
+        hashes[label] = _copy_private(source, root / child / label, private_root=root)
+        artifacts[label] = {'status': 'present-backed-up-hash-verified', 'sha256': hashes[label]}
+    key = read_receipt_key(root / 'readiness/receipt-hmac.key')
+    if key is None:
+        raise ReconciliationRequired('readiness receipt key is unavailable or unsafe')
+    metadata_value = {'transaction_id': transaction_id, 'created_at': stamp, 'hashes': hashes,
+                      'artifacts': artifacts,
+                      'receipt_key': {'present': True,
+                                      'key_id': hashlib.sha256(key).hexdigest()[:16]},
+                      'key_contents_backed_up': False}
+    digest = private_json_write(root, f'{child}/metadata.json', metadata_value)
+    if private_json_read(root, f'{child}/metadata.json', expected_sha256=digest) != metadata_value:
+        raise PrivateArtifactError('backup metadata read-back mismatch')
+    return {'path': child, 'metadata_sha256': digest, 'hashes': hashes}
+
+
+def secure_install(tracked: Path, stable: Path, backup_root: Path, expected_sha256: str,
+                   plist_path: Path, interpreter: Path) -> dict[str, Any]:
+    _require_private_io_capabilities()
+    if not _is_sha256(expected_sha256):
+        raise PrivateArtifactError('tracked importer or expected hash is invalid')
+    source = _read_confined_regular(tracked, label='tracked importer')
+    if hashlib.sha256(source).hexdigest() != expected_sha256:
+        raise PrivateArtifactError('tracked importer SHA-256 mismatch')
+    _read_confined_regular(interpreter, label='interpreter')
+    try:
+        plist = plistlib.loads(_read_confined_regular(plist_path, label='LaunchAgent plist'))
+    except PrivateArtifactError:
+        raise
+    except Exception:
+        raise PrivateArtifactError('LaunchAgent plist is malformed') from None
+    arguments = plist.get('ProgramArguments')
+    if (not isinstance(arguments, list) or len(arguments) < 2
+            or arguments[0] != str(interpreter) or arguments[1] != str(stable)
+            or 'verify-only' not in arguments or 'reconcile' in arguments
+            or '--execute' in arguments):
+        raise PrivateArtifactError('LaunchAgent plist does not point at safe noninteractive command')
+    backup = None
+    backup_fd = _open_private_root(backup_root, create=True); os.close(backup_fd)
+    if stable.exists():
+        backup = backup_root / f'{stable.name}.{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")}'
+        _copy_private(stable, backup)
+    stable_root_fd = _open_private_root(stable.parent, create=True)
+    fd = -1; name = f'.{stable.name}.{secrets.token_hex(16)}.tmp'
+    try:
+        existing = None
+        try: existing = os.stat(stable.name, dir_fd=stable_root_fd, follow_symlinks=False)
+        except FileNotFoundError: pass
+        if existing is not None:
+            if not stat.S_ISREG(existing.st_mode) or existing.st_uid != os.getuid() or stat.S_IMODE(existing.st_mode) != 0o700:
+                raise PrivateArtifactError('installed importer target is unsafe')
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o700, dir_fd=stable_root_fd)
+        view = memoryview(source)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0: raise OSError('short install write')
+            view = view[written:]
+        os.fsync(fd); os.close(fd); fd = -1
+        os.replace(name, stable.name, src_dir_fd=stable_root_fd, dst_dir_fd=stable_root_fd)
+        name = ''; os.fsync(stable_root_fd)
+    finally:
+        if fd >= 0: os.close(fd)
+        if name:
+            try: os.unlink(name, dir_fd=stable_root_fd)
+            except FileNotFoundError: pass
+        os.close(stable_root_fd)
+    installed_fd = os.open(stable, os.O_RDONLY | os.O_NOFOLLOW)
+    try: installed = os.read(installed_fd, len(source) + 1)
+    finally: os.close(installed_fd)
+    if installed != source or hashlib.sha256(installed).hexdigest() != expected_sha256:
+        raise PrivateArtifactError('installed importer read-back hash mismatch')
+    return {'installed_sha256': expected_sha256, 'backup_created': backup is not None,
+            'launch_agent_reloaded': False}
+
+
+def _phase2_main(argv: list[str]) -> None:
+    if argv and argv[0] == 'legacy-reconcile':
+        old_argv = sys.argv
+        try:
+            sys.argv = [old_argv[0], *argv[1:]]
+            legacy_main()
+        finally:
+            sys.argv = old_argv
+        return
+    args = _phase2_parser().parse_args(argv)
+    if args.command in {'key-init', 'key-rotate'}:
+        key_id = generate_receipt_key(
+            args.private_root / 'readiness/receipt-hmac.key', rotate=args.command == 'key-rotate')
+        print(json.dumps({'command': args.command, 'key_id': key_id,
+                          'receipts_valid': False, 'reverification_required': True}))
+        return
+    if args.command == 'install':
+        result = secure_install(args.tracked_importer, args.stable_path, args.backup_root,
+                                args.expected_sha256, args.plist, args.interpreter)
+        print(json.dumps(result)); return
+    if args.command == 'reload-instructions':
+        print(json.dumps({'launch_agent_reloaded': False, 'manual_command':
+                          f'launchctl bootout gui/$UID {args.plist} && launchctl bootstrap gui/$UID {args.plist}'}))
+        return
+    if args.command == 'rollback':
+        expected = f'ROLLBACK:{args.forward_transaction_id}'
+        if args.confirm != expected:
+            raise SystemExit('rollback confirmation token mismatch')
+        root = Path(args.private_root)
+        plan_payload = private_json_read(
+            root, f'transactions/{args.forward_transaction_id}/plan.json')
+        if plan_payload.get('transaction_id') != args.forward_transaction_id:
+            raise ReconciliationRequired('forward plan transaction mismatch')
+        state = DurableRollbackExecutor(_client(args.base_url), root).execute(
+            plan_payload['records'], args.forward_transaction_id, args.transaction_id)
+        print(json.dumps({'mode': 'rollback', 'complete': state['complete'],
+                          'transaction_id': args.transaction_id, 'readiness': False}))
+        return
+
+    _preflight_phase2_paths(args)
+    root, manifest_path, _, _ = _phase2_paths(args)
+    if args.command == 'verify-only' and publication_recovery_required_read_only(root):
+        print(json.dumps({'mode': 'verify-only', 'publication_recovery_required': True,
+                          'filesystem_mutated': False, 'backend_mutated': False}))
+        raise SystemExit(1)
+    if args.command == 'reconcile':
+        recover_publication(root)
+    scanned, current = _scan_at(args.source_root)
+    if args.command == 'dry-run':
+        previous = _manifest_rows(root, manifest_path) if manifest_path.exists() else {}
+        changed = {rel for rel in set(current) & set(previous)
+                   if current[rel]['sha256'] != previous[rel].get('sha256')
+                   or container_for_doc(current[rel]) != container_for_row(previous[rel])}
+        counts = {'add': len(set(current) - set(previous)), 'replace': len(changed),
+                  'delete': len(set(previous) - set(current))}
+        print(json.dumps({'mode': 'dry-run', 'scanned': len(scanned), 'eligible': len(current),
+                          'actions': counts, 'filesystem_mutated': False,
+                          'provider_client_created': False, 'backend_mutated': False}))
+        return
+    client = _client(args.base_url)
+    inventory = provider_inventory(client)
+    classification = classify_inventory(current, inventory)
+    approved = reconciliation_plan(classification)
+    summary = _safe_summary(classification, approved)
+    if args.command == 'verify-only':
+        storage_rows = _receipt_inventory(client, current)
+        observations = _vector_observations(client, current)
+        key = read_receipt_key(root / 'readiness/receipt-hmac.key')
+        try:
+            storage = private_json_read(root, 'readiness/storage-reconciliation.json')
+            vector = private_json_read(root, 'readiness/vector-readiness.json')
+            receipts_valid = key is not None and validate_readiness_receipts(
+                storage, vector, key=key,
+                current_fingerprint=source_fingerprint_from_documents(current),
+                now=datetime.now(timezone.utc))
+            # Re-run the complete vector receipt validator against the live
+            # search/get observations without persisting its transient proof.
+            live_vector_valid = key is not None and bool(build_vector_readiness_receipt(
+                current, observations, generation=str(vector.get('generation', '')),
+                generated_at=datetime.now(timezone.utc), key=key))
+        except Exception:
+            receipts_valid = False
+            live_vector_valid = False
+        complete = (not approved and classification['expected'] == tuple(sorted(current))
+                    and len(storage_rows) == len(current) and len(observations) == len(current)
+                    and receipts_valid and live_vector_valid)
+        print(json.dumps({'mode': 'verify-only', **summary, 'verification_complete': complete,
+                          'storage_verified_count': len(storage_rows),
+                          'vector_verified_count': len(observations),
+                          'receipts_valid': receipts_valid,
+                          'filesystem_mutated': False, 'backend_mutated': False}))
+        if not complete: raise SystemExit(1)
+        return
+    proposed_plan = transaction_plan_from_inventory(current, inventory, approved)
+    proposed_digest = transaction_plan_digest(proposed_plan)
+    if args.command == 'plan':
+        print(json.dumps({'mode': 'plan', **summary, 'transaction_id': args.transaction_id,
+                          'plan_digest': proposed_digest,
+                          'containers': sorted(CANONICAL_CONTAINERS),
+                          'reason_codes': sorted({row['action'] for row in proposed_plan}),
+                          'filesystem_mutated': False, 'backend_mutated': False}))
+        return
+    if args.confirm != args.transaction_id:
+        raise SystemExit('reconcile confirmation token mismatch')
+
+    plan_child = f'transactions/{args.transaction_id}/plan.json'
+    plan_path = root / plan_child
+    if plan_path.exists():
+        plan_payload = private_json_read(root, plan_child)
+        plan = _validated_transaction_plan(plan_payload.get('records'))
+        digest = transaction_plan_digest(plan)
+        if plan_payload.get('transaction_id') != args.transaction_id or plan_payload.get('plan_digest') != digest:
+            raise TransactionJournalError('persisted transaction plan binding is invalid')
+        summary = _safe_summary(classification, plan)
+    else:
+        plan = proposed_plan
+        digest = proposed_digest
+    if args.confirm_plan != digest:
+        raise SystemExit('reconcile plan digest mismatch')
+
+    if not plan_path.exists():
+        backup = create_release_backup(
+            root, args.transaction_id, importer_path=Path(__file__).resolve(),
+            manifest_path=manifest_path, plist_path=args.plist, first_install=args.first_install,
+        )
+        plan_payload = {'transaction_id': args.transaction_id, 'records': _plain_json(plan),
+                        'plan_digest': digest, 'backup': backup}
+        plan_digest = private_json_write(root, plan_child, plan_payload)
+        if private_json_read(root, plan_child, expected_sha256=plan_digest) != plan_payload:
+            raise PrivateArtifactError('forward plan read-back mismatch')
+    try:
+        state = DurableReconciliationExecutor(client, root).execute(current, plan, args.transaction_id)
+        generated_at = datetime.now(timezone.utc)
+        generation = f'{args.transaction_id}:{state["verification_digest"]}'
+        storage_rows = _receipt_inventory(client, current)
+        # Both deep proofs complete before either public receipt is replaced.
+        observations = _vector_observations(client, current)
+        manifest = {'schema_version': INDEX_SCHEMA_VERSION, 'transaction_id': args.transaction_id,
+                    'generation': generation,
+                    'documents': sorted(storage_rows, key=lambda row: row['relative_path'])}
+        storage_digest, vector_digest = publish_readiness_pair(
+            root, current, storage_rows, observations, generation, generated_at,
+            manifest=manifest, manifest_child=manifest_path.relative_to(root).as_posix())
+    except Exception:
+        print(json.dumps({'mode': 'reconcile', 'transaction_id': args.transaction_id,
+                          'readiness': False, 'resume': f'reconcile transaction {args.transaction_id}',
+                          'rollback': f'rollback forward transaction {args.transaction_id}'}))
+        raise SystemExit(1) from None
+    print(json.dumps({'mode': 'reconcile', **summary, 'transaction_id': args.transaction_id,
+                      'storage_receipt_sha256': storage_digest,
+                      'vector_receipt_sha256': vector_digest, 'behavioral_receipt_written': False,
+                      'readiness': True}))
+
+
+def main() -> None:
+    _phase2_main(sys.argv[1:])
 
 
 if __name__ == '__main__':

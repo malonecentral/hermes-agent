@@ -230,7 +230,7 @@ def test_verify_only_is_read_only_and_reads_manifest_without_lock(importer, monk
     monkeypatch.setattr(importer, "completion_readiness", lambda client, current: {
         "reconciliation_complete": True,
     })
-    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--verify-only"])
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "legacy-reconcile", "--verify-only"])
 
     importer.main()
 
@@ -256,7 +256,7 @@ def test_verify_only_exits_nonzero_when_any_document_is_incomplete(importer, mon
     monkeypatch.setattr(importer, "canonical_documents", lambda: [doc])
     monkeypatch.setattr(importer, "Supermemory", lambda **kwargs: client)
     monkeypatch.setattr(importer, "api_key", lambda: "key")
-    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--verify-only"])
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "legacy-reconcile", "--verify-only"])
     with pytest.raises(SystemExit) as exc:
         importer.main()
     assert exc.value.code == 1
@@ -599,7 +599,7 @@ def test_dry_run_reads_only_source_and_manifest_and_returns_path_plan(importer, 
     monkeypatch.setattr(importer, "LOCK", lock)
     monkeypatch.setattr(importer, "canonical_documents", lambda: [new])
     monkeypatch.setattr(importer, "Supermemory", lambda **kwargs: (_ for _ in ()).throw(AssertionError("provider constructed")))
-    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--dry-run"])
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "legacy-reconcile", "--dry-run"])
     importer.main()
     result = json.loads(capsys.readouterr().out)
     assert result["plan"] == [

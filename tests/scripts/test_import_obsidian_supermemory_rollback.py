@@ -134,7 +134,7 @@ def test_add_delete_replace_move_and_mixed_restore_exact_pre_state(importer, tmp
                      for r in client.documents.rows.values())
     expected = sorted((r["custom_id"], r["container_tags"][0], r["content"], r["metadata"]) for r in before)
     assert logical == expected
-    journal = importer.private_json_read(tmp_path / "private", "journals/rollback.json")
+    journal = importer.private_json_read(tmp_path / "private", "transactions/rollback-txn/rollback-journal.json")
     assert journal["forward_transaction_id"] == "forward-txn"
     assert journal["forward_plan_digest"] == importer.transaction_plan_digest(plan)
     assert journal["snapshot_digest"] == state["snapshot_digest"]
@@ -225,7 +225,7 @@ def test_malformed_rollback_hydration_is_sanitized_durable_and_retryable(
         rollback(importer, tmp_path, client, plan)
     assert str(caught.value) == "rollback hydration failed"
     assert all(text not in str(caught.value) for text in ("secret", "private-id", "SDK error"))
-    journal = importer.private_json_read(tmp_path / "private", "journals/rollback.json")
+    journal = importer.private_json_read(tmp_path / "private", "transactions/rollback-txn/rollback-journal.json")
     assert journal["records"][0]["stage"] == "reconcile_required"
     assert journal["records"][0]["history"][-1] == "reconcile_required"
     expected_new_mutations = int(action == "restore" and phase == "initial")
@@ -238,9 +238,9 @@ def test_malformed_rollback_hydration_is_sanitized_durable_and_retryable(
 def test_tampered_snapshot_and_forged_or_reordered_journal_fail_closed(importer, tmp_path):
     doc = importer.item("Skills/a.md", b"body"); client = Client(); plan = [plan_row("add", doc)]
     forward(importer, tmp_path, client, {doc["relative_path"]: doc}, plan)
-    snapshot = importer.private_json_read(tmp_path / "private", "snapshots/forward.json")
+    snapshot = importer.private_json_read(tmp_path / "private", "transactions/forward-txn/snapshot.json")
     snapshot["expected_pre_inventory"] = [{"forged": True}]
-    importer.private_json_write(tmp_path / "private", "snapshots/forward.json", snapshot)
+    importer.private_json_write(tmp_path / "private", "transactions/forward-txn/snapshot.json", snapshot)
     with pytest.raises(importer.PrivateArtifactError): rollback(importer, tmp_path, client, plan)
 
 
@@ -256,15 +256,15 @@ def test_tampered_reordered_or_stale_rollback_journal_is_rejected(importer, tmp_
             raise RuntimeError("stop")
     with pytest.raises(RuntimeError): rollback(importer, tmp_path, client, plan, fault_injector=stop)
     root = tmp_path / "private"
-    original = importer.private_json_read(root, "journals/rollback.json")
+    original = importer.private_json_read(root, "transactions/rollback-txn/rollback-journal.json")
     for mutation in ("reordered", "stale", "forged"):
         journal = copy.deepcopy(original)
         if mutation == "reordered": journal["records"].reverse()
         elif mutation == "stale": journal["forward_transaction_id"] = "other-forward"
         else: journal["records"][0]["stage"] = "done"
-        importer.private_json_write(root, "journals/rollback.json", journal)
+        importer.private_json_write(root, "transactions/rollback-txn/rollback-journal.json", journal)
         with pytest.raises(importer.TransactionJournalError): rollback(importer, tmp_path, client, plan)
-    importer.private_json_write(root, "journals/rollback.json", original)
+    importer.private_json_write(root, "transactions/rollback-txn/rollback-journal.json", original)
 
 
 @pytest.mark.parametrize("mutation", [
@@ -284,7 +284,7 @@ def test_self_consistent_forged_post_inventory_is_rejected_before_provider_acces
     with pytest.raises(RuntimeError):
         rollback(importer, tmp_path, client, plan, fault_injector=stop)
     root = tmp_path / "private"
-    journal = importer.private_json_read(root, "journals/rollback.json")
+    journal = importer.private_json_read(root, "transactions/rollback-txn/rollback-journal.json")
     rows = journal["expected_post_inventory"]
     if mutation == "identity_and_digest": rows[0]["custom_id"] = "forged"
     elif mutation == "remove": rows.pop()
@@ -294,7 +294,7 @@ def test_self_consistent_forged_post_inventory_is_rejected_before_provider_acces
     elif mutation == "hash": rows[0]["sha256"] = "f" * 64
     else: rows[0]["bytes"] += 1
     journal["post_inventory_digest"] = importer._canonical_digest(rows)
-    importer.private_json_write(root, "journals/rollback.json", journal)
+    importer.private_json_write(root, "transactions/rollback-txn/rollback-journal.json", journal)
     before = list(client.documents.calls)
     with pytest.raises(importer.TransactionJournalError):
         rollback(importer, tmp_path, client, plan)

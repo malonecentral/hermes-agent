@@ -154,7 +154,7 @@ def test_mixed_add_delete_replace_scope_move_snapshots_before_mutation(importer,
                 fault_injector=lambda point: events.append(point))
     assert state["complete"] and state["verified_count"] == 3
     assert events.index("snapshot_verified") < events.index("mutation")
-    snapshot = importer.private_json_read(tmp_path / "private", "snapshots/forward.json",
+    snapshot = importer.private_json_read(tmp_path / "private", "transactions/txn/snapshot.json",
                                           expected_sha256=state["snapshot_digest"])
     assert {r["backend_identity"] for r in snapshot["records"]} == {"delete", "replace", "move"}
     assert snapshot["count"] == 3
@@ -286,7 +286,7 @@ def test_artifact_write_fault_occurs_at_snapshot_boundary_not_root_setup(importe
     with pytest.raises(importer.PrivateArtifactError, match="injected"):
         importer.DurableReconciliationExecutor(FakeClient(importer), root).execute(
             {doc["relative_path"]: doc}, [plan_row("add", doc)], "txn")
-    assert calls == ["snapshots/forward.json"]
+    assert calls == ["transactions/txn/snapshot.json"]
     monkeypatch.setattr(importer, "private_json_write", original)
 
 
@@ -366,7 +366,7 @@ def test_executor_durably_visits_all_forward_transition_stages(importer, tmp_pat
 
     def capture(point):
         if point == "journal_written":
-            journal = importer.private_json_read(tmp_path / "private", "journals/forward.json")
+            journal = importer.private_json_read(tmp_path / "private", "transactions/txn/forward-journal.json")
             seen.extend(record["stage"] for record in journal["records"])
 
     state = run(importer, tmp_path, [new],
@@ -416,7 +416,7 @@ def test_identity_change_after_each_predelete_checkpoint_blocks_delete(
         nonlocal changed
         if point != "journal_written" or changed:
             return
-        journal = importer.private_json_read(tmp_path / "private", "journals/forward.json")
+        journal = importer.private_json_read(tmp_path / "private", "transactions/txn/forward-journal.json")
         if journal["records"][0]["stage"] == checkpoint_stage:
             client.documents.rows["checkpoint"]["metadata"]["content_sha256"] = "f" * 64
             changed = True
@@ -439,7 +439,7 @@ def test_lost_delete_without_mutation_resumes_delete_from_reconcile_required(
     plan = [plan_row("delete", doc, identity(importer, row), doc)]
     with pytest.raises(importer.ReconciliationRequired):
         run(importer, tmp_path, [], plan, client)
-    journal = importer.private_json_read(tmp_path / "private", "journals/forward.json")
+    journal = importer.private_json_read(tmp_path / "private", "transactions/txn/forward-journal.json")
     assert journal["records"][0]["stage"] == "reconcile_required"
     client.documents.delete_mutates = True
     state = run(importer, tmp_path, [], plan, client)
@@ -476,10 +476,10 @@ def test_forged_terminal_journal_cannot_succeed_without_provider_proof(
 
     with pytest.raises(RuntimeError):
         run(importer, tmp_path, [doc], plan, client, fault_injector=stop)
-    journal = importer.private_json_read(tmp_path / "private", "journals/forward.json")
+    journal = importer.private_json_read(tmp_path / "private", "transactions/txn/forward-journal.json")
     journal["records"][0]["stage"] = "done"
     journal["records"][0]["history"] = ["existing", "add_submitted", "done"]
-    importer.private_json_write(tmp_path / "private", "journals/forward.json", journal)
+    importer.private_json_write(tmp_path / "private", "transactions/txn/forward-journal.json", journal)
     before = list(client.documents.calls)
     with pytest.raises(importer.ReconciliationRequired):
         run(importer, tmp_path, [doc], plan, client)
