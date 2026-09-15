@@ -66,7 +66,8 @@ Config file: `$HERMES_HOME/supermemory.json`
 | `family_shared_container` | `family_shared` | Validated Family Shared canonical-document topology tag. Contract-only in A1. |
 | `owner_conversation_container` | `owner_conversations` | Validated Owner conversation topology tag. Contract-only in A1. |
 | `routing_projection_enabled` | `false` | A2 feature flag. When enabled, retrieval uses the validated projected containers below; when disabled, the legacy routing path is unchanged. |
-| `requester_conversation_projection` | `false` | Advertise requester-specific Family conversation routing. It remains disabled unless both trusted identity projection and a namespace key are configured; A1 does not wire capture or retrieval. |
+| `requester_conversation_projection` | `false` | Enables requester-specific Family conversation routing when trusted identity projection and a namespace key are configured. |
+| `requester_conversation_capture` | `false` | Directly captures qualifying completed Family user turns into the authenticated requester's projected container. The four protected topology tags above must be distinct; derived requester containers are also checked before each write. Provider failures and rejected collisions are non-fatal; session history remains the fallback record. |
 | `requester_identity_server` | empty | MCP server name whose request-local `jarvisRequester.person_id` projection is supplied by the authenticated registry integration. Display names and local registry files are never accepted. |
 | `requester_conversation_namespace_key` | empty | At least 32 UTF-8 bytes used as the HMAC-SHA256 namespace key for opaque stable container tags. Keep `$HERMES_HOME/supermemory.json` owner-only. Missing/invalid keys disable the capability. |
 

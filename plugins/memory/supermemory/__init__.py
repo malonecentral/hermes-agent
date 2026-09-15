@@ -632,6 +632,7 @@ def _default_config() -> dict:
         "family_shared_container": "family_shared",
         "owner_conversation_container": "owner_conversations",
         "requester_conversation_projection": False,
+        "requester_conversation_capture": False,
         "requester_identity_server": "",
         "requester_conversation_namespace_key": "",
         "routing_projection_enabled": False,
@@ -646,6 +647,16 @@ def _validated_topology_tag(value: Any, default: str) -> str:
         and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_]{0,127}", value)
         else default
     )
+
+
+def _protected_topology_tags(config: dict) -> tuple[str, ...]:
+    """Return every configured namespace requester capture must not enter."""
+    return tuple(config[key] for key in (
+        "owner_canonical_container",
+        "owner_explicit_container",
+        "family_shared_container",
+        "owner_conversation_container",
+    ))
 
 
 def _sanitize_tag(raw: str) -> str:
@@ -773,6 +784,18 @@ def _load_supermemory_config(hermes_home: str) -> dict:
         and config["requester_identity_server"]
         and config["requester_conversation_namespace_key"]
     )
+    requested_capture = bool(
+        _as_bool(config.get("requester_conversation_capture"), False)
+        and config["requester_conversation_projection"]
+    )
+    protected_tags = _protected_topology_tags(config)
+    config["requester_conversation_capture"] = bool(
+        requested_capture and len(set(protected_tags)) == len(protected_tags)
+    )
+    if requested_capture and not config["requester_conversation_capture"]:
+        logger.warning(
+            "supermemory_family_capture outcome=config_rejected reason=protected_container_collision"
+        )
     config["routing_projection_enabled"] = _as_bool(
         config.get("routing_projection_enabled"), False
     )
@@ -1934,7 +1957,16 @@ class SupermemoryMemoryProvider(MemoryProvider):
         if not self._active:
             return ""
         if self._audience == "family":
-            return "# Family Shared memory\nRead-only canonical Family Shared evidence is prefetched automatically. No memory tools or conversational capture are available."
+            capture = (
+                " Authenticated requester-private conversational capture is enabled; "
+                "it is non-authoritative and cannot write Family Shared or Owner memory."
+                if self._config.get("requester_conversation_capture")
+                else " No conversational capture is available."
+            )
+            return (
+                "# Family Shared memory\nRead-only canonical Family Shared evidence is "
+                f"prefetched automatically. No memory tools are available.{capture}"
+            )
         lines = [
             "# Supermemory",
             f"Active. Container: {self._container_tag}.",
@@ -2675,9 +2707,51 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
                   messages: Optional[List[Dict[str, Any]]] = None) -> None:
-        # A provider can outlive a config change (CLI, desktop, and gateway
-        # sessions are routinely long-running).  A capture disable must take
-        # effect immediately instead of relying on those processes to restart.
+        if self._audience == "family":
+            config = _load_supermemory_config(self._hermes_home)
+            if not config.get("requester_conversation_capture") or not self._active or not self._client:
+                return
+            route = load_routing_projection(config, audience="family")
+            container = route.conversation_container
+            if container in _protected_topology_tags(config):
+                logger.warning(
+                    "supermemory_family_capture outcome=rejected reason=protected_container_collision"
+                )
+                return
+            session = str(session_id or self._session_id).strip()
+            user = _clean_text_for_capture(user_content)
+            turn_number = self._turn_count
+            if (
+                not container
+                or not session
+                or turn_number < 1
+                or not _is_capture_worthy_owner_statement(user)
+            ):
+                return
+            turn_key = hashlib.sha256(
+                f"{container}\0{session}\0{turn_number}".encode("utf-8")
+            ).hexdigest()
+            try:
+                self._client.add_memory(
+                    self._format_conversation([{"role": "user", "content": user}]),
+                    metadata={
+                        "type": "requester_conversation",
+                        "authority": "non-authoritative",
+                        "provenance": "user-authored role-delimited statement",
+                        "capture_source": "family_turn_completion",
+                        "requester_container": container,
+                    },
+                    entity_context=self._entity_context,
+                    container_tag=container,
+                    custom_id=f"hermes-requester-conversation:{container}:{turn_key}",
+                    task_type="memory",
+                )
+            except Exception:
+                logger.warning(
+                    "supermemory_family_capture outcome=provider_error action=session_history_fallback"
+                )
+            return
+        # Owner capture honors config changes without requiring process restart.
         capture_enabled = bool(_load_supermemory_config(self._hermes_home)["auto_capture"])
         if (not self._active or not self._auto_capture or not capture_enabled
                 or not self._write_enabled or not self._client):
