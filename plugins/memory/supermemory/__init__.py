@@ -22,7 +22,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-from .search_v4 import field as _v4_field, normalize_document_chunk, search_documents_v4
+from .search_v4 import (
+    canonical_chunk_preauthorized,
+    canonical_scope_from_path,
+    field as _v4_field,
+    normalize_document_chunk,
+    search_documents_v4,
+)
 
 from agent.memory_provider import MemoryProvider
 from agent.secret_scope import get_secret, is_multiplex_active
@@ -774,18 +780,10 @@ def _deduplicate_recall(static_facts: list, dynamic_facts: list, search_results:
 
 def _valid_v4_canonical_path(metadata: dict) -> bool:
     """Validate the indexed path and its ACL classification as one unit."""
-    relative_path = metadata.get("relative_path")
-    if not isinstance(relative_path, str) or not relative_path or relative_path != relative_path.strip():
-        return False
-    if (relative_path.startswith(("/", "./")) or "\\" in relative_path
-            or any(part in {"", ".", ".."} for part in relative_path.split("/"))
-            or not relative_path.endswith(".md")):
-        return False
-    expected_visibility = (
-        "family_shared" if relative_path.startswith("Jarvis/Family Shared/")
-        else "owner_private"
-    )
-    return metadata.get("visibility") == expected_visibility
+    scope = canonical_scope_from_path(metadata.get("relative_path"))
+    return bool(scope and metadata.get("visibility") == (
+        "family_shared" if scope == _FAMILY_CANONICAL_CONTAINER else "owner_private"
+    ))
 
 
 def _is_canonical_result(item: dict, *, schema_v4_ready: bool = False) -> bool:
@@ -794,36 +792,19 @@ def _is_canonical_result(item: dict, *, schema_v4_ready: bool = False) -> bool:
     raw_metadata = item.get("metadata")
     metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     source_container = item.get("_source_container")
-    if source_container is not None:
-        expected_container = (_FAMILY_CANONICAL_CONTAINER
-                              if metadata.get("visibility") == "family_shared"
-                              else _OWNER_CANONICAL_CONTAINER)
-        if source_container != expected_container:
-            return False
-        custom_id = item.get("_source_custom_id")
-        if custom_id:
-            path = metadata.get("relative_path")
-            if not isinstance(path, str) or custom_id != "obsidian-" + hashlib.sha256(path.encode()).hexdigest():
-                return False
-    legacy_valid = (
-        metadata.get("schema_version") in {None, 3, "3", 4, "4"}
-        and not isinstance(metadata.get("schema_version"), bool)
-        and metadata.get("authority") == "canonical"
-        and metadata.get("source") == "obsidian"
-        and metadata.get("identity_scope", "owner") == "owner"
-        and metadata.get("canonical_root", "owner") == "owner"
-        and metadata.get("visibility", "owner_private") in {"owner", "owner_private", "family_shared"}
-    )
-    if not schema_v4_ready:
-        return legacy_valid
+    scope = canonical_scope_from_path(metadata.get("relative_path"))
+    custom_id = item.get("_source_custom_id")
     exact = (
-        metadata.get("index_schema_version") == 4
+        scope in {_OWNER_CANONICAL_CONTAINER, _FAMILY_CANONICAL_CONTAINER}
+        and item.get("_source_container") == scope
+        and isinstance(custom_id, str) and bool(custom_id)
+        and custom_id == "obsidian-" + hashlib.sha256(metadata["relative_path"].encode()).hexdigest()
+        and metadata.get("index_schema_version") == 4
         and not isinstance(metadata.get("index_schema_version"), bool)
         and metadata.get("authority") == "canonical"
         and metadata.get("source") == "obsidian"
         and metadata.get("identity_scope") == "owner"
         and metadata.get("canonical_root") == "owner"
-        and metadata.get("visibility") in {"owner_private", "family_shared"}
         and _valid_v4_canonical_path(metadata)
     )
     if not exact:
@@ -1398,7 +1379,23 @@ class _SupermemoryClient:
         raw = _v4_field(response, "results", []) or []
         results = []
         for item in raw[:limit]:
+            if not canonical_chunk_preauthorized(item, tag):
+                continue
             parents = _v4_field(item, "documents")
+            item_metadata = _v4_field(item, "metadata")
+            summary_custom_id = (
+                _v4_field(parents[0], "custom_id", _v4_field(parents[0], "customId"))
+                if isinstance(parents, list) and len(parents) == 1 else None
+            )
+            if not isinstance(item_metadata, dict):
+                continue
+            expected_custom_id = "obsidian-" + hashlib.sha256(
+                item_metadata["relative_path"].encode()
+            ).hexdigest()
+            # Current v4 summaries omit customId.  When a provider does return
+            # one, a mismatch is conclusive and must reject before lookup.
+            if summary_custom_id is not None and summary_custom_id != expected_custom_id:
+                continue
             parent_id = (
                 _v4_field(parents[0], "id")
                 if isinstance(parents, list) and len(parents) == 1 else ""
@@ -1417,7 +1414,9 @@ class _SupermemoryClient:
                     except Exception:
                         hydrated = None
                     cache[parent_id] = hydrated
-            normalized = normalize_document_chunk(item, tag, hydrated)
+            normalized = normalize_document_chunk(
+                item, tag, hydrated, allow_summary_proof=hydrated is None,
+            )
             if normalized is not None:
                 results.append(normalized)
         _stage_receipt("normalize", received=len(raw), eligible=len(results),
@@ -2128,9 +2127,43 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 "visibility": "family_shared", "relative_path": relative_path,
                 "content_bytes": len(raw), "content_sha256": hashlib.sha256(raw).hexdigest(),
             }
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return []
+            try:
+                document = self._client.get_document(custom_id, timeout=remaining)
+            except Exception:
+                logger.warning("supermemory_prefetch stage=exact_date_hydrate outcome=rejected")
+                return []
+            parent_metadata = document.get("metadata")
+            parent_content = str(document.get("content") or "")
+            parent_prefix = re.match(
+                r"\A\[canonical-identity\]\n[\s\S]*?\n\[/canonical-identity\]\n\n",
+                parent_content,
+            )
+            parent_source = parent_content[parent_prefix.end():] if parent_prefix else ""
+            valid_parent = (
+                canonical_scope_from_path(relative_path) == _FAMILY_CANONICAL_CONTAINER
+                and canonical_chunk_preauthorized(
+                    {"metadata": metadata}, _FAMILY_CANONICAL_CONTAINER,
+                )
+                and document.get("id") in {custom_id, document.get("custom_id")}
+                and document.get("custom_id") == custom_id
+                and document.get("container_tags") == [_FAMILY_CANONICAL_CONTAINER]
+                and document.get("task_type") == "superrag"
+                and document.get("status") == "done"
+                and parent_metadata == metadata
+                and parent_source.encode("utf-8") == raw
+                and time.monotonic() <= deadline
+            )
+            if not valid_parent:
+                logger.warning("supermemory_prefetch stage=exact_date_hydrate outcome=rejected")
+                return []
             hydrated.append({
                 "id": custom_id, "memory": content, "metadata": metadata,
                 "updated_at": "",
+                "_source_container": _FAMILY_CANONICAL_CONTAINER,
+                "_source_custom_id": custom_id,
             })
         if hydrated:
             logger.info(

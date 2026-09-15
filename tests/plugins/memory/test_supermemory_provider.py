@@ -139,15 +139,309 @@ def family_provider(monkeypatch, tmp_path):
     return p
 
 
-def _canonical(memory, path, visibility):
-    return {"id": path, "memory": memory, "metadata": {
+def _canonical(memory, path, visibility, *, ident=None, similarity=None, **metadata_overrides):
+    metadata = {
         "index_schema_version": 4, "authority": "canonical", "source": "obsidian",
         "identity_scope": "owner", "canonical_root": "owner",
         "visibility": visibility, "relative_path": path,
-    }}
+    }
+    metadata.update(metadata_overrides)
+    result = {"id": ident or path, "memory": memory, "metadata": metadata,
+    "_source_container": (
+        "family_shared" if path.startswith("Jarvis/Family Shared/") else "owner_primary"
+    ), "_source_custom_id": "obsidian-" + hashlib.sha256(path.encode()).hexdigest()}
+    if similarity is not None:
+        result["similarity"] = similarity
+    return result
 
 
-def test_legacy_canonical_admission_accepts_string_schema_v4():
+def test_readiness_false_rejects_forged_family_path_before_qwen(family_provider, monkeypatch):
+    family_provider._temporal_filters_schema_v4_ready = False
+    family_provider._client.search_results = [
+        _canonical("OWNER PRIVATE", "Jarvis/Owner Private/Secret.md", "family_shared"),
+        _canonical("TRAVERSAL", "Jarvis/Family Shared/../Secret.md", "family_shared"),
+    ]
+    calls = []
+    monkeypatch.setattr(
+        "plugins.memory.supermemory._call_owner_reranker",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    assert family_provider.prefetch("secret") == ""
+    assert calls == []
+
+
+@pytest.mark.parametrize("ready", [False, True])
+@pytest.mark.parametrize("path", [
+    "/Jarvis/Family Shared/Secret.md",
+    "Jarvis\\Family Shared\\Secret.md",
+    "Jarvis/Family Shared//Secret.md",
+    "Jarvis/Family Shared/./Secret.md",
+    "Jarvis/Family Shared/../Secret.md",
+    "Family Shared/Secret.md",
+])
+def test_canonical_path_acl_is_unconditional_for_all_readiness_states(
+    family_provider, monkeypatch, ready, path,
+):
+    family_provider._temporal_filters_schema_v4_ready = ready
+    item = _canonical("FORGED", path, "family_shared")
+    item["_source_container"] = "family_shared"
+    calls = []
+    monkeypatch.setattr(
+        "plugins.memory.supermemory._call_owner_reranker",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    assert family_provider.prefetch("forged") == ""
+    assert calls == []
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_valid_owner_and_family_canonical_identity_is_readiness_independent(ready):
+    owner = _canonical("OWNER", "Jarvis/Facts/Owner.md", "owner_private")
+    shared = _canonical("SHARED", "Jarvis/Family Shared/People/Family.md", "family_shared")
+
+    assert _is_canonical_result(owner, schema_v4_ready=ready)
+    assert _is_canonical_result(shared, schema_v4_ready=ready)
+
+
+@pytest.mark.parametrize("ready", [False, True])
+@pytest.mark.parametrize("mutation", [
+    "container", "custom_id", "schema", "identity_scope", "canonical_root", "visibility",
+])
+def test_production_canonical_identity_failures_are_readiness_independent(ready, mutation):
+    item = _canonical("SHARED", "Jarvis/Family Shared/Fact.md", "family_shared")
+    if mutation == "container":
+        item["_source_container"] = "owner_primary"
+    elif mutation == "custom_id":
+        item["_source_custom_id"] = "obsidian-forged"
+    elif mutation == "schema":
+        item["metadata"]["index_schema_version"] = "4"
+    elif mutation == "identity_scope":
+        item["metadata"]["identity_scope"] = "family"
+    elif mutation == "canonical_root":
+        item["metadata"]["canonical_root"] = "family"
+    else:
+        item["metadata"]["visibility"] = "owner_private"
+
+    assert not _is_canonical_result(item, schema_v4_ready=ready)
+
+
+@pytest.mark.parametrize("path", [
+    "Root Note.md", "Jarvis/Facts/Fact.md", "Skills/Memory/SKILL.md",
+])
+def test_every_approved_owner_root_is_explicitly_authorized(path):
+    from plugins.memory.supermemory.search_v4 import canonical_scope_from_path
+    assert canonical_scope_from_path(path) == "owner_primary"
+
+
+@pytest.mark.parametrize("path", [
+    "People/Owner.md", "Other/Secret.md", "Family Shared/Fact.md",
+    "JarvisX/Fact.md", "skills/Fact.md",
+])
+def test_arbitrary_or_wrong_owner_roots_are_rejected(path):
+    from plugins.memory.supermemory.search_v4 import canonical_scope_from_path
+    assert canonical_scope_from_path(path) is None
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_source_less_claims_are_never_canonical_regardless_of_readiness(ready):
+    item = _canonical("FORGED", "Jarvis/Facts/Fact.md", "owner_private")
+    item.pop("_source_container")
+    item.pop("_source_custom_id")
+    assert not _is_canonical_result(item, schema_v4_ready=ready)
+
+
+def test_malformed_chunk_is_rejected_before_parent_hydration():
+    raw = _v4_chunk("Jarvis/Family Shared/People/Aaron.md")
+    raw["metadata"] = dict(raw["metadata"], identity_scope="family")
+    raw["documents"][0]["metadata"] = raw["metadata"]
+    calls = []
+
+    class Search:
+        @staticmethod
+        def memories(**kwargs):
+            return {"results": [raw]}
+
+    class Documents:
+        @staticmethod
+        def get(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("security-rejected chunk must not hydrate")
+
+    client = object.__new__(_SupermemoryClient)
+    setattr(client, "_client", SimpleNamespace(search=Search(), documents=Documents()))
+    client._canonical_document_search_mode = "documents"
+
+    assert client.search_documents("q", container_tag="family_shared") == []
+    assert calls == []
+
+
+def test_raw_custom_id_mismatch_is_rejected_without_parent_fetch():
+    raw = _v4_chunk("Jarvis/Family Shared/People/Aaron.md")
+    raw["documents"][0].update(
+        customId="obsidian-wrong", containerTags=["family_shared"],
+    )
+    calls = []
+
+    class Search:
+        memories = staticmethod(lambda **kwargs: {"results": [raw]})
+
+    class Documents:
+        @staticmethod
+        def get(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("mismatched summary identity must not hydrate")
+
+    client = object.__new__(_SupermemoryClient)
+    client._client = SimpleNamespace(search=Search(), documents=Documents())
+    client._canonical_document_search_mode = "documents"
+    assert client.search_documents("q", container_tag="family_shared") == []
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("level", "claim"),
+    [
+        ("result", {"containerTags": ["owner_primary"]}),
+        ("parent", {"containerTag": "owner_primary"}),
+        ("result", {"containerTags": []}),
+        ("parent", {"containerTags": "family_shared"}),
+        ("result", {"containerTags": ["family_shared", "owner_primary"]}),
+        ("parent", {"containerTag": ["family_shared"]}),
+        ("result", {"containerTags": ["family_shared"], "containerTag": "family_shared"}),
+        ("parent", {"container_tags": ["family_shared"], "containerTags": ["family_shared"]}),
+    ],
+)
+def test_explicit_raw_container_claim_rejects_before_parent_fetch(level, claim):
+    raw = _v4_chunk("Jarvis/Family Shared/People/Aaron.md")
+    (raw if level == "result" else raw["documents"][0]).update(claim)
+    calls = []
+
+    class Search:
+        memories = staticmethod(lambda **kwargs: {"results": [raw]})
+
+    class Documents:
+        @staticmethod
+        def get(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("invalid explicit container proof must not hydrate")
+
+    client = object.__new__(_SupermemoryClient)
+    client._client = SimpleNamespace(search=Search(), documents=Documents())
+    client._canonical_document_search_mode = "documents"
+    assert client.search_documents("q", container_tag="family_shared") == []
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("level", "claim"),
+    [
+        ("result", {"containerTags": ["family_shared"]}),
+        ("result", {"containerTag": "family_shared"}),
+        ("parent", {"container_tags": ["family_shared"]}),
+        ("parent", {"container_tag": "family_shared"}),
+    ],
+)
+def test_exact_explicit_raw_container_claim_allows_parent_fetch(level, claim):
+    path = "Jarvis/Family Shared/People/Aaron.md"
+    raw = _v4_chunk(path)
+    (raw if level == "result" else raw["documents"][0]).update(claim)
+    parent = _v4_parent(path)
+    calls = []
+
+    class Search:
+        memories = staticmethod(lambda **kwargs: {"results": [raw]})
+
+    class Documents:
+        @staticmethod
+        def get(ident, **kwargs):
+            calls.append((ident, kwargs))
+            return SimpleNamespace(
+                id=parent["id"], custom_id=parent["customId"],
+                container_tags=parent["containerTags"], metadata=parent["metadata"],
+            )
+
+    client = object.__new__(_SupermemoryClient)
+    client._client = SimpleNamespace(search=Search(), documents=Documents())
+    client._canonical_document_search_mode = "documents"
+    assert len(client.search_documents("q", container_tag="family_shared")) == 1
+    assert len(calls) == 1
+
+
+def test_strict_summary_proof_survives_parent_fetch_failure_through_qwen_and_formatting(
+    family_provider, monkeypatch,
+):
+    raw = _v4_chunk("Jarvis/Family Shared/People/Aaron.md", text="Aaron enjoys hiking.")
+    other = _v4_chunk(
+        "Jarvis/Family Shared/People/Other.md", ident="chunk-2", text="Other enjoys chess.",
+    )
+    for item in (raw, other):
+        expected = "obsidian-" + hashlib.sha256(item["metadata"]["relative_path"].encode()).hexdigest()
+        item["documents"][0].update(customId=expected, containerTags=["family_shared"])
+
+    class Search:
+        memories = staticmethod(lambda **kwargs: {"results": [raw, other]})
+
+    class Documents:
+        @staticmethod
+        def get(*args, **kwargs):
+            raise TimeoutError("ordinary parent lookup timeout")
+
+    client = object.__new__(_SupermemoryClient)
+    client._client = SimpleNamespace(search=Search(), documents=Documents())
+    client._container_tag = "family_shared"
+    client._search_mode = "documents"
+    client._canonical_document_search_mode = "documents"
+    family_provider._client = client
+    qwen_candidates = []
+    monkeypatch.setattr(
+        "plugins.memory.supermemory._call_owner_reranker",
+        lambda query, candidates, **kwargs: (
+            qwen_candidates.extend(candidates)
+            or {"selected_ids": [raw["id"]], "rejected_ids": [other["id"]], "sufficient": True}
+        ),
+    )
+
+    context = family_provider.prefetch("Tell me about Aaron")
+    assert [item["id"] for item in qwen_candidates] == [raw["id"], other["id"]]
+    assert "Aaron enjoys hiking." in context
+    assert "Other enjoys chess." not in context
+
+
+def test_parent_integrity_failure_drops_without_summary_fallback_before_qwen(
+    family_provider, monkeypatch,
+):
+    raw = _v4_chunk("Jarvis/Family Shared/People/Aaron.md", text="DO NOT FORMAT")
+    expected = "obsidian-" + hashlib.sha256(raw["metadata"]["relative_path"].encode()).hexdigest()
+    raw["documents"][0].update(customId=expected, containerTags=["family_shared"])
+    wrong_parent = _v4_parent("Jarvis/Family Shared/People/Aaron.md", custom_id="obsidian-wrong")
+
+    class Search:
+        memories = staticmethod(lambda **kwargs: {"results": [raw]})
+
+    class Documents:
+        get = staticmethod(lambda *args, **kwargs: SimpleNamespace(
+            id=wrong_parent["id"], custom_id=wrong_parent["customId"],
+            container_tags=wrong_parent["containerTags"], metadata=wrong_parent["metadata"],
+        ))
+
+    client = object.__new__(_SupermemoryClient)
+    client._client = SimpleNamespace(search=Search(), documents=Documents())
+    client._container_tag = "family_shared"
+    client._search_mode = "documents"
+    client._canonical_document_search_mode = "documents"
+    family_provider._client = client
+    calls = []
+    monkeypatch.setattr(
+        "plugins.memory.supermemory._call_owner_reranker",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    assert family_provider.prefetch("Tell me about Aaron") == ""
+    assert calls == []
+
+
+def test_verified_canonical_admission_is_readiness_independent():
     item = _canonical(
         "evidence", "Jarvis/Family Shared/Food/Restaurants/Example.md", "family_shared",
     )
@@ -612,8 +906,10 @@ def test_structured_conflict_is_suppressed_before_result_limit(provider, monkeyp
     provider._max_recall_results = 1
     conversation = {"id": "u", "memory": "[role: user] Carol [user:end]", "metadata": {
         "source": "conversation", "speaker": "user", "fact_subject": "Dennis", "fact_key": "wife", "fact_value": "Carol"}}
-    canonical = {"id": "c", "memory": "Alice", "metadata": {
-        "source": "obsidian", "authority": "canonical", "fact_subject": "Dennis", "fact_key": "wife", "fact_value": "Alice"}}
+    canonical = _canonical(
+        "Alice", "Jarvis/Facts/Relationships.md", "owner_private", ident="c",
+        fact_subject="Dennis", fact_key="wife", fact_value="Alice",
+    )
     def rank(query, candidates, **kwargs):
         return {"selected_ids": ["u", "c"], "rejected_ids": [], "sufficient": True, "scores": [1.0, 0.9]}
     monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker", rank)
@@ -767,8 +1063,9 @@ def test_temporal_retrieval_sends_and_locally_applies_filters_when_schema_v4_rea
 def test_owner_prefetch_preserves_canonical_when_optional_profile_times_out(provider):
     provider._container_tag = "owner_primary"
     provider._prefetch_timeout = 0.12
-    canonical = {"id": "c1", "memory": "Dennis's venue is Ghost Ranch.",
-                 "metadata": {"source": "obsidian", "authority": "canonical"}}
+    canonical = _canonical(
+        "Dennis's venue is Ghost Ranch.", "Jarvis/Facts/Venues.md", "owner_private", ident="c1",
+    )
 
     def slow_profile(*args, **kwargs):
         time.sleep(0.3)
@@ -841,8 +1138,9 @@ def test_owner_prefetch_discards_result_that_finishes_after_deadline(provider):
 def test_owner_prefetch_discards_optional_result_completed_after_deadline(provider):
     provider._container_tag = "owner_primary"
     provider._prefetch_timeout = 0.06
-    canonical = {"id": "c1", "memory": "Canonical evidence.",
-                 "metadata": {"source": "obsidian", "authority": "canonical"}}
+    canonical = _canonical(
+        "Canonical evidence.", "Jarvis/Facts/Evidence.md", "owner_private", ident="c1",
+    )
     late = {"id": "late", "memory": "LATE OPTIONAL SECRET",
             "metadata": {"source": "conversation", "speaker": "user"}}
     provider._client.get_profile = lambda *args, **kwargs: {
@@ -863,8 +1161,9 @@ def test_owner_prefetch_discards_optional_result_completed_after_deadline(provid
 def test_manager_50ms_deadline_beats_350ms_provider_and_turn_two_is_fresh(provider):
     provider._container_tag = "owner_primary"
     provider._prefetch_timeout = 0.35
-    canonical = {"id": "fresh", "memory": "TURN TWO FRESH",
-                 "metadata": {"source": "obsidian", "authority": "canonical"}}
+    canonical = _canonical(
+        "TURN TWO FRESH", "Jarvis/Facts/Fresh.md", "owner_private", ident="fresh",
+    )
     calls = 0
     observed_timeouts = []
 
@@ -879,8 +1178,9 @@ def test_manager_50ms_deadline_beats_350ms_provider_and_turn_two_is_fresh(provid
         observed_timeouts.append(kwargs["timeout"])
         if "first unique query" in args[0]:
             time.sleep(0.35)
-            return [{"id": "late", "memory": "TURN ONE LATE",
-                     "metadata": {"source": "obsidian", "authority": "canonical"}}]
+            return [_canonical(
+                "TURN ONE LATE", "Jarvis/Facts/Late.md", "owner_private", ident="late",
+            )]
         return [canonical]
 
     provider._client.search_documents = documents
@@ -989,7 +1289,10 @@ def test_owner_primary_prefetch_uses_only_canonical_documents(provider):
         "dynamic": ["Assistant-derived recent claim"],
         "search_results": [
             {"id": "bad", "memory": "[role: assistant] Wrong wife", "metadata": {"type": "conversation"}},
-            {"id": "good", "memory": "Dennis's wife is Courtnee.", "metadata": {"source": "obsidian", "authority": "canonical"}},
+            _canonical(
+                "Dennis's wife is Courtnee.", "Jarvis/Family Shared/People/Dennis.md",
+                "family_shared", ident="good",
+            ),
         ],
     }
     provider.on_turn_start(1, "start")
@@ -1006,20 +1309,15 @@ def test_owner_primary_prefetch_resolves_speaker_relative_parent_query(provider)
         "static": [],
         "dynamic": [],
         "search_results": [
-            {
-                "id": "collision",
-                "memory": "Dennis William Malone is Dennis Malone’s paternal uncle; Phillip D. Malone is his sibling.",
-                "metadata": {
-                    "source": "obsidian",
-                    "authority": "canonical",
-                    "relative_path": "Jarvis/Family Shared/People/Dennis William Malone.md",
-                },
-            },
-            {
-                "id": "father",
-                "memory": "- Phillip D. Malone is Dennis Malone’s father.",
-                "metadata": {"source": "obsidian", "authority": "canonical"},
-            }
+            _canonical(
+                "Dennis William Malone is Dennis Malone’s paternal uncle; Phillip D. Malone is his sibling.",
+                "Jarvis/Family Shared/People/Dennis William Malone.md", "family_shared",
+                ident="collision",
+            ),
+            _canonical(
+                "- Phillip D. Malone is Dennis Malone’s father.",
+                "Jarvis/Family Shared/People/Dennis Malone.md", "family_shared", ident="father",
+            ),
         ],
     }
 
@@ -1124,11 +1422,10 @@ def test_owner_mother_in_law_query_ranks_direct_profile_without_rewrite():
 ])
 def test_owner_named_restaurant_recall_keeps_only_exact_note_and_reciprocal_dishes(provider, query):
     provider._container_tag = "owner_primary"
-    canonical = {"source": "obsidian", "authority": "canonical"}
-    zipps = {"memory": "restaurant: Zipp's\n### Courtnee\n- Mozzarella Sticks — prefers ranch.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Restaurants/Zipp's.md"}}
-    mozzarella = {"memory": "# Mozzarella Sticks\n- [[Restaurants/Zipp's]] — Courtnee likes them with ranch.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Dishes/Mozzarella Sticks.md"}}
-    parlay = {"memory": "restaurant: Parlay\nCourtnee ordered the Honey Hot Chicken Sandwich.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Restaurants/Parlay.md"}}
-    chicken = {"memory": "# Chicken Sandwiches\n- [[Restaurants/Parlay]] — Courtnee rated it 3/5.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Dishes/Chicken Sandwiches.md"}}
+    zipps = _canonical("restaurant: Zipp's\n### Courtnee\n- Mozzarella Sticks — prefers ranch.", "Jarvis/Family Shared/Food/Restaurants/Zipp's.md", "family_shared")
+    mozzarella = _canonical("# Mozzarella Sticks\n- [[Restaurants/Zipp's]] — Courtnee likes them with ranch.", "Jarvis/Family Shared/Food/Dishes/Mozzarella Sticks.md", "family_shared")
+    parlay = _canonical("restaurant: Parlay\nCourtnee ordered the Honey Hot Chicken Sandwich.", "Jarvis/Family Shared/Food/Restaurants/Parlay.md", "family_shared")
+    chicken = _canonical("# Chicken Sandwiches\n- [[Restaurants/Parlay]] — Courtnee rated it 3/5.", "Jarvis/Family Shared/Food/Dishes/Chicken Sandwiches.md", "family_shared")
     provider._client.profile_response = {"static": [], "dynamic": [], "search_results": [parlay, chicken, mozzarella, zipps]}
 
     result = provider.prefetch(query)
@@ -1143,15 +1440,15 @@ def test_owner_named_restaurant_recall_keeps_only_exact_note_and_reciprocal_dish
 def test_named_restaurant_prefetch_has_no_fixed_authority_seats_and_uniform_five_limit(provider):
     provider._container_tag = "owner_primary"
     provider._max_recall_results = 5
-    canonical_meta = {"source": "obsidian", "authority": "canonical"}
-    canonical = [{
-        "id": "venue", "memory": "restaurant: Zipp's\n- Usual order: burger",
-        "metadata": {**canonical_meta, "relative_path": "Jarvis/Family Shared/Food/Restaurants/Zipp's.md"},
-    }]
-    canonical += [{
-        "id": f"dish-{index}", "memory": f"# Dish {index}\n- [[Restaurants/Zipp's]] — detail {index}",
-        "metadata": {**canonical_meta, "relative_path": f"Jarvis/Family Shared/Food/Dishes/Dish {index}.md"},
-    } for index in range(4)]
+    canonical = [_canonical(
+        "restaurant: Zipp's\n- Usual order: burger",
+        "Jarvis/Family Shared/Food/Restaurants/Zipp's.md", "family_shared", ident="venue",
+    )]
+    canonical += [_canonical(
+        f"# Dish {index}\n- [[Restaurants/Zipp's]] — detail {index}",
+        f"Jarvis/Family Shared/Food/Dishes/Dish {index}.md", "family_shared",
+        ident=f"dish-{index}",
+    ) for index in range(4)]
     conversations = [{
         "id": f"conversation-{index}",
         "memory": f"[role: user]\nAt Zipp's I liked conversation detail {index}.\n[user:end]",
@@ -1168,12 +1465,11 @@ def test_named_restaurant_prefetch_has_no_fixed_authority_seats_and_uniform_five
 
 def test_owner_recall_keeps_only_requested_person_section(provider):
     provider._container_tag = "owner_primary"
-    canonical = {"source": "obsidian", "authority": "canonical"}
     provider._client.profile_response = {"static": [], "dynamic": [], "search_results": [{
-        "id": "ikes",
-        "memory": "restaurant: Ike's\n### Dennis\n- Madison Bumgarner on sourdough.\n### Lauren\n- Ike's Reuben.",
-        "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Restaurants/Ike's.md"},
-    }]}
+        **_canonical(
+            "restaurant: Ike's\n### Dennis\n- Madison Bumgarner on sourdough.\n### Lauren\n- Ike's Reuben.",
+            "Jarvis/Family Shared/Food/Restaurants/Ike's.md", "family_shared", ident="ikes",
+        )}]}
 
     result = provider.prefetch("What is my favorite order at Ike's?")
 
@@ -1183,11 +1479,10 @@ def test_owner_recall_keeps_only_requested_person_section(provider):
 
 def test_owner_named_parlay_recall_excludes_zipps_person_collision(provider):
     provider._container_tag = "owner_primary"
-    canonical = {"source": "obsidian", "authority": "canonical"}
     provider._client.profile_response = {"static": [], "dynamic": [], "search_results": [
-        {"memory": "restaurant: Zipp's\nCourtnee likes mozzarella sticks with ranch.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Restaurants/Zipp's.md"}},
-        {"memory": "# Chicken Sandwiches\n- [[Restaurants/Parlay]] — Courtnee rated the Honey Hot Chicken Sandwich 3/5.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Dishes/Chicken Sandwiches.md"}},
-        {"memory": "restaurant: Parlay\nCourtnee liked the sweet heat but disliked the breading and bun.", "metadata": {**canonical, "relative_path": "Jarvis/Family Shared/Food/Restaurants/Parlay.md"}},
+        _canonical("restaurant: Zipp's\nCourtnee likes mozzarella sticks with ranch.", "Jarvis/Family Shared/Food/Restaurants/Zipp's.md", "family_shared"),
+        _canonical("# Chicken Sandwiches\n- [[Restaurants/Parlay]] — Courtnee rated the Honey Hot Chicken Sandwich 3/5.", "Jarvis/Family Shared/Food/Dishes/Chicken Sandwiches.md", "family_shared"),
+        _canonical("restaurant: Parlay\nCourtnee liked the sweet heat but disliked the breading and bun.", "Jarvis/Family Shared/Food/Restaurants/Parlay.md", "family_shared"),
     ]}
 
     result = provider.prefetch("What did Courtnee think about Parlay?")
@@ -1244,7 +1539,9 @@ def _v4_restaurant(path, source, *, document_id="doc-venue"):
         f"entity_name: {path.rsplit('/', 1)[-1][:-3]}\n[/canonical-identity]\n\n"
     )
     chunk = {"id": f"{document_id}:0", "_parent_document_id": document_id,
-             "memory": source.splitlines()[0], "metadata": metadata}
+             "memory": source.splitlines()[0], "metadata": metadata,
+             "_source_container": "family_shared",
+             "_source_custom_id": "obsidian-" + hashlib.sha256(path.encode()).hexdigest()}
     document = {
         "id": document_id,
         "custom_id": "obsidian-" + hashlib.sha256(path.encode()).hexdigest(),
@@ -1379,8 +1676,49 @@ def test_gate_off_exact_date_food_miss_hydrates_verified_canonical_parent(
     )
 
     assert "pork tenderloin sandwich with crinkle-cut fries" in result
-    assert provider._client.get_document_calls == []
+    assert len(provider._client.get_document_calls) == 1
     assert all(call["filters"] is None for call in provider._client.search_calls)
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_exact_date_hydration_mints_verified_internal_source_proof(
+        provider, tmp_path, ready):
+    provider._temporal_filters_schema_v4_ready = ready
+    source = "restaurant: Hob Nob Sports Grill\n### 2026-09-12\n- Verified dinner."
+    custom_id = _install_exact_date_restaurant(tmp_path, provider, source)
+
+    results = provider._hydrate_exact_date_restaurants(
+        {"event_date": ("2026-09-12",)}, deadline=time.monotonic() + 1,
+    )
+
+    assert len(results) == 1
+    assert results[0]["_source_container"] == "family_shared"
+    assert results[0]["_source_custom_id"] == custom_id
+    assert _is_canonical_result(results[0], schema_v4_ready=ready)
+
+
+@pytest.mark.parametrize("ready", [False, True])
+@pytest.mark.parametrize("mutation", ["container", "custom_id", "path", "integrity"])
+def test_exact_date_hydration_drops_unverified_parent_without_chunk_fallback(
+        provider, tmp_path, ready, mutation):
+    provider._temporal_filters_schema_v4_ready = ready
+    source = "restaurant: Hob Nob Sports Grill\n### 2026-09-12\n- Verified dinner."
+    custom_id = _install_exact_date_restaurant(tmp_path, provider, source)
+    document = provider._client.documents_by_id[custom_id]
+    if mutation == "container":
+        document["container_tags"] = ["owner_primary"]
+    elif mutation == "custom_id":
+        document["custom_id"] = "obsidian-forged"
+    elif mutation == "path":
+        document["metadata"] = dict(
+            document["metadata"], relative_path="Jarvis/Family Shared/Food/Restaurants/Other.md",
+        )
+    else:
+        document["content"] += "\n- Unverified provider text."
+
+    assert provider._hydrate_exact_date_restaurants(
+        {"event_date": ("2026-09-12",)}, deadline=time.monotonic() + 1,
+    ) == []
 
 
 def test_exact_date_hydration_fails_closed_for_non_v4_source(provider, tmp_path):
@@ -1622,9 +1960,8 @@ def test_owner_capture_respects_disabled_toggle(monkeypatch, tmp_path):
 
 def test_owner_prefetch_reranker_selects_valid_evidence(provider, monkeypatch):
     provider._container_tag = "owner_primary"
-    canonical = {"source": "obsidian", "authority": "canonical"}
     provider._client.profile_response = {"static": [], "dynamic": [], "search_results": [
-        {"id": "c1", "memory": "Alex prefers tea.", "metadata": canonical},
+        _canonical("Alex prefers tea.", "Jarvis/Facts/Alex.md", "owner_private", ident="c1"),
     ]}
     conversation = [
         {"id": "u1", "memory": "[role: user]\nI prefer coffee.\n[user:end]", "metadata": {"authority": "non-authoritative", "source": "conversation", "speaker": "user"}},
@@ -1784,14 +2121,14 @@ def test_owner_reranker_combines_up_to_twenty_unique_candidates_per_source(provi
                 "rejected_ids": [], "sufficient": True}
 
     monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker", fake_reranker)
-    canonical = [
-        {"id": f"c{index}", "memory": f"Canonical fact {index}",
-         "metadata": {"source": "obsidian", "authority": "canonical"}}
-        for index in range(20)
-    ]
+    canonical = [_canonical(
+        f"Canonical fact {index}", f"Jarvis/Facts/Fact {index}.md", "owner_private",
+        ident=f"c{index}",
+    ) for index in range(20)]
     canonical.insert(1, {**canonical[0]})
-    canonical.insert(2, {"id": "different-id", "memory": "Canonical fact 0",
-                         "metadata": {"source": "obsidian", "authority": "canonical"}})
+    canonical.insert(2, _canonical(
+        "Canonical fact 0", "Jarvis/Facts/Fact 0.md", "owner_private", ident="different-id",
+    ))
     conversations = [
         {"id": f"u{index}", "memory": f"[role: user]\nConversation fact {index}\n[user:end]",
          "metadata": {"type": "owner_conversation"}}
@@ -1824,19 +2161,31 @@ def test_rank_one_paraphrase_reaches_one_pass_reranker_despite_twenty_query_copy
                 "rejected_ids": [], "sufficient": True}
         ),
     )
-    canonical_meta = {"source": "obsidian", "authority": "canonical"}
     conversation_meta = {"type": "owner_conversation"}
-    distractor_meta = conversation_meta if target_source == "canonical" else canonical_meta
-    target_meta = canonical_meta if target_source == "canonical" else conversation_meta
-    distractors = [{"id": f"copy-{i}", "memory": f"[role: user]\nfavorite color favorite color exact query copy {i}\n[user:end]",
-                    "metadata": distractor_meta} for i in range(20)]
+    if target_source == "canonical":
+        distractors = [{"id": f"copy-{i}", "memory": f"[role: user]\nfavorite color favorite color exact query copy {i}\n[user:end]",
+                        "metadata": conversation_meta} for i in range(20)]
+    else:
+        distractors = [_canonical(
+            f"favorite color favorite color exact query copy {i}",
+            f"Jarvis/Facts/Color Copy {i}.md", "owner_private", ident=f"copy-{i}",
+        ) for i in range(20)]
     target_text = ("The shade I like most is cerulean." if target_source == "canonical" else
                    "[role: user]\nThe shade I like most is cerulean.\n[user:end]")
-    target = {"id": "target", "memory": target_text, "metadata": target_meta}
-    other_source = [target] + [{"id": f"other-{i}",
-                               "memory": (f"unrelated {i}" if target_source == "canonical" else
-                                          f"[role: user]\nunrelated {i}\n[user:end]"),
-                               "metadata": target_meta} for i in range(19)]
+    if target_source == "canonical":
+        target = _canonical(
+            target_text, "Jarvis/Facts/Favorite Color.md", "owner_private", ident="target",
+        )
+        other_source = [target] + [_canonical(
+            f"unrelated {i}", f"Jarvis/Facts/Unrelated {i}.md", "owner_private",
+            ident=f"other-{i}",
+        ) for i in range(19)]
+    else:
+        target = {"id": "target", "memory": target_text, "metadata": conversation_meta}
+        other_source = [target] + [{
+            "id": f"other-{i}", "memory": f"[role: user]\nunrelated {i}\n[user:end]",
+            "metadata": conversation_meta,
+        } for i in range(19)]
     conversation_items = distractors if target_source == "canonical" else other_source
     provider._rerank_owner_candidates(
         "favorite color", distractors + other_source,
@@ -1895,8 +2244,10 @@ def test_owner_reranker_non_finite_score_fails_closed(monkeypatch, score):
 
 def test_exact_last_night_dinner_regression_retains_labeled_canonical_and_user_evidence(provider, monkeypatch):
     provider._container_tag = "owner_primary"
-    canonical = {"id": "dinner", "memory": "### 2026-09-11 — dine-in dinner\n- Location: Ghost Ranch",
-                 "metadata": {"source": "obsidian", "authority": "canonical", "eventDate": ["2026-09-11"]}}
+    canonical = _canonical(
+        "### 2026-09-11 — dine-in dinner\n- Location: Ghost Ranch",
+        "Jarvis/Facts/Dinner.md", "owner_private", ident="dinner", eventDate=["2026-09-11"],
+    )
     conversation = {"id": "hermes-owner-conversation:session-1",
                     "memory": "[role: user]\nWe had dinner at Ghost Ranch last night.\n[user:end]",
                     "metadata": {"type": "owner_conversation", "event_date": "2026-09-11"}}
@@ -1926,8 +2277,10 @@ def test_single_dated_candidate_bypasses_reranker(provider, monkeypatch):
         called = True
         raise AssertionError("single eligible dated candidate must bypass reranker")
     monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker", should_not_call)
-    item = {"id": "one", "memory": "### 2026-09-11 — dinner\nGhost Ranch",
-            "metadata": {"source": "obsidian", "authority": "canonical"}}
+    item = _canonical(
+        "### 2026-09-11 — dinner\nGhost Ranch", "Jarvis/Facts/Dinner.md",
+        "owner_private", ident="one",
+    )
     assert provider._rerank_owner_candidates("dinner 2026-09-11", [item]) == [item]
     assert called is False
 
@@ -1943,8 +2296,8 @@ def test_owner_reranker_consumes_only_remaining_deadline_budget(provider, monkey
 
     monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker", fake_reranker)
     items = [
-        {"id": "c1", "memory": "one", "metadata": {"source": "obsidian", "authority": "canonical"}},
-        {"id": "c2", "memory": "two", "metadata": {"source": "obsidian", "authority": "canonical"}},
+        _canonical("one", "Jarvis/Facts/One.md", "owner_private", ident="c1"),
+        _canonical("two", "Jarvis/Facts/Two.md", "owner_private", ident="c2"),
     ]
     deadline = time.monotonic() + 0.2
     assert provider._rerank_owner_candidates("question", items, deadline=deadline) == [items[0]]
@@ -2085,18 +2438,15 @@ def test_search_tool_formats_results(provider):
 
 def test_owner_search_tool_scopes_first_person_restaurant_results(provider):
     provider._container_tag = "owner_primary"
-    canonical = {"source": "obsidian", "authority": "canonical",
-                 "relative_path": "Jarvis/Family Shared/Food/Restaurants/Perfect Pear Bistro.md"}
-    provider._client.search_results = [{
-        "id": "pear",
-        "memory": (
+    provider._client.search_results = [_canonical(
+        (
             "restaurant: Perfect Pear Bistro\n"
             "### Courtnee\n- Favorite: Green Chili Mac.\n"
             "### Dennis\n- Chili was pretty good. Likes the Pear Martini and Pear Mule."
         ),
-        "similarity": 0.95,
-        "metadata": canonical,
-    }]
+        "Jarvis/Family Shared/Food/Restaurants/Perfect Pear Bistro.md", "family_shared",
+        ident="pear", similarity=0.95,
+    )]
 
     result = json.loads(provider.handle_tool_call(
         "supermemory_search", {"query": "What do I like at Perfect Pear Bistro?"}
@@ -2380,20 +2730,21 @@ def test_schema_v4_canonical_acl_rejects_missing_malformed_and_spoofed_metadata(
     assert secret not in caplog.text
 
 
-def test_gate_off_preserves_schema_v3_canonical_recall(provider):
+@pytest.mark.parametrize("ready", [False, True])
+def test_source_less_schema_v3_canonical_fails_closed_for_all_readiness_states(provider, ready):
     provider._container_tag = "owner_primary"
-    provider._temporal_filters_schema_v4_ready = False
-    legacy = {"id": "legacy", "memory": "Legacy canonical fact survives rollout.",
+    provider._temporal_filters_schema_v4_ready = ready
+    legacy = {"id": "legacy", "memory": "Source-less canonical claim.",
               "metadata": {"schema_version": "3", "source": "obsidian",
                            "authority": "canonical", "visibility": "owner"}}
     provider._client.search_documents = lambda *args, **kwargs: [legacy]
     provider._client.search_memories = lambda *args, **kwargs: []
     provider._client.get_profile = lambda *args, **kwargs: {
         "static": [], "dynamic": [], "search_results": []}
-    assert "Legacy canonical fact survives rollout" in provider.prefetch("legacy fact")
+    assert provider.prefetch("legacy fact") == ""
 
 
-def test_gate_off_live_extracted_capture_reaches_qwen_and_is_selected(provider, monkeypatch):
+def test_gate_off_source_less_canonical_is_dropped_before_live_extracted_capture(provider, monkeypatch):
     provider._container_tag = "owner_primary"
     provider._temporal_filters_schema_v4_ready = False
     canonical = {"id": "legacy", "memory": "Ghost Ranch is a venue.", "metadata": {
@@ -2417,16 +2768,15 @@ def test_gate_off_live_extracted_capture_reaches_qwen_and_is_selected(provider, 
     provider._client.get_profile = lambda *args, **kwargs: {
         "static": [], "dynamic": [], "search_results": []}
     calls = []
-    def qwen(query, candidates, **kwargs):
-        calls.append(candidates)
-        return {"selected_ids": [extracted["id"]], "rejected_ids": [canonical["id"]],
-                "sufficient": True, "scores": [1.0]}
-    monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker", qwen)
+    monkeypatch.setattr(
+        "plugins.memory.supermemory._call_owner_reranker",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
 
     result = provider.prefetch("Where did I have dinner last night?")
 
-    assert len(calls) == 1
-    assert {candidate["id"] for candidate in calls[0]} == {"legacy", extracted["id"]}
+    assert calls == []
+    assert "Ghost Ranch is a venue" not in result
     assert "I had dinner at Ghost Ranch last night" in result
 
 
@@ -2453,18 +2803,19 @@ def test_extracted_owner_conversation_rejects_non_user_and_forged_shapes(provide
     ]) == []
 
 
-def test_family_never_accepts_gate_off_legacy_owner_visibility():
+@pytest.mark.parametrize("ready", [False, True])
+def test_source_less_legacy_owner_visibility_is_never_accepted(ready):
     from plugins.memory.supermemory import _visible_canonical_results
     owner = {"id": "owner", "metadata": {
         "schema_version": "3", "source": "obsidian", "authority": "canonical",
         "identity_scope": "owner", "canonical_root": "owner", "visibility": "owner",
     }}
     assert _visible_canonical_results(
-        [owner], family=True, authenticated_family=True, schema_v4_ready=False,
+        [owner], family=True, authenticated_family=True, schema_v4_ready=ready,
     ) == []
     assert _visible_canonical_results(
-        [owner], family=False, schema_v4_ready=False,
-    ) == [owner]
+        [owner], family=False, schema_v4_ready=ready,
+    ) == []
 
 
 def test_production_shape_prefetch_builds_20_plus_20_one_call_and_keeps_user_evidence(
@@ -2476,6 +2827,10 @@ def test_production_shape_prefetch_builds_20_plus_20_one_call_and_keeps_user_evi
     canonical = [{
         "id": f"canonical-{index}", "memory": f"Canonical fact {index}",
         "metadata": _v4_canonical_metadata(f"Jarvis/Owner Private/Fact {index}.md"),
+        "_source_container": "owner_primary",
+        "_source_custom_id": "obsidian-" + hashlib.sha256(
+            f"Jarvis/Owner Private/Fact {index}.md".encode()
+        ).hexdigest(),
     } for index in range(20)]
     canonical[0]["metadata"].update({
         "fact_subject": "Dennis", "fact_key": "seat", "fact_value": "aisle",
@@ -2518,16 +2873,20 @@ def test_production_shape_prefetch_builds_20_plus_20_one_call_and_keeps_user_evi
 
 def test_family_acl_requires_authenticated_server_context_and_never_returns_private():
     from plugins.memory.supermemory import _visible_canonical_results
-    private = {"id": "private", "metadata": _v4_canonical_metadata()}
+    private = _canonical("private", "Jarvis/Owner Private/Fact.md", "owner_private")
     shared = {"id": "shared", "metadata": _v4_canonical_metadata(
-        "Jarvis/Family Shared/Fact.md", visibility="family_shared")}
+        "Jarvis/Family Shared/Fact.md", visibility="family_shared"),
+        "_source_container": "family_shared",
+        "_source_custom_id": "obsidian-" + hashlib.sha256(
+            "Jarvis/Family Shared/Fact.md".encode()
+        ).hexdigest()}
     items = [private, shared]
     assert _visible_canonical_results(items, family=True) == []
     assert [item["id"] for item in _visible_canonical_results(
         items, family=True, authenticated_family=True,
     )] == ["shared"]
     assert [item["id"] for item in _visible_canonical_results(items, family=False)] == [
-        "private", "shared"]
+        "Jarvis/Owner Private/Fact.md", "shared"]
 
 
 def _v4_chunk(path, *, text="Canonical fact", ident="chunk-1", **changes):
