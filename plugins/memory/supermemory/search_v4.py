@@ -58,10 +58,13 @@ def _summary_proves_identity(result: Any, container_tag: str) -> bool:
     return bool(custom_id == expected and (tags == [container_tag] or tag == container_tag))
 
 
-def canonical_chunk_preauthorized(result: Any, container_tag: str) -> bool:
+def canonical_chunk_preauthorized(
+    result: Any, container_tag: str, *, canonical_scope: str | None = None,
+) -> bool:
     """Reject malformed canonical identity before fetching its parent."""
     metadata = field(result, "metadata")
-    if not isinstance(metadata, dict) or container_tag not in CANONICAL_CONTAINERS:
+    policy_container = canonical_scope or container_tag
+    if not isinstance(metadata, dict) or policy_container not in CANONICAL_CONTAINERS:
         return False
     parents = field(result, "documents")
     if (not _explicit_container_claim_agrees(result, container_tag)
@@ -70,7 +73,7 @@ def canonical_chunk_preauthorized(result: Any, container_tag: str) -> bool:
         return False
     scope = canonical_scope_from_path(metadata.get("relative_path"))
     return bool(
-        scope == container_tag
+        scope == policy_container
         and metadata.get("index_schema_version") == 4
         and not isinstance(metadata.get("index_schema_version"), bool)
         and metadata.get("source") == "obsidian"
@@ -103,12 +106,15 @@ def search_documents_v4(client, query: str, *, container_tag: str, limit: int,
 
 
 def normalize_document_chunk(result, container_tag: str, hydrated_parent,
-                             *, allow_summary_proof: bool = False) -> dict | None:
+                             *, allow_summary_proof: bool = False,
+                             canonical_scope: str | None = None) -> dict | None:
     """Accept only chunks whose hydrated parent proves identity and scope."""
     text = field(result, "chunk")
     parents = field(result, "documents")
     metadata = field(result, "metadata")
-    if (not canonical_chunk_preauthorized(result, container_tag)
+    policy_container = canonical_scope or container_tag
+    if (not canonical_chunk_preauthorized(
+            result, container_tag, canonical_scope=policy_container)
             or not isinstance(text, str) or not text.strip()
             or field(result, "is_aggregated", field(result, "isAggregated", False))
             or not isinstance(parents, list) or len(parents) != 1
@@ -130,7 +136,7 @@ def normalize_document_chunk(result, container_tag: str, hydrated_parent,
     custom_id = field(proof_parent, "custom_id", field(proof_parent, "customId", ""))
     if (metadata.get("source") != "obsidian" or metadata.get("authority") != "canonical"
             or parent_id not in {hydrated_id, custom_id}
-            or source_container != container_tag or not expected_custom_id
+            or source_container != policy_container or not expected_custom_id
             or custom_id != expected_custom_id):
         return None
     document_id = field(result, "document_id", field(result, "documentId"))
@@ -159,5 +165,6 @@ def normalize_document_chunk(result, container_tag: str, hydrated_parent,
         text = "[canonical-identity]\n" + "\n".join(identity) + "\n[/canonical-identity]\n\n" + text
     return {"id": chunk_id, "memory": text, "metadata": metadata,
             "similarity": field(result, "similarity"), "updated_at": updated or parent_updated,
-            "_source_container": source_container, "_parent_document_id": parent_id,
+            "_source_container": container_tag, "_canonical_scope": source_container,
+            "_parent_document_id": parent_id,
             "_source_custom_id": custom_id}

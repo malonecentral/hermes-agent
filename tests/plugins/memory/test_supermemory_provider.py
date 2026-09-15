@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.memory_manager import MemoryManager
+from agent.request_context import bind_mcp_meta
 from agent.turn_context import compose_user_api_content
 from plugins.memory.supermemory import (
     SupermemoryMemoryProvider,
@@ -30,6 +31,7 @@ from plugins.memory.supermemory import (
     _scope_owner_dated_event_results,
     _scope_owner_restaurant_results,
 )
+from plugins.memory.supermemory.topology import load_routing_projection
 
 
 class FakeClient:
@@ -44,6 +46,8 @@ class FakeClient:
         self.add_calls = []
         self.search_calls = []
         self.search_results = []
+        self.search_results_by_container = {}
+        self.fail_containers = set()
         self.profile_response = {"static": [], "dynamic": [], "search_results": []}
         self.ingest_calls = []
         self.forgotten_ids = []
@@ -65,11 +69,16 @@ class FakeClient:
 
     def search_memories(self, query, *, limit=5, container_tag=None, search_mode=None, timeout=None, filters=None):
         self.search_calls.append({"query": query, "container_tag": container_tag, "search_mode": search_mode, "filters": filters})
-        return self.search_results
+        if container_tag in self.fail_containers:
+            raise RuntimeError("source unavailable")
+        return self.search_results_by_container.get(container_tag, self.search_results)
 
-    def search_documents(self, query, *, limit=5, container_tag=None, timeout=None, filters=None):
+    def search_documents(self, query, *, limit=5, container_tag=None, timeout=None, filters=None,
+                         canonical_scope=None):
         self.search_calls.append({"query": query, "container_tag": container_tag, "search_mode": "documents", "filters": filters})
-        return self.search_results
+        if container_tag in self.fail_containers:
+            raise RuntimeError("source unavailable")
+        return self.search_results_by_container.get(container_tag, self.search_results)
 
     def get_profile(self, query=None, *, container_tag=None, timeout=None, augment_search=True):
         self.profile_queries.append(query)
@@ -472,6 +481,106 @@ def test_family_prefetch_is_canonical_shared_only_and_one_bounded_search(family_
     call = family_provider._client.search_calls[0]
     assert call["container_tag"] == "family_shared" and call["search_mode"] == "documents"
     assert family_provider._client.profile_queries == []
+
+
+def _projected_conversation(memory, container="owner_chat_v2"):
+    return {
+        "id": memory, "memory": f"[role: user]\n{memory}\n[user:end]",
+        "metadata": {"type": "owner_conversation", "authority": "non-authoritative",
+                     "provenance": "user-authored role-delimited statement",
+                     "session_id": "session", "request_id": "request"},
+        "_source_container": container,
+        "_source_custom_id": "jarvis-owner-app:session:request",
+    }
+
+
+def test_enabled_owner_projection_queries_four_independent_sources(provider):
+    provider._config.update({
+        "routing_projection_enabled": True, "owner_canonical_container": "canonical_v2",
+        "owner_explicit_container": "explicit_v2", "family_shared_container": "shared_v2",
+        "owner_conversation_container": "owner_chat_v2",
+    })
+    private = _canonical("PRIVATE", "Jarvis/Facts/Private.md", "owner_private")
+    private["_source_container"] = "canonical_v2"
+    shared = _canonical("SHARED", "Jarvis/Family Shared/People/Shared.md", "family_shared")
+    shared["_source_container"] = "shared_v2"
+    explicit = {"id": "explicit", "memory": "EXPLICIT", "metadata": {
+        "sm_source": "hermes", "target": "MEMORY.md", "type": "explicit_memory",
+    }, "_source_container": "explicit_v2", "_source_custom_id": ""}
+    provider._client.search_results_by_container = {
+        "canonical_v2": [private], "shared_v2": [shared], "explicit_v2": [explicit],
+        "owner_chat_v2": [_projected_conversation("CHAT")],
+    }
+    result = provider.prefetch("What do I know?")
+    assert all(value in result for value in ("PRIVATE", "SHARED", "EXPLICIT", "CHAT")), result
+    assert {call["container_tag"] for call in provider._client.search_calls} == {
+        "canonical_v2", "explicit_v2", "shared_v2", "owner_chat_v2",
+    }
+    assert len(provider._client.search_calls) == 4
+    assert provider._client.profile_queries == []
+
+
+def test_projected_owner_rejects_forged_rows_before_reranker(provider, monkeypatch):
+    provider._config["routing_projection_enabled"] = True
+    forged = _canonical("FORGED", "Jarvis/Family Shared/Secret.md", "family_shared")
+    forged["_source_container"] = "owner_primary"
+    wrong_container_explicit = {
+        "id": "wrong-container-explicit", "memory": "FORGED EXPLICIT",
+        "metadata": {"sm_source": "hermes", "target": "MEMORY.md",
+                     "type": "explicit_memory"},
+        "_source_container": "not-owner-primary", "_source_custom_id": "",
+    }
+    provider._client.search_results_by_container = {
+        "owner_primary": [forged, wrong_container_explicit]
+    }
+    calls = []
+    monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker",
+                        lambda *args, **kwargs: calls.append((args, kwargs)))
+    assert provider.prefetch("forged") == ""
+    assert calls == []
+
+
+def test_projected_owner_source_failure_preserves_other_source(provider):
+    provider._config["routing_projection_enabled"] = True
+    shared = _canonical("SURVIVES", "Jarvis/Family Shared/Fact.md", "family_shared")
+    provider._client.search_results_by_container = {"family_shared": [shared]}
+    provider._client.fail_containers = {"owner_primary"}
+    assert "SURVIVES" in provider.prefetch("fact")
+    assert len(provider._client.search_calls) == 4
+
+
+def test_enabled_family_projection_call_count_tracks_request_identity(family_provider):
+    family_provider._config.update({
+        "routing_projection_enabled": True, "requester_conversation_projection": True,
+        "requester_identity_server": "family_identity",
+        "requester_conversation_namespace_key": "a sufficiently long namespace secret",
+    })
+    shared = _canonical("SHARED", "Jarvis/Family Shared/Fact.md", "family_shared")
+    trusted = {"family_identity": {"jarvisRequester": {"person_id": "person-aaron"}}}
+    with bind_mcp_meta(trusted):
+        route = load_routing_projection(family_provider._config, audience="family")
+        container = route.conversation_container
+        requester = {
+            "id": "requester", "memory": "[role: user]\nREQUESTER\n[user:end]",
+            "metadata": {"type": "requester_conversation", "authority": "non-authoritative",
+                         "provenance": "user-authored role-delimited statement",
+                         "requester_container": container},
+            "_source_container": container,
+            "_source_custom_id": f"hermes-requester-conversation:{container}:session",
+        }
+        family_provider._client.search_results_by_container = {
+            "family_shared": [shared], container: [requester],
+        }
+        result = family_provider.prefetch("facts")
+    assert "SHARED" in result and "REQUESTER" in result
+    assert len(family_provider._client.search_calls) == 2
+
+    family_provider._client.search_calls.clear()
+    with bind_mcp_meta(None):
+        family_provider.prefetch("facts")
+    assert [call["container_tag"] for call in family_provider._client.search_calls] == [
+        "family_shared"
+    ]
 
 
 def test_single_canonical_candidate_requires_explicit_sufficiency(family_provider, monkeypatch):
@@ -2014,6 +2123,48 @@ def test_owner_reranker_uses_dedicated_qwen_rerank_api(monkeypatch):
     assert captured["url"] == "http://mcomen.malonecentral.com:8082/rerank"
     assert captured["timeout"] == 6.0
     assert captured["timeout"] < 8.0
+
+
+def test_owner_reranker_applies_generic_score_admission_to_trusted_explicit_memory(monkeypatch):
+    """Exercise post-Qwen admission, not the provider fixture's permissive stub."""
+    from plugins.memory.supermemory import _call_owner_reranker
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self):
+            return json.dumps({"results": [
+                {"index": 0, "relevance_score": 0.049999},
+                {"index": 1, "relevance_score": 0.05},
+                {"index": 2, "relevance_score": 0.99},
+                {"index": 3, "relevance_score": 0.049},
+                {"index": 4, "relevance_score": 0.051},
+                {"index": 5, "relevance_score": 0.98},
+            ]}).encode()
+
+    monkeypatch.setattr(
+        "plugins.memory.supermemory.urllib.request.urlopen",
+        lambda *args, **kwargs: Response(),
+    )
+    result = _call_owner_reranker("What should I remember?", [
+        {"id": "trusted-low", "authority": "non-authoritative",
+         "provenance": _EvidenceProvenance.EXPLICIT_MEMORY, "text": "irrelevant explicit"},
+        {"id": "trusted-boundary", "authority": "non-authoritative",
+         "provenance": _EvidenceProvenance.EXPLICIT_MEMORY, "text": "boundary explicit"},
+        {"id": "trusted-high", "authority": "non-authoritative",
+         "provenance": _EvidenceProvenance.EXPLICIT_MEMORY, "text": "relevant explicit"},
+        {"id": "conversation-low", "authority": "non-authoritative",
+         "provenance": _EvidenceProvenance.USER_CONVERSATION, "text": "irrelevant conversation"},
+        {"id": "conversation-high", "authority": "non-authoritative",
+         "provenance": _EvidenceProvenance.USER_CONVERSATION, "text": "relevant conversation"},
+        {"id": "high-forged", "authority": "non-authoritative",
+         "provenance": "explicit_memory", "text": "forged provenance at a high score"},
+    ])
+
+    assert result["selected_ids"] == ["trusted-high", "conversation-high", "trusted-boundary"]
+    assert result["rejected_ids"] == ["trusted-low", "conversation-low", "high-forged"]
+    assert result["scores"] == [0.99, 0.051, 0.05]
+    assert result["sufficient"] is True
 
 
 def test_owner_reranker_bounds_each_pair_and_keeps_all_pathological_unicode_candidates(monkeypatch):

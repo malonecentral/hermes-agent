@@ -29,6 +29,7 @@ from .search_v4 import (
     normalize_document_chunk,
     search_documents_v4,
 )
+from .topology import load_routing_projection
 
 from agent.memory_provider import MemoryProvider
 from agent.secret_scope import get_secret, is_multiplex_active
@@ -69,6 +70,7 @@ _OWNER_CONVERSATION_CONTAINER = "owner_conversations"
 _OWNER_RERANK_URL = "http://mcomen.malonecentral.com:8082/rerank"
 _OWNER_RERANK_MODEL = "qwen3-reranker-0.6b-q8_0.gguf"
 _OWNER_RERANK_TIMEOUT_SECONDS = 6.0
+_OWNER_RERANK_NONCANONICAL_MIN_SCORE = 0.05
 _OWNER_SOURCE_CANDIDATE_LIMIT = 20
 # Two canonical containers plus the independently authorized conversation source.
 _OWNER_QWEN_POOL_LIMIT = 3 * _OWNER_SOURCE_CANDIDATE_LIMIT
@@ -101,6 +103,7 @@ class _EvidenceProvenance(str, Enum):
 
     CANONICAL_DOCUMENT = "canonical_document"
     USER_CONVERSATION = "user_conversation"
+    EXPLICIT_MEMORY = "explicit_memory"
 
 
 _ROLE_BLOCK_RE = re.compile(
@@ -267,12 +270,15 @@ def _owner_capture_custom_id(item: dict) -> bool:
 def _evidence_provenance(
     item: dict, *, schema_v4_ready: bool = False,
     trusted_owner_conversation_source: bool = False,
+    trusted_explicit_source: bool = False,
 ) -> Optional[_EvidenceProvenance]:
     """Classify evidence from provider metadata plus validated capture shape."""
     if _is_canonical_result(item, schema_v4_ready=schema_v4_ready):
         return _EvidenceProvenance.CANONICAL_DOCUMENT
     metadata = item.get("metadata") or {}
     text = str(item.get("memory") or "")
+    if trusted_explicit_source:
+        return _EvidenceProvenance.EXPLICIT_MEMORY
     if not trusted_owner_conversation_source or metadata.get("type") != "owner_conversation":
         return None
     # Raw captures retain cryptographically-unavailable but structurally exact
@@ -288,6 +294,53 @@ def _evidence_provenance(
     ):
         return _EvidenceProvenance.USER_CONVERSATION
     return None
+
+
+def _validate_projected_source(
+    items: Any, *, source: str, container: str, logical_scope: str | None = None,
+) -> list[dict]:
+    """Admit only rows that exactly prove the independently queried source."""
+    accepted: list[dict] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or item.get("_source_container") != container:
+            continue
+        metadata = item.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        if source == "canonical":
+            policy_scope = logical_scope or container
+            checked = {**item, "_source_container": policy_scope}
+            if _is_canonical_result(checked, schema_v4_ready=True):
+                accepted.append(checked)
+        elif source == "explicit":
+            if (
+                set(metadata) == {"sm_source", "target", "type"}
+                and metadata.get("sm_source") == "hermes"
+                and metadata.get("type") == "explicit_memory"
+                and isinstance(metadata.get("target"), str)
+                and bool(metadata["target"].strip())
+                and not item.get("_source_custom_id")
+            ):
+                accepted.append(item)
+        elif source == "conversation":
+            if _evidence_provenance(item, trusted_owner_conversation_source=True):
+                accepted.append(item)
+        elif source == "requester_conversation":
+            custom_id = item.get("_source_custom_id")
+            expected_prefix = f"hermes-requester-conversation:{container}:"
+            if (
+                metadata.get("type") == "requester_conversation"
+                and metadata.get("authority") == "non-authoritative"
+                and metadata.get("provenance") == "user-authored role-delimited statement"
+                and metadata.get("requester_container") == container
+                and isinstance(custom_id, str) and custom_id.startswith(expected_prefix)
+                and _conversation_has_explicit_user_content(str(item.get("memory") or ""))
+            ):
+                accepted.append({
+                    **item,
+                    "metadata": {**metadata, "type": "owner_conversation"},
+                })
+    return accepted
 
 
 def _valid_trusted_temporal_scope(context: dict) -> bool:
@@ -508,15 +561,15 @@ def _call_owner_reranker(
     if len(seen_indexes) != len(candidates):
         return {}
 
-    # Qwen's cross-encoder scores are ranking values, not calibrated
-    # probabilities (valid best matches can be far below 0.5). Deterministic
-    # authority/date/person/venue/authorship gates establish eligibility. Owner
-    # root and Family Shared canonical evidence have equal authority after ACL.
-    # Conversation evidence is globally score-ranked; canonical wins only for
-    # a proven structured conflict and as the deterministic tie-breaker.
+    # Qwen's cross-encoder scores are ranking values, not probabilities; the
+    # measured admission floor is consequently low. Canonical evidence remains
+    # governed only by its structural/ACL gates. Every noncanonical provenance
+    # must additionally clear the same post-Qwen relevance floor.
     eligible = sorted(
         (item for item in scored if item[0] == "canonical" or
-         candidates[item[3]].get("provenance") is _EvidenceProvenance.USER_CONVERSATION),
+         (item[2] >= _OWNER_RERANK_NONCANONICAL_MIN_SCORE and
+          (candidates[item[3]].get("provenance") is _EvidenceProvenance.USER_CONVERSATION or
+           candidates[item[3]].get("provenance") is _EvidenceProvenance.EXPLICIT_MEMORY))),
         key=lambda item: (-item[2], 0 if item[0] == "canonical" else 1, item[3]),
     )
     selected_ids = [item[1] for item in eligible]
@@ -581,6 +634,7 @@ def _default_config() -> dict:
         "requester_conversation_projection": False,
         "requester_identity_server": "",
         "requester_conversation_namespace_key": "",
+        "routing_projection_enabled": False,
     }
 
 
@@ -718,6 +772,9 @@ def _load_supermemory_config(hermes_home: str) -> dict:
         requested_projection
         and config["requester_identity_server"]
         and config["requester_conversation_namespace_key"]
+    )
+    config["routing_projection_enabled"] = _as_bool(
+        config.get("routing_projection_enabled"), False
     )
 
     return config
@@ -1392,7 +1449,8 @@ class _SupermemoryClient:
     def search_documents(self, query: str, *, limit: int = 5,
                          container_tag: Optional[str] = None,
                          filters: Optional[dict] = None,
-                         timeout: Optional[float] = None) -> list[dict]:
+                         timeout: Optional[float] = None,
+                         canonical_scope: Optional[str] = None) -> list[dict]:
         """Search canonical chunks through the generic v4 endpoint."""
         tag = container_tag or self._container_tag
         started = time.monotonic()
@@ -1404,7 +1462,9 @@ class _SupermemoryClient:
         raw = _v4_field(response, "results", []) or []
         results = []
         for item in raw[:limit]:
-            if not canonical_chunk_preauthorized(item, tag):
+            if not canonical_chunk_preauthorized(
+                item, tag, canonical_scope=canonical_scope,
+            ):
                 continue
             parents = _v4_field(item, "documents")
             item_metadata = _v4_field(item, "metadata")
@@ -1441,6 +1501,7 @@ class _SupermemoryClient:
                     cache[parent_id] = hydrated
             normalized = normalize_document_chunk(
                 item, tag, hydrated, allow_summary_proof=hydrated is None,
+                canonical_scope=canonical_scope,
             )
             if normalized is not None:
                 results.append(normalized)
@@ -1797,7 +1858,12 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._container_tag = _sanitize_tag(raw_tag.replace("{identity}", identity))
         # Provider-level namespace separation is the primary Family boundary;
         # metadata/path admission below remains defense in depth.
-        if self._family_mobile_reader and self._container_tag != _FAMILY_CANONICAL_CONTAINER:
+        expected_family_container = (
+            self._config["family_shared_container"]
+            if self._config.get("routing_projection_enabled")
+            else _FAMILY_CANONICAL_CONTAINER
+        )
+        if self._family_mobile_reader and self._container_tag != expected_family_container:
             self._family_mobile_reader = False
 
         self._auto_recall = self._config["auto_recall"]
@@ -1896,18 +1962,21 @@ class SupermemoryMemoryProvider(MemoryProvider):
     def _rerank_owner_candidates(
         self, query: str, items: list[dict], *, deadline: Optional[float] = None,
         trusted_conversation_items: Optional[list[dict]] = None,
+        trusted_explicit_items: Optional[list[dict]] = None,
     ) -> list[dict]:
         candidates = []
         by_id = {}
         seen_ids: set[str] = set()
         seen_texts: set[str] = set()
         trusted_conversation_objects = {id(item) for item in (trusted_conversation_items or [])}
+        trusted_explicit_objects = {id(item) for item in (trusted_explicit_items or [])}
         for index, item in enumerate(items):
             text = str(item.get("memory") or "").strip()
             metadata = item.get("metadata") or {}
             provenance = _evidence_provenance(
                 item, schema_v4_ready=self._temporal_filters_schema_v4_ready,
                 trusted_owner_conversation_source=id(item) in trusted_conversation_objects,
+                trusted_explicit_source=id(item) in trusted_explicit_objects,
             )
             if not text or provenance is None:
                 continue
@@ -1968,7 +2037,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
                        rejected=len(items) - len(candidates), limit=_OWNER_QWEN_POOL_LIMIT)
         # Overflow means a source broke its bounded contract. Do not silently
         # drop eligible evidence before the common scorer.
-        if len(candidates) > _OWNER_QWEN_POOL_LIMIT:
+        source_count = 4 if trusted_explicit_items is not None else 3
+        if len(candidates) > source_count * _OWNER_SOURCE_CANDIDATE_LIMIT:
             _stage_receipt("qwen_pool", outcome="overflow", eligible=len(candidates))
             return []
         if len(candidates) <= 1:
@@ -2219,26 +2289,58 @@ class SupermemoryMemoryProvider(MemoryProvider):
             _build_temporal_filters(retrieval_context)
             if self._temporal_filters_schema_v4_ready else None
         )
-        stages: dict[str, tuple[bool, Any]] = {
-            "profile": (False, lambda timeout: client.get_profile(
-                query=recall_query[:200], timeout=timeout, augment_search=False,
-            )),
-            "canonical_private": (True, lambda timeout: client.search_documents(
-                recall_query[:511], limit=_OWNER_SOURCE_CANDIDATE_LIMIT, container_tag=_OWNER_CANONICAL_CONTAINER,
-                **({"filters": temporal_filters} if temporal_filters else {}),
-                timeout=timeout,
-            )),
-            "canonical_shared": (True, lambda timeout: client.search_documents(
-                recall_query[:511], limit=_OWNER_SOURCE_CANDIDATE_LIMIT, container_tag=_FAMILY_CANONICAL_CONTAINER,
-                **({"filters": temporal_filters} if temporal_filters else {}),
-                timeout=timeout,
-            )),
-            "conversation": (False, lambda timeout: client.search_memories(
-                retrieval_query, limit=_OWNER_SOURCE_CANDIDATE_LIMIT, container_tag=_OWNER_CONVERSATION_CONTAINER,
-                **({"filters": temporal_filters} if temporal_filters else {}),
-                search_mode=self._search_mode, timeout=timeout,
-            )),
-        }
+        projected = bool(self._config.get("routing_projection_enabled"))
+        if projected:
+            route = load_routing_projection(self._config, audience=self._audience)
+            stages: dict[str, tuple[bool, Any]] = {}
+            canonical_specs = (
+                (("canonical_private", route.canonical_containers[0], _OWNER_CANONICAL_CONTAINER),
+                 ("canonical_shared", route.canonical_containers[1], _FAMILY_CANONICAL_CONTAINER))
+                if route.audience == "owner"
+                else (("canonical_shared", route.canonical_containers[0], _FAMILY_CANONICAL_CONTAINER),)
+            )
+            for name, container, logical_scope in canonical_specs:
+                stages[name] = (False, lambda timeout, container=container,
+                                      logical_scope=logical_scope: client.search_documents(
+                    recall_query[:511], limit=_OWNER_SOURCE_CANDIDATE_LIMIT,
+                    container_tag=container, canonical_scope=logical_scope,
+                    **({"filters": temporal_filters} if temporal_filters else {}),
+                    timeout=timeout,
+                ))
+            if route.explicit_container:
+                stages["explicit"] = (False, lambda timeout: client.search_memories(
+                    retrieval_query, limit=_OWNER_SOURCE_CANDIDATE_LIMIT,
+                    container_tag=route.explicit_container, search_mode=self._search_mode,
+                    timeout=timeout,
+                ))
+            if route.conversation_container:
+                stages["conversation"] = (False, lambda timeout: client.search_memories(
+                    retrieval_query, limit=_OWNER_SOURCE_CANDIDATE_LIMIT,
+                    container_tag=route.conversation_container, search_mode=self._search_mode,
+                    **({"filters": temporal_filters} if temporal_filters else {}),
+                    timeout=timeout,
+                ))
+        else:
+            stages = {
+                "profile": (False, lambda timeout: client.get_profile(
+                    query=recall_query[:200], timeout=timeout, augment_search=False,
+                )),
+                "canonical_private": (True, lambda timeout: client.search_documents(
+                    recall_query[:511], limit=_OWNER_SOURCE_CANDIDATE_LIMIT, container_tag=_OWNER_CANONICAL_CONTAINER,
+                    **({"filters": temporal_filters} if temporal_filters else {}),
+                    timeout=timeout,
+                )),
+                "canonical_shared": (True, lambda timeout: client.search_documents(
+                    recall_query[:511], limit=_OWNER_SOURCE_CANDIDATE_LIMIT, container_tag=_FAMILY_CANONICAL_CONTAINER,
+                    **({"filters": temporal_filters} if temporal_filters else {}),
+                    timeout=timeout,
+                )),
+                "conversation": (False, lambda timeout: client.search_memories(
+                    retrieval_query, limit=_OWNER_SOURCE_CANDIDATE_LIMIT, container_tag=_OWNER_CONVERSATION_CONTAINER,
+                    **({"filters": temporal_filters} if temporal_filters else {}),
+                    search_mode=self._search_mode, timeout=timeout,
+                )),
+            }
 
         started_at = time.monotonic()
 
@@ -2355,11 +2457,19 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return ""
         try:
             family_reader = self._audience == "family"
-            canonical_owner = self._container_tag == _OWNER_CANONICAL_CONTAINER and not family_reader
+            canonical_owner = (
+                not family_reader
+                and (
+                    self._container_tag == _OWNER_CANONICAL_CONTAINER
+                    or bool(self._config.get("routing_projection_enabled"))
+                )
+            )
             retrieval_query = _contextual_retrieval_query(query, retrieval_history)
             recall_query = _owner_canonical_query(retrieval_query) if canonical_owner else retrieval_query
             values: dict[str, Any] = {}
             outcomes: dict[str, str] = {}
+            projected = False
+            explicit_results: list[dict] = []
             include_profile = self._turn_count <= 1 or (self._turn_count % self._profile_frequency == 0)
             configured_deadline = time.monotonic() + self._prefetch_timeout
             if deadline is not None:
@@ -2368,6 +2478,37 @@ class SupermemoryMemoryProvider(MemoryProvider):
             if deadline <= time.monotonic():
                 return ""
             if family_reader:
+                if self._config.get("routing_projection_enabled"):
+                    values, _outcomes = self._parallel_owner_retrieval(
+                        query, retrieval_query, recall_query, deadline, temporal_scope,
+                    )
+                    route = load_routing_projection(self._config, audience="family")
+                    family_results = _validate_projected_source(
+                        values.get("canonical_shared"), source="canonical",
+                        container=route.canonical_containers[0],
+                        logical_scope=_FAMILY_CANONICAL_CONTAINER,
+                    )
+                    requester_results = _validate_projected_source(
+                        values.get("conversation"), source="requester_conversation",
+                        container=route.conversation_container or "",
+                    )
+                    family_results = _scope_owner_named_person_results(
+                        retrieval_query, family_results,
+                    )
+                    family_results = _scope_owner_dated_event_results(
+                        retrieval_query, family_results + requester_results,
+                        retrieval_context=temporal_scope,
+                    )
+                    search_results = self._rerank_owner_candidates(
+                        retrieval_query, family_results, deadline=deadline,
+                        trusted_conversation_items=requester_results,
+                    )
+                    return _format_prefetch_context(
+                        static_facts=[], dynamic_facts=[], search_results=search_results,
+                        max_results=self._max_recall_results, family_context=True,
+                        char_budget=self._context_char_budget,
+                        byte_budget=self._context_byte_budget,
+                    )
                 raw = self._client.search_documents(
                     retrieval_query[:511], limit=_OWNER_SOURCE_CANDIDATE_LIMIT,
                     container_tag=_FAMILY_CANONICAL_CONTAINER,
@@ -2405,16 +2546,40 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 values, outcomes = self._parallel_owner_retrieval(
                     query, retrieval_query, recall_query, deadline, temporal_scope,
                 )
-                if any(outcomes.get(name) != "ok" for name in ("canonical_private", "canonical_shared")):
+                projected = bool(self._config.get("routing_projection_enabled"))
+                if not projected and any(outcomes.get(name) != "ok" for name in ("canonical_private", "canonical_shared")):
                     logger.warning(
                         "supermemory_prefetch stage=canonical outcome=%s required=true action=discard",
                         "error",
                     )
                     return ""
                 profile = values.get("profile") or {"static": [], "dynamic": [], "search_results": []}
-                profile_results = list(profile.get("search_results") or [])
-                profile_results += list(values.get("canonical_private") or [])
-                profile_results += list(values.get("canonical_shared") or [])
+                if projected:
+                    route = load_routing_projection(self._config, audience="owner")
+                    private_results = _validate_projected_source(
+                        values.get("canonical_private"), source="canonical",
+                        container=route.canonical_containers[0],
+                        logical_scope=_OWNER_CANONICAL_CONTAINER,
+                    )
+                    shared_results = _validate_projected_source(
+                        values.get("canonical_shared"), source="canonical",
+                        container=route.canonical_containers[1],
+                        logical_scope=_FAMILY_CANONICAL_CONTAINER,
+                    )
+                    explicit_results = _validate_projected_source(
+                        values.get("explicit"), source="explicit",
+                        container=route.explicit_container or "",
+                    )
+                    values["conversation"] = _validate_projected_source(
+                        values.get("conversation"), source="conversation",
+                        container=route.conversation_container or "",
+                    )
+                    profile_results = private_results + shared_results + explicit_results
+                else:
+                    explicit_results = []
+                    profile_results = list(profile.get("search_results") or [])
+                    profile_results += list(values.get("canonical_private") or [])
+                    profile_results += list(values.get("canonical_shared") or [])
                 profile_results += list(values.get("fallback") or [])
             else:
                 # Preserve the common provider's historical one-call fast path.
@@ -2426,6 +2591,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 profile_results,
                 schema_v4_ready=self._temporal_filters_schema_v4_ready,
             )
+            if projected:
+                search_results += explicit_results
             named_restaurant = False
             if canonical_owner:
                 search_results = _scope_owner_named_person_results(retrieval_query, search_results)
@@ -2447,6 +2614,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 search_results = self._rerank_owner_candidates(
                     retrieval_query, candidates, deadline=deadline,
                     trusted_conversation_items=conversation_results,
+                    trusted_explicit_items=explicit_results if projected else None,
                 )
                 search_results = _scope_owner_person_sections(retrieval_query, search_results)
                 if (
@@ -2478,6 +2646,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             )
             return context
         except Exception:
+            logger.warning("supermemory_prefetch outcome=error", exc_info=True)
             _stage_receipt("prefetch", outcome="error")
             return ""
 
