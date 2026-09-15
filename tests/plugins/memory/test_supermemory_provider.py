@@ -1280,6 +1280,25 @@ def test_exact_venue_hydrates_full_perfect_pear_preferences_before_one_rerank(pr
     assert reranks == []  # one hydrated candidate bypasses; never adds a second request
 
 
+def test_family_exact_venue_hydrates_complete_parent_before_answer(family_provider):
+    source = (
+        "restaurant: Zipp's\n### Courtnee\n"
+        "- Golden Focaccia.\n- Mozzarella sticks with ranch."
+    )
+    chunk, document = _v4_restaurant(
+        "Jarvis/Family Shared/Food/Restaurants/Zipp's.md", source,
+    )
+    chunk["memory"] = "restaurant: Zipp's\n### Courtnee\n- Mozzarella sticks with ranch."
+    family_provider._client.search_documents = lambda *args, **kwargs: [chunk]
+    family_provider._client.documents_by_id["doc-venue"] = document
+
+    result = family_provider.prefetch("What does my mom like at Zips?")
+
+    assert "Golden Focaccia" in result
+    assert "Mozzarella sticks with ranch" in result
+    assert len(family_provider._client.get_document_calls) == 1
+
+
 @pytest.mark.parametrize(("query", "venue"), [
     ("What do I like from Ike's?", "Ike's Love & Sandwiches"),
     ("What do I like from McDonald's?", "McDonald's"),

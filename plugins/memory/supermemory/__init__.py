@@ -2304,6 +2304,17 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 family_results = _scope_owner_dated_event_results(
                     retrieval_query, family_results, retrieval_context=temporal_scope,
                 )
+                restaurant_results, named_restaurant = _scope_owner_restaurant_results(
+                    retrieval_query, family_results,
+                )
+                if named_restaurant:
+                    hydrated_restaurant = self._hydrate_exact_restaurant(
+                        restaurant_results, deadline=deadline,
+                    )
+                    scoped_ids = {id(item) for item in restaurant_results}
+                    family_results = hydrated_restaurant + [
+                        item for item in family_results if id(item) not in scoped_ids
+                    ]
                 search_results = self._rerank_owner_candidates(
                     retrieval_query, family_results, deadline=deadline,
                 )
