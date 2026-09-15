@@ -98,6 +98,23 @@ def test_completed_turn_boundary_preserves_request_identity(family_provider):
     assert len(client.add_calls) == 1
 
 
+def test_turn_start_projection_survives_request_context_reset(family_provider):
+    client = family_provider._client
+    with bind_mcp_meta(identity("person-alice")):
+        family_provider.on_turn_start(2, "I prefer tea with breakfast.")
+
+    # The authenticated request scope can end before completed-turn sync runs.
+    with bind_mcp_meta(None):
+        family_provider.sync_turn(
+            "I prefer tea with breakfast.",
+            "Noted.",
+            session_id="session-a",
+            messages=[{"role": "user", "content": "I prefer tea with breakfast."}],
+        )
+
+    assert len(client.add_calls) == 1
+
+
 def test_two_authenticated_principals_route_to_separate_opaque_containers(family_provider):
     capture(family_provider, "person-alice")
     capture(family_provider, "person-bob")

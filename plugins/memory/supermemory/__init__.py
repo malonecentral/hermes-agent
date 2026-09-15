@@ -29,7 +29,11 @@ from .search_v4 import (
     normalize_document_chunk,
     search_documents_v4,
 )
-from .topology import load_routing_projection, validate_topology_destinations
+from .topology import (
+    MemoryRoutingProjection,
+    load_routing_projection,
+    validate_topology_destinations,
+)
 
 from agent.memory_provider import MemoryProvider
 from agent.secret_scope import get_secret, is_multiplex_active
@@ -1746,6 +1750,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._container_tag = _DEFAULT_CONTAINER_TAG
         self._session_id = ""
         self._turn_count = 0
+        self._turn_requester_route: Optional[MemoryRoutingProjection] = None
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: Optional[threading.Thread] = None
@@ -1954,6 +1959,16 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._turn_count = max(turn_number, 0)
+        self._turn_requester_route = None
+        if self._audience == "family":
+            config = _load_supermemory_config(self._hermes_home)
+            if config.get("requester_conversation_capture"):
+                route = load_routing_projection(config, audience="family")
+                if route.requester_conversation_capable:
+                    # Completed-turn sync may run after the request ContextVar
+                    # has been reset. Preserve only the already-derived opaque
+                    # route, never the raw authenticated principal.
+                    self._turn_requester_route = route
         if self._client is not None and hasattr(self._client, "begin_turn"):
             self._client.begin_turn()
 
@@ -2715,7 +2730,9 @@ class SupermemoryMemoryProvider(MemoryProvider):
             config = _load_supermemory_config(self._hermes_home)
             if not config.get("requester_conversation_capture") or not self._active or not self._client:
                 return
-            route = load_routing_projection(config, audience="family")
+            route = self._turn_requester_route or load_routing_projection(
+                config, audience="family"
+            )
             container = route.conversation_container
             if container in _protected_topology_tags(config):
                 logger.warning(
