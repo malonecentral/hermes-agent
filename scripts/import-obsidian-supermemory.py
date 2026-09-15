@@ -68,6 +68,10 @@ class ReconciliationRequired(RuntimeError):
     """Backend identity could not be proven; mutation must stop."""
 
 
+class OwnerCanonicalRebuildFailed(RuntimeError):
+    """The disposable Owner canonical destination needs reset and retry."""
+
+
 class PrivateArtifactError(RuntimeError):
     """A private artifact path or file failed a fail-closed safety check."""
 
@@ -625,6 +629,112 @@ def provider_inventory(client: Supermemory) -> dict[str, tuple[dict[str, Any], .
             raise ReconciliationRequired('provider pagination item count is inconsistent')
         result[container] = tuple(collected)
     return result
+
+
+def owner_canonical_inventory(client: Supermemory) -> tuple[dict[str, Any], ...]:
+    """Exhaustively list only the configured Owner canonical destination."""
+    collected: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        response = client.documents.list(container_tags=[CONTAINER], include_content=False,
+                                         limit=100, page=page, timeout=30.0)
+        rows = _field(response, 'memories')
+        pagination = _field(response, 'pagination')
+        if not isinstance(rows, (list, tuple)) or pagination is None:
+            raise ReconciliationRequired('Owner canonical inventory is malformed')
+        current = _page_integer(_alias(pagination, 'current_page', 'currentPage'))
+        total = _page_integer(_alias(pagination, 'total_pages', 'totalPages'))
+        total_items = _page_integer(_alias(pagination, 'total_items', 'totalItems'))
+        if current != page or total < 0 or total_items < 0 or (total == 0 and rows):
+            raise ReconciliationRequired('Owner canonical pagination could not prove inventory')
+        collected.extend(dict(row) if isinstance(row, dict) else row.model_dump() for row in rows)
+        if total == 0 or page == total:
+            break
+        if page > total or not rows:
+            raise ReconciliationRequired('Owner canonical pagination could not prove inventory')
+        page += 1
+    if len(collected) != total_items:
+        raise ReconciliationRequired('Owner canonical pagination item count is inconsistent')
+    return tuple(collected)
+
+
+def rebuild_owner_canonical(
+        client: Supermemory, current: dict[str, dict[str, Any]], private_root: Path, *,
+        expected_count: int, expected_fingerprint: str, confirm: str,
+        sleep: Callable[[float], None] = time.sleep, poll_attempts: int = 60) -> dict[str, Any]:
+    """Populate a proven-empty Owner canonical destination from canonical source."""
+    if any(container_for_doc(doc) != CONTAINER for doc in current.values()):
+        raise ReconciliationRequired('Owner canonical rebuild source contains an ineligible document')
+    fingerprint = source_fingerprint_from_documents(current, owner_canonical_container=CONTAINER)
+    fingerprint_digest = fingerprint['digest']
+    token = f'REBUILD-OWNER-CANONICAL:{len(current)}:{fingerprint_digest}'
+    if len(current) != expected_count or fingerprint_digest != expected_fingerprint:
+        raise ReconciliationRequired('Owner canonical source count or fingerprint changed')
+    if confirm != token:
+        raise SystemExit('Owner canonical rebuild confirmation token mismatch')
+    if owner_canonical_inventory(client):
+        raise ReconciliationRequired('Owner canonical destination is not empty')
+    try:
+        for rel in sorted(current):
+            doc = current[rel]
+            result = client.documents.add(
+                content=doc['content'], container_tag=CONTAINER, custom_id=doc['custom_id'],
+                task_type='superrag', metadata=metadata(doc), timeout=30.0)
+            document_id = str(_field(result, 'id', '') or '')
+            if not document_id:
+                raise ReconciliationRequired('Owner canonical add returned no document id')
+            remote = None
+            for _ in range(poll_attempts):
+                remote = normalize_provider_object(client.documents.get(document_id, timeout=15.0))
+                if _field(remote, 'id') != document_id:
+                    raise ReconciliationRequired(
+                        'Owner canonical poll returned a mismatched document id')
+                if status_name(remote) in TERMINAL:
+                    break
+                sleep(1.0)
+            if remote is None or status_name(remote) != 'done':
+                raise ReconciliationRequired('Owner canonical add did not complete')
+        listed = owner_canonical_inventory(client)
+        if len(listed) != len(current):
+            raise ReconciliationRequired('Owner canonical destination count verification failed')
+        verified = []
+        seen_ids: set[str] = set()
+        for row in listed:
+            document_id = str(_field(row, 'id', '') or '')
+            if not document_id or document_id in seen_ids:
+                raise ReconciliationRequired('Owner canonical destination identity is invalid')
+            seen_ids.add(document_id)
+            hydrated = normalize_provider_object(client.documents.get(document_id, timeout=15.0))
+            if _field(hydrated, 'id') != document_id:
+                raise ReconciliationRequired(
+                    'Owner canonical hydration returned a mismatched document id')
+            meta = _field(hydrated, 'metadata', {})
+            rel = meta.get('relative_path') if isinstance(meta, dict) else None
+            doc = current.get(rel) if isinstance(rel, str) else None
+            if doc is None:
+                raise ReconciliationRequired('Owner canonical destination has an unexpected document')
+            validate_backend_document(hydrated, doc)
+            verified.append({'relative_path': rel, 'custom_id': doc['custom_id'],
+                             'document_id': document_id, 'sha256': doc['sha256'],
+                             'bytes': doc['bytes'], 'container': CONTAINER})
+        if {row['relative_path'] for row in verified} != set(current):
+            raise ReconciliationRequired('Owner canonical destination is incomplete')
+    except Exception as exc:
+        raise OwnerCanonicalRebuildFailed(
+            'Owner canonical rebuild failed; reset-owner-canonical by deleting all records '
+            'in the disposable destination, then rerun the rebuild') from exc
+    manifest = {'schema_version': INDEX_SCHEMA_VERSION, 'container': CONTAINER,
+                'source_fingerprint': fingerprint, 'count': len(verified),
+                'documents': sorted(verified, key=lambda row: row['relative_path'])}
+    manifest_digest = private_json_write(
+        Path(private_root), 'readiness/owner-canonical-manifest.json', manifest)
+    proof = {'schema_version': INDEX_SCHEMA_VERSION, 'container': CONTAINER,
+             'source_fingerprint': fingerprint, 'source_count': len(current),
+             'verified_count': len(verified), 'manifest_sha256': manifest_digest,
+             'readiness': True}
+    proof_digest = private_json_write(
+        Path(private_root), 'readiness/owner-canonical-readiness.json', proof)
+    return {**proof, 'readiness_proof_sha256': proof_digest}
 
 
 def _explicit_container_claim_agrees(row: dict[str, Any], container: str) -> bool:
@@ -3606,7 +3716,7 @@ def legacy_main() -> None:
 # subcommands and the durable executors.
 PHASE2_COMMANDS = frozenset({
     'dry-run', 'plan', 'verify-only', 'reconcile', 'rollback', 'key-init', 'key-rotate',
-    'install', 'reload-instructions', 'legacy-reconcile',
+    'install', 'reload-instructions', 'legacy-reconcile', 'rebuild-owner-canonical',
 })
 
 
@@ -3626,6 +3736,12 @@ def _phase2_parser() -> argparse.ArgumentParser:
     plan = sub.add_parser('plan', parents=[common])
     plan.add_argument('--transaction-id', required=True, type=_transaction_id_argument)
     sub.add_parser('verify-only', parents=[common])
+    rebuild = sub.add_parser('rebuild-owner-canonical', parents=[common])
+    rebuild.set_defaults(rebuild_owner_canonical_container='owner_canonical',
+                         rebuild_owner_explicit_container='owner_explicit')
+    rebuild.add_argument('--expected-source-count', required=True, type=int)
+    rebuild.add_argument('--expected-source-fingerprint', required=True, type=_plan_digest_argument)
+    rebuild.add_argument('--confirm', required=True)
     reconcile = sub.add_parser('reconcile', parents=[common])
     reconcile.add_argument('--execute', action='store_true', required=True)
     reconcile.add_argument('--transaction-id', required=True, type=_transaction_id_argument)
@@ -4247,6 +4363,9 @@ def _phase2_main(argv: list[str]) -> None:
             sys.argv = old_argv
         return
     args = _phase2_parser().parse_args(argv)
+    if args.command == 'rebuild-owner-canonical':
+        args.owner_canonical_container = args.rebuild_owner_canonical_container
+        args.owner_explicit_container = args.rebuild_owner_explicit_container
     if hasattr(args, 'owner_canonical_container'):
         configure_destinations(args.owner_canonical_container, args.owner_explicit_container)
     if args.command in {'key-init', 'key-rotate'}:
@@ -4287,6 +4406,14 @@ def _phase2_main(argv: list[str]) -> None:
     if args.command == 'reconcile':
         recover_publication(root)
     scanned, current = _scan_at(args.source_root)
+    if args.command == 'rebuild-owner-canonical':
+        owner = {rel: doc for rel, doc in current.items() if container_for_doc(doc) == CONTAINER}
+        result = rebuild_owner_canonical(
+            _client(args.base_url), owner, root,
+            expected_count=args.expected_source_count,
+            expected_fingerprint=args.expected_source_fingerprint, confirm=args.confirm)
+        print(json.dumps({'mode': args.command, **result}))
+        return
     if args.command == 'dry-run':
         previous = _manifest_rows(root, manifest_path) if manifest_path.exists() else {}
         changed = {rel for rel in set(current) & set(previous)
