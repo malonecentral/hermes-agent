@@ -314,6 +314,38 @@ _MEMORY_EVIDENCE_MISSING_FINAL_RESPONSE = (
     "I couldn't find canonical evidence for that, so I won't guess."
 )
 
+def _append_staged_evidence_contract(
+    api_messages: List[Dict[str, Any]], *, stage: str, sentinel: str
+) -> None:
+    """Attach the evidence-gate contract to the API copy of the latest turn."""
+    if stage == "refinement":
+        instruction = (
+            "\n\n[HOST EVIDENCE GATE — request-local]\n"
+            "Use the single offered memory-search tool to refine the evidence. "
+            f"If no useful refinement is possible, return exactly {sentinel} "
+            "and nothing else. Do not mention tool availability or internal "
+            "restrictions."
+        )
+    else:
+        instruction = (
+            "\n\n[HOST EVIDENCE GATE — request-local]\n"
+            "Answer from the supplied canonical evidence when it is sufficient. "
+            f"Otherwise, return exactly {sentinel} and nothing else. Do not "
+            "mention tool availability or internal restrictions."
+        )
+    for message in reversed(api_messages):
+        if message.get("role") not in {"user", "tool"}:
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            message["content"] = content + instruction
+        elif isinstance(content, list):
+            message["content"] = [
+                *content,
+                {"type": "text", "text": instruction},
+            ]
+        return
+
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -2746,6 +2778,16 @@ def run_conversation(
             _sel_incoming,
             logger=request_logger,
         )
+
+        # The gate's control result must be communicated on every gated call,
+        # not inferred from a host-only tool schema.  Mutate only the API copy:
+        # neither this contract nor its sentinel belongs in conversation state.
+        if _host_memory_gate_stage in {"initial", "refinement", "post_refinement"}:
+            _append_staged_evidence_contract(
+                api_messages,
+                stage=_host_memory_gate_stage,
+                sentinel=_host_memory_gate_sentinel,
+            )
 
         # Safety net: strip orphaned tool results / add stubs for missing
         # results before sending to the API.  Runs unconditionally — not
@@ -7707,8 +7749,16 @@ def run_conversation(
                     # boundary, then make the following synthesis call tool-free.
                     if (len(assistant_message.tool_calls) != 1
                             or assistant_message.tool_calls[0].function.name != "supermemory_search"):
+                        # A malformed or batched refinement still consumes the
+                        # one refinement opportunity.  Route the next request
+                        # through tool-free synthesis; never re-advertise the
+                        # scoped schema and let a provider retry indefinitely.
+                        _host_memory_gate_stage = "post_refinement"
                         assistant_message.tool_calls = []
                         assistant_message.content = _host_memory_gate_sentinel
+                        # This is host control flow, not an assistant/tool turn:
+                        # do not append the synthetic sentinel to history.
+                        continue
                     else:
                         _host_memory_gate_stage = "post_refinement"
                         agent.valid_tool_names.add("supermemory_search")
@@ -8366,11 +8416,15 @@ def run_conversation(
                 # chokepoint below, after final_msg is built, so it catches
                 # every path that reaches turn finalization, not just this one.)
                 final_response = assistant_message.content or ""
-                if (_host_memory_gate_stage in {"initial", "refinement", "post_refinement"}
-                        and final_response.strip() == _host_memory_gate_sentinel):
+                _host_gate_control_result = (
+                    _host_memory_gate_stage
+                    in {"initial", "refinement", "post_refinement"}
+                    and final_response.strip() == _host_memory_gate_sentinel
+                )
+                if _host_gate_control_result:
                     # The sentinel is control flow only: do not append, persist,
-                    # stream, or retain it.  First occurrence admits one scoped
-                    # refinement; the next admits one ordinary bounded fallback.
+                    # stream, or retain it. The first result admits scoped
+                    # refinement; the next admits ordinary bounded tools.
                     _host_memory_gate_stage = (
                         "refinement" if _host_memory_gate_stage == "initial" else "fallback"
                     )
