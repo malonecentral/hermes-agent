@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 import re
+import secrets
 import stat
 import tempfile
 import time
@@ -14,6 +16,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable
 
 from supermemory import Supermemory
@@ -43,6 +46,14 @@ TERMINAL = {'done', 'failed', 'error'}
 
 class ReconciliationRequired(RuntimeError):
     """Backend identity could not be proven; mutation must stop."""
+
+
+class PrivateArtifactError(RuntimeError):
+    """A private artifact path or file failed a fail-closed safety check."""
+
+
+class TransactionJournalError(ValueError):
+    """A transaction journal is malformed or does not match its canonical plan."""
 
 def normalized_relative_path(rel: str) -> Path:
     if canonical_scope_from_path(rel) is None:
@@ -792,6 +803,561 @@ def build_schema_v4_backfill_plan(
             replacements[rel] = row
     return {'replacements': replacements, 'completed': completed, 'inventory': inventory,
             'already_v4': len(completed), 'eligible': len(current)}
+
+
+TRANSACTION_PLAN_FIELDS = frozenset({
+    'action', 'relative_path', 'custom_id', 'source_container', 'target_container',
+    'expected_sha256', 'expected_bytes', 'expected_pre_identity', 'expected_post_identity',
+})
+TRANSACTION_IDENTITY_FIELDS = frozenset({'custom_id', 'container', 'sha256', 'bytes', 'document_id'})
+TRANSACTION_STAGES = frozenset({
+    'existing', 'delete_verified', 'delete_submitted', 'deleted', 'add_submitted',
+    'processing', 'done', 'failed', 'reconcile_required',
+})
+TRANSACTION_TRANSITIONS = {
+    'add': {
+        'existing': {'add_submitted', 'failed', 'reconcile_required'},
+        'add_submitted': {'processing', 'done', 'failed', 'reconcile_required'},
+        'processing': {'done', 'failed', 'reconcile_required'},
+        'failed': {'reconcile_required'},
+    },
+    'replace': {
+        'existing': {'delete_verified', 'failed', 'reconcile_required'},
+        'delete_verified': {'delete_submitted', 'failed', 'reconcile_required'},
+        'delete_submitted': {'deleted', 'failed', 'reconcile_required'},
+        'deleted': {'add_submitted', 'failed', 'reconcile_required'},
+        'add_submitted': {'processing', 'done', 'failed', 'reconcile_required'},
+        'processing': {'done', 'failed', 'reconcile_required'},
+        'failed': {'reconcile_required'},
+    },
+    'delete': {
+        'existing': {'delete_verified', 'failed', 'reconcile_required'},
+        'delete_verified': {'delete_submitted', 'failed', 'reconcile_required'},
+        'delete_submitted': {'deleted', 'failed', 'reconcile_required'},
+        'deleted': {'done', 'failed', 'reconcile_required'},
+        'failed': {'reconcile_required'},
+    },
+}
+
+
+def _plain_json(value: Any) -> Any:
+    if isinstance(value, MappingProxyType):
+        return {key: _plain_json(item) for key, item in value.items()}
+    if isinstance(value, dict):
+        return {key: _plain_json(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_plain_json(item) for item in value]
+    return value
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _exact_json_equal(left: Any, right: Any) -> bool:
+    """Compare JSON values without Python's bool/int or int/float aliases."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _exact_json_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(
+            _exact_json_equal(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return left == right
+
+
+def thaw_transaction_journal(journal: Any) -> dict[str, Any]:
+    value = _plain_json(journal)
+    if not isinstance(value, dict):
+        raise TransactionJournalError('transaction journal must be an object')
+    return value
+
+
+def _canonical_digest(value: Any) -> str:
+    try:
+        data = json.dumps(_plain_json(value), ensure_ascii=False, sort_keys=True,
+                          separators=(',', ':'), allow_nan=False).encode('utf-8')
+    except (TypeError, ValueError):
+        raise TransactionJournalError('transaction plan is not canonical JSON') from None
+    return hashlib.sha256(data).hexdigest()
+
+
+_SHA256_RE = re.compile(r'[0-9a-f]{64}')
+_TRANSACTION_ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
+
+
+def _is_sha256(value: Any) -> bool:
+    return type(value) is str and _SHA256_RE.fullmatch(value) is not None
+
+
+def _validate_transaction_id(value: Any, *, label: str = 'transaction id') -> None:
+    if type(value) is not str or _TRANSACTION_ID_RE.fullmatch(value) is None:
+        raise TransactionJournalError(f'{label} is invalid')
+
+
+def _validate_transaction_identity(identity: Any, record: dict[str, Any], label: str) -> None:
+    if not isinstance(identity, dict) or set(identity) != TRANSACTION_IDENTITY_FIELDS:
+        raise TransactionJournalError(f'{label} identity fields are invalid')
+    if (type(identity['custom_id']) is not str or identity['custom_id'] != record['custom_id']
+            or type(identity['container']) is not str
+            or identity['container'] not in CANONICAL_CONTAINERS
+            or not _is_sha256(identity['sha256'])
+            or type(identity['bytes']) is not int
+            or identity['bytes'] < 0
+            or (identity['document_id'] is not None
+                and (type(identity['document_id']) is not str
+                     or not identity['document_id']
+                     or identity['document_id'].strip() != identity['document_id']))):
+        raise TransactionJournalError(f'{label} identity is invalid')
+
+
+def _validated_transaction_plan(plan_records: Any) -> tuple[dict[str, Any], ...]:
+    if not isinstance(plan_records, (tuple, list)) or not plan_records:
+        raise TransactionJournalError('transaction plan records are invalid')
+    records: list[dict[str, Any]] = []
+    paths: set[str] = set()
+    custom_ids: set[str] = set()
+    document_ids: set[str] = set()
+    for raw in plan_records:
+        raw = _plain_json(raw)
+        if not isinstance(raw, dict) or set(raw) != TRANSACTION_PLAN_FIELDS:
+            raise TransactionJournalError('transaction plan record fields are invalid')
+        record = dict(raw)
+        action = record['action']
+        rel = record['relative_path']
+        custom_id = record['custom_id']
+        if type(action) is not str or action not in TRANSACTION_TRANSITIONS:
+            raise TransactionJournalError('transaction plan action is invalid')
+        if (type(rel) is not str or canonical_scope_from_path(rel) is None
+                or type(custom_id) is not str or custom_id != stable_custom_id_from_path(rel)
+                or not _is_sha256(record['expected_sha256'])
+                or type(record['expected_bytes']) is not int or record['expected_bytes'] < 0
+                or (record['source_container'] is not None
+                    and (type(record['source_container']) is not str
+                         or record['source_container'] not in CANONICAL_CONTAINERS))
+                or (record['target_container'] is not None
+                    and (type(record['target_container']) is not str
+                         or record['target_container'] not in CANONICAL_CONTAINERS))):
+            raise TransactionJournalError('transaction plan record identity is invalid')
+        pre, post = record['expected_pre_identity'], record['expected_post_identity']
+        if pre is not None:
+            _validate_transaction_identity(pre, record, 'pre')
+        if post is not None:
+            _validate_transaction_identity(post, record, 'post')
+        if ((action == 'add' and (pre is not None or post is None
+                                 or record['source_container'] is not None
+                                 or record['target_container'] != post['container']))
+                or (action == 'delete' and (pre is None or post is not None
+                                            or record['source_container'] != pre['container']
+                                            or record['target_container'] is not None))
+                or (action == 'replace' and (pre is None or post is None
+                                             or record['source_container'] != pre['container']
+                                             or record['target_container'] != post['container']))):
+            raise TransactionJournalError('transaction action identity is inconsistent')
+        expected_identity = post if action in {'add', 'replace'} else pre
+        if (expected_identity['sha256'] != record['expected_sha256']
+                or expected_identity['bytes'] != record['expected_bytes']):
+            raise TransactionJournalError('transaction expected identity is inconsistent')
+        if rel in paths or custom_id in custom_ids:
+            raise TransactionJournalError('duplicate transaction plan identity')
+        paths.add(rel)
+        custom_ids.add(custom_id)
+        for identity in (pre, post):
+            document_id = identity and identity['document_id']
+            if document_id:
+                if document_id in document_ids:
+                    raise TransactionJournalError('duplicate transaction document identity')
+                document_ids.add(document_id)
+        records.append(record)
+    return tuple(records)
+
+
+def transaction_plan_digest(plan_records: Any) -> str:
+    """Hash the exact order and complete expected identities of a pure plan."""
+    return _canonical_digest(_validated_transaction_plan(plan_records))
+
+
+def new_transaction_journal(transaction_id: str, plan_records: Any, *,
+                            snapshot_digest: str | None = None) -> MappingProxyType:
+    records = _validated_transaction_plan(plan_records)
+    _validate_transaction_id(transaction_id)
+    if snapshot_digest is not None and not _is_sha256(snapshot_digest):
+        raise TransactionJournalError('snapshot digest is invalid')
+    journal = {
+        'journal_schema_version': 1,
+        'transaction_id': transaction_id,
+        'plan_digest': _canonical_digest(records),
+        'snapshot_digest': snapshot_digest,
+        'records': [dict(record, order=index, stage='existing', history=['existing'])
+                    for index, record in enumerate(records)],
+    }
+    return _freeze_json(journal)
+
+
+def validate_transaction_journal(journal: Any, plan_records: Any, *,
+                                 expected_transaction_id: str,
+                                 expected_snapshot_digest: str | None = None) -> MappingProxyType:
+    plan = _validated_transaction_plan(plan_records)
+    _validate_transaction_id(expected_transaction_id, label='expected transaction id')
+    if expected_snapshot_digest is not None and not _is_sha256(expected_snapshot_digest):
+        raise TransactionJournalError('expected snapshot digest is invalid')
+    value = thaw_transaction_journal(journal)
+    fields = {'journal_schema_version', 'transaction_id', 'plan_digest', 'snapshot_digest', 'records'}
+    if (set(value) != fields or type(value['journal_schema_version']) is not int
+            or value['journal_schema_version'] != 1):
+        raise TransactionJournalError('transaction journal fields are invalid')
+    _validate_transaction_id(value['transaction_id'])
+    if value['transaction_id'] != expected_transaction_id:
+        raise TransactionJournalError('transaction id is stale or mismatched')
+    digest = _canonical_digest(plan)
+    if not _is_sha256(value['plan_digest']) or value['plan_digest'] != digest:
+        raise TransactionJournalError('transaction journal plan digest mismatch')
+    if ((value['snapshot_digest'] is not None and not _is_sha256(value['snapshot_digest']))
+            or value['snapshot_digest'] != expected_snapshot_digest):
+        raise TransactionJournalError('transaction snapshot digest mismatch')
+    rows = value['records']
+    if not isinstance(rows, list) or len(rows) != len(plan):
+        raise TransactionJournalError('transaction journal plan record count mismatch')
+    journal_extra = {'order', 'stage', 'history'}
+    for index, (row, expected) in enumerate(zip(rows, plan, strict=True)):
+        if not isinstance(row, dict) or set(row) != TRANSACTION_PLAN_FIELDS | journal_extra:
+            raise TransactionJournalError('transaction journal record fields are invalid')
+        if (type(row['order']) is not int or row['order'] < 0 or row['order'] != index
+                or not _exact_json_equal(
+                    {key: row[key] for key in TRANSACTION_PLAN_FIELDS}, expected
+                )):
+            raise TransactionJournalError('transaction journal plan record mismatch')
+        stage, history = row['stage'], row['history']
+        if (type(stage) is not str or stage not in TRANSACTION_STAGES
+                or not isinstance(history, list) or not history or history[-1] != stage):
+            raise TransactionJournalError('transaction journal stage is invalid')
+        if (history[0] != 'existing'
+                or any(type(item) is not str or item not in TRANSACTION_STAGES for item in history)):
+            raise TransactionJournalError('transaction journal stage history is invalid')
+        transitions = TRANSACTION_TRANSITIONS[expected['action']]
+        if any(right not in transitions.get(left, set()) for left, right in zip(history, history[1:])):
+            raise TransactionJournalError('transaction journal transition is invalid')
+    return _freeze_json(value)
+
+
+def advance_transaction_journal(journal: Any, plan_records: Any, record_index: int,
+                                stage: str, *, expected_transaction_id: str,
+                                expected_snapshot_digest: str | None = None) -> MappingProxyType:
+    validated = validate_transaction_journal(
+        journal, plan_records, expected_transaction_id=expected_transaction_id,
+        expected_snapshot_digest=expected_snapshot_digest,
+    )
+    if stage not in TRANSACTION_STAGES:
+        raise TransactionJournalError('transaction journal stage is unknown')
+    if (isinstance(record_index, bool) or not isinstance(record_index, int)
+            or not 0 <= record_index < len(validated['records'])):
+        raise TransactionJournalError('transaction journal record index is invalid')
+    value = thaw_transaction_journal(validated)
+    row = value['records'][record_index]
+    if stage not in TRANSACTION_TRANSITIONS[row['action']].get(row['stage'], set()):
+        raise TransactionJournalError('transaction journal transition is invalid')
+    row['stage'] = stage
+    row['history'].append(stage)
+    return validate_transaction_journal(
+        value, plan_records, expected_transaction_id=expected_transaction_id,
+        expected_snapshot_digest=expected_snapshot_digest,
+    )
+
+
+def _private_child_parts(child: str) -> tuple[str, ...]:
+    if (not isinstance(child, str) or not child or '\x00' in child or '\\' in child
+            or child.startswith('/') or Path(child).is_absolute()):
+        raise PrivateArtifactError('private artifact child path is not relative')
+    parts = tuple(child.split('/'))
+    if any(part in {'', '.', '..'} for part in parts) or '/'.join(parts) != child:
+        raise PrivateArtifactError('private artifact child path is not canonical')
+    return parts
+
+
+def _verify_private_stat(value: os.stat_result, *, directory: bool, label: str) -> None:
+    expected_mode = 0o700 if directory else 0o600
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected_type(value.st_mode):
+        raise PrivateArtifactError(f'{label} is not a {"directory" if directory else "regular file"}')
+    if value.st_uid != os.getuid():
+        raise PrivateArtifactError(f'{label} is not owned by the current user')
+    if stat.S_IMODE(value.st_mode) != expected_mode:
+        raise PrivateArtifactError(f'{label} has wrong mode; expected {expected_mode:04o}')
+
+
+def _require_private_io_capabilities() -> None:
+    """Fail before private I/O if descriptor-confined durability is unavailable."""
+    if any(type(getattr(os, name, None)) is not int or getattr(os, name) == 0
+           for name in ('O_DIRECTORY', 'O_NOFOLLOW')):
+        raise PrivateArtifactError('platform lacks required private I/O capabilities')
+    if any(not callable(getattr(os, name, None))
+           for name in ('open', 'mkdir', 'stat', 'unlink', 'replace', 'fsync', 'fstat')):
+        raise PrivateArtifactError('platform lacks required private I/O capabilities')
+    supports_dir_fd = getattr(os, 'supports_dir_fd', None)
+    supports_follow_symlinks = getattr(os, 'supports_follow_symlinks', None)
+    if not isinstance(supports_dir_fd, set) or any(function not in supports_dir_fd
+           for function in (os.open, os.mkdir, os.stat, os.unlink)):
+        raise PrivateArtifactError('platform lacks required dir_fd capabilities')
+    if (not isinstance(supports_follow_symlinks, set)
+            or os.stat not in supports_follow_symlinks):
+        raise PrivateArtifactError('platform lacks no-follow stat capability')
+    try:
+        parameters = inspect.signature(os.replace).parameters
+    except (TypeError, ValueError):
+        raise PrivateArtifactError('platform lacks confined replace capability') from None
+    if not {'src_dir_fd', 'dst_dir_fd'} <= set(parameters):
+        raise PrivateArtifactError('platform lacks confined replace capability')
+    probe_fd = -1
+    try:
+        probe_fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        os.fsync(probe_fd)
+    except OSError:
+        raise PrivateArtifactError('platform lacks directory fsync capability') from None
+    finally:
+        if probe_fd >= 0:
+            os.close(probe_fd)
+
+
+def _verify_trusted_ancestor(value: os.stat_result, *, label: str) -> None:
+    """Accept safe root-owned/sticky ancestors or non-writable user-owned ones."""
+    if not stat.S_ISDIR(value.st_mode):
+        raise PrivateArtifactError(f'{label} is not a directory')
+    mode = stat.S_IMODE(value.st_mode)
+    if value.st_uid == 0 and (not mode & 0o022 or mode & stat.S_ISVTX):
+        return
+    if value.st_uid != os.getuid() or mode & 0o022:
+        raise PrivateArtifactError(f'{label} has unsafe ownership or mode')
+
+
+def _open_private_root(root: Path, *, create: bool) -> int:
+    root = Path(root)
+    if not root.is_absolute() or root == Path('/') or any(part in {'.', '..'} for part in root.parts[1:]):
+        raise PrivateArtifactError('private root must be a canonical absolute path')
+    retained: list[int] = []
+    try:
+        current = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        retained.append(current)
+        _verify_trusted_ancestor(os.fstat(current), label='trusted anchor')
+        parts = root.parts[1:]
+        for index, name in enumerate(parts):
+            final = index == len(parts) - 1
+            try:
+                before = os.stat(name, dir_fd=current, follow_symlinks=False)
+            except FileNotFoundError:
+                if not (final and create):
+                    raise
+                os.mkdir(name, 0o700, dir_fd=current)
+                os.fsync(current)
+                before = os.stat(name, dir_fd=current, follow_symlinks=False)
+            if final:
+                _verify_private_stat(before, directory=True, label='private root')
+            else:
+                _verify_trusted_ancestor(before, label='private root ancestor')
+            child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                               dir_fd=current)
+            retained.append(child_fd)
+            after = os.fstat(child_fd)
+            if final:
+                _verify_private_stat(after, directory=True, label='private root')
+            else:
+                _verify_trusted_ancestor(after, label='private root ancestor')
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                raise PrivateArtifactError('private root ancestry changed during open')
+            for parent_fd, descendant_fd, component in zip(retained, retained[1:], parts):
+                linked = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+                opened = os.fstat(descendant_fd)
+                if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise PrivateArtifactError('private root ancestry changed during traversal')
+            current = child_fd
+        return os.dup(retained[-1])
+    except OSError as exc:
+        raise PrivateArtifactError(f'private root is unavailable: {type(exc).__name__}') from None
+    finally:
+        for fd in reversed(retained):
+            os.close(fd)
+
+
+def _open_private_parent(root_fd: int, parts: tuple[str, ...], *, create: bool) -> int:
+    current = os.dup(root_fd)
+    child_fd = -1
+    try:
+        for name in parts[:-1]:
+            child_fd = -1
+            created = False
+            if create:
+                try:
+                    os.mkdir(name, 0o700, dir_fd=current)
+                    created = True
+                    os.fsync(current)
+                except FileExistsError:
+                    pass
+            before = os.stat(name, dir_fd=current, follow_symlinks=False)
+            if not created:
+                _verify_private_stat(before, directory=True, label='private artifact directory')
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            child_fd = os.open(name, flags, dir_fd=current)
+            if created:
+                os.fchmod(child_fd, 0o700)
+            after = os.fstat(child_fd)
+            _verify_private_stat(after, directory=True, label='private artifact directory')
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                raise PrivateArtifactError('private artifact directory identity changed')
+            os.close(current)
+            current = child_fd
+            child_fd = -1
+        return current
+    except Exception:
+        if child_fd >= 0:
+            os.close(child_fd)
+        os.close(current)
+        raise
+
+
+def _json_bytes(payload: Any) -> bytes:
+    try:
+        return (json.dumps(_plain_json(payload), ensure_ascii=False, sort_keys=True,
+                           separators=(',', ':'), allow_nan=False) + '\n').encode('utf-8')
+    except (TypeError, ValueError) as exc:
+        raise PrivateArtifactError(f'private artifact is not canonical JSON: {type(exc).__name__}') from None
+
+
+def private_json_write(root: Path, child: str, payload: Any) -> str:
+    """Crash-durably replace one mode-0600 JSON artifact below a private root."""
+    _require_private_io_capabilities()
+    parts = _private_child_parts(child)
+    data = _json_bytes(payload)
+    root_fd = parent_fd = temp_fd = -1
+    temp_name = ''
+    try:
+        root_fd = _open_private_root(root, create=True)
+        parent_fd = _open_private_parent(root_fd, parts, create=True)
+        leaf = parts[-1]
+        try:
+            existing = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            _verify_private_stat(existing, directory=False, label='private artifact')
+        for _ in range(128):
+            candidate = f'.{leaf}.{secrets.token_hex(16)}.tmp'
+            try:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                temp_fd = os.open(candidate, flags, 0o600, dir_fd=parent_fd)
+                temp_name = candidate
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise PrivateArtifactError('could not allocate a private temporary file')
+        _verify_private_stat(os.fstat(temp_fd), directory=False, label='private temporary file')
+        view = memoryview(data)
+        while view:
+            written = os.write(temp_fd, view)
+            if written <= 0:
+                raise OSError('short private artifact write')
+            view = view[written:]
+        os.fsync(temp_fd)
+        os.close(temp_fd)
+        temp_fd = -1
+        os.replace(temp_name, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        temp_name = ''
+        os.fsync(parent_fd)
+        return hashlib.sha256(data).hexdigest()
+    except PrivateArtifactError:
+        raise
+    except OSError as exc:
+        raise PrivateArtifactError(f'private artifact write failed: {type(exc).__name__}') from None
+    finally:
+        if temp_fd >= 0:
+            os.close(temp_fd)
+        if temp_name and parent_fd >= 0:
+            try:
+                os.unlink(temp_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
+def private_json_read(root: Path, child: str, *, max_bytes: int = 8 * 1024 * 1024,
+                      expected_sha256: str | None = None) -> Any:
+    """Read bounded JSON through verified directory/file descriptors only."""
+    _require_private_io_capabilities()
+    parts = _private_child_parts(child)
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
+        raise PrivateArtifactError('private artifact maximum size is invalid')
+    if expected_sha256 is not None and not _is_sha256(expected_sha256):
+        raise PrivateArtifactError('expected SHA-256 is invalid')
+    root_fd = parent_fd = file_fd = -1
+    try:
+        root_fd = _open_private_root(root, create=False)
+        parent_fd = _open_private_parent(root_fd, parts, create=False)
+        leaf = parts[-1]
+        before = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        _verify_private_stat(before, directory=False, label='private artifact')
+        file_fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        opened = os.fstat(file_fd)
+        _verify_private_stat(opened, directory=False, label='private artifact')
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            raise PrivateArtifactError('private artifact identity changed during open')
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(file_fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b''.join(chunks)
+        if len(data) > max_bytes:
+            raise PrivateArtifactError('private artifact exceeds maximum size')
+        after = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        if ((after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+                or after.st_size != opened.st_size or after.st_mtime_ns != opened.st_mtime_ns):
+            raise PrivateArtifactError('private artifact identity changed during read')
+        digest = hashlib.sha256(data).hexdigest()
+        if expected_sha256 is not None and digest != expected_sha256:
+            raise PrivateArtifactError('private artifact SHA-256 mismatch')
+        try:
+            def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+                result: dict[str, Any] = {}
+                for key, item in pairs:
+                    if key in result:
+                        raise ValueError('duplicate JSON object key')
+                    result[key] = item
+                return result
+
+            value = json.loads(
+                data, object_pairs_hook=unique_object,
+                parse_constant=lambda token: (_ for _ in ()).throw(
+                    ValueError(f'non-finite JSON number: {token}')
+                ),
+            )
+            if not isinstance(value, dict):
+                raise ValueError('private state must be an object')
+            return value
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            raise PrivateArtifactError('private artifact contains invalid JSON') from None
+    except PrivateArtifactError:
+        raise
+    except OSError as exc:
+        raise PrivateArtifactError(f'private artifact read failed: {type(exc).__name__}') from None
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
 
 
 def _private_json_write(path: Path, payload: dict[str, Any]) -> bytes:
