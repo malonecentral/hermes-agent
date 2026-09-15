@@ -14,6 +14,9 @@ _OWNER_CANONICAL_ROOTS = frozenset({"Jarvis", "Skills"})
 _FAMILY_PREFIX = ("Jarvis", "Family Shared")
 _WINDOWS_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 _PERCENT_BYTE_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
+SENSITIVE_CONTENT = re.compile(
+    r"(?i)(?:[#?&](?:access_)?token=|(?:api[_-]?key|password|secret)\s*[:=])"
+)
 # These glyphs are visually usable as separators but their Unicode names do
 # not contain SOLIDUS or SLASH, so keep this small exception auditable.
 _UNNAMED_SEPARATOR_LOOKALIKES = frozenset(
@@ -80,3 +83,52 @@ def stable_custom_id_from_path(relative_path: Any) -> str | None:
     if canonical_scope_from_path(relative_path) is None:
         return None
     return "obsidian-" + hashlib.sha256(relative_path.encode("utf-8")).hexdigest()
+
+
+def canonical_frontmatter_values(source: str) -> dict[str, list[str]]:
+    """Parse the importer's deliberately small deterministic frontmatter subset."""
+    values: dict[str, list[str]] = {}
+    if not source.startswith("---\n"):
+        return values
+    end = source.find("\n---\n", 4)
+    if end < 0:
+        raise ValueError("malformed frontmatter")
+    for line in source[4:end].splitlines():
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_-]*):\s*(.*?)\s*", line)
+        if not match:
+            continue
+        key, raw = match.groups()
+        if key in values:
+            raise ValueError("duplicate frontmatter field")
+        if raw.startswith("["):
+            if not raw.endswith("]"):
+                raise ValueError("malformed frontmatter list")
+            values[key] = [v.strip().strip("\"'") for v in raw[1:-1].split(",") if v.strip()]
+        elif raw in {"", "null", "[]"}:
+            values[key] = []
+        elif raw[:1] in {"|", ">"}:
+            raise ValueError("unsupported multiline frontmatter")
+        else:
+            values[key] = [raw.strip("\"'")]
+    return values
+
+
+def canonical_entity_type(relative_path: str, fields: dict[str, str]) -> str:
+    """Derive the same entity type used by the canonical importer."""
+    return fields.get("type") or (
+        "restaurant" if "/Food/Restaurants/" in f"/{relative_path}"
+        else "dish" if "/Food/Dishes/" in f"/{relative_path}"
+        else "person" if "/People/" in f"/{relative_path}"
+        else "document"
+    )
+
+
+def canonical_exclusion_reason(relative_path: str, source: str, entity_type: str) -> str:
+    """Return the import exclusion reason without exposing matched content."""
+    # The generated identity envelope contains source-derived values plus the
+    # relative path. Its fixed field names do not themselves match this policy.
+    if SENSITIVE_CONTENT.search(source) or SENSITIVE_CONTENT.search(relative_path):
+        return "sensitive_content"
+    if entity_type.endswith("-template") or relative_path.rsplit("/", 1)[-1][:-3].lower().endswith("template"):
+        return "template"
+    return ""

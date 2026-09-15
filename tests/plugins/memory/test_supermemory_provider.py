@@ -819,32 +819,18 @@ def test_client_rejects_result_parent_metadata_or_timestamp_disagreement(field):
     assert client.search_memories("q") == []
 
 
-def test_v4_import_gate_requires_search_metadata_convergence_receipt(tmp_path):
+def test_v4_import_gate_rejects_legacy_aggregate_receipt(tmp_path):
     row = {"index_schema_version": 4, "final_status": "done",
            "visibility": "owner_private", "container": "owner_primary"}
-    base = {"schema_version": 4, "reconciliation_complete": True,
-            "documents": [row], "expected_count": 1, "backend_reconciled_count": 1,
-            "submission_failure_count": 0, "still_pending_count": 0}
-    path = tmp_path / "obsidian-supermemory-import.json"
-    path.write_text(json.dumps(base), encoding="utf-8")
+    legacy = {"schema_version": 4, "reconciliation_complete": True,
+              "documents": [row], "expected_count": 1, "backend_reconciled_count": 1,
+              "search_readiness_complete": True, "search_verified_count": 1,
+              "search_failure_count": 0, "submission_failure_count": 0,
+              "still_pending_count": 0, "inventory_complete": True,
+              "canonical_containers": ["owner_primary", "family_shared"],
+              "canonical_container_counts": {"owner_primary": 1, "family_shared": 0}}
+    (tmp_path / "obsidian-supermemory-import.json").write_text(json.dumps(legacy), encoding="utf-8")
     assert _verified_v4_import_ready(str(tmp_path)) is False
-    ready = base | {"search_readiness_complete": True,
-                                       "search_verified_count": 1,
-                                       "search_failure_count": 0,
-                                       "inventory_complete": True,
-                                       "canonical_containers": ["owner_primary", "family_shared"],
-                                       "canonical_container_counts": {"owner_primary": 1, "family_shared": 0}}
-    path.write_text(json.dumps(ready), encoding="utf-8")
-    assert _verified_v4_import_ready(str(tmp_path)) is True
-    for mutation in (
-        {"inventory_complete": False},
-        {"canonical_containers": ["owner_primary"]},
-        {"canonical_container_counts": {"owner_primary": 0, "family_shared": 0}},
-        {"documents": [row | {"container": "family_shared"}]},
-        {"documents": [row | {"visibility": "invalid"}]},
-    ):
-        path.write_text(json.dumps(ready | mutation), encoding="utf-8")
-        assert _verified_v4_import_ready(str(tmp_path)) is False
 
 
 def test_owner_capture_identity_ignores_forged_metadata_custom_id(provider):

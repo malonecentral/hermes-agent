@@ -201,9 +201,9 @@ def _remote(importer, doc, **overrides):
     return value
 
 
-def test_verify_only_is_read_only_and_does_not_consult_manifest_or_lock(importer, monkeypatch, capsys, tmp_path):
+def test_verify_only_is_read_only_and_reads_manifest_without_lock(importer, monkeypatch, capsys, tmp_path):
     manifest = tmp_path / "manifest.json"
-    manifest.write_bytes(b"do not touch\n")
+    manifest.write_bytes(b'{"documents":[]}\n')
     before = manifest.stat()
     lock = tmp_path / "sync.lock"
     monkeypatch.setattr(importer, "OUT", manifest)
@@ -223,7 +223,7 @@ def test_verify_only_is_read_only_and_does_not_consult_manifest_or_lock(importer
         def update(self, *args, **kwargs): raise AssertionError("verify-only called update")
 
     monkeypatch.setattr(importer, "canonical_documents", lambda: [private, shared])
-    monkeypatch.setattr(importer, "load_previous", lambda: (_ for _ in ()).throw(AssertionError("manifest read")))
+
     monkeypatch.setattr(importer, "atomic_receipt", lambda payload: (_ for _ in ()).throw(AssertionError("manifest write")))
     monkeypatch.setattr(importer, "Supermemory", lambda **kwargs: type("Client", (), {"documents": Documents()})())
     monkeypatch.setattr(importer, "api_key", lambda: "key")
@@ -236,7 +236,7 @@ def test_verify_only_is_read_only_and_does_not_consult_manifest_or_lock(importer
 
     result = json.loads(capsys.readouterr().out)
     assert result == {"schema_version": 4, "scanned": 2, "eligible": 2,
-                      "owner_private_count": 1, "family_shared_count": 1,
+                      "owner_private_count": 1, "family_shared_count": 1, "manifest_count": 0,
                       "backend_verified_count": 2, "failure_count": 0,
                       "failed_paths": [], "verification_complete": True,
                       "reconciliation_complete": True,
@@ -244,12 +244,13 @@ def test_verify_only_is_read_only_and_does_not_consult_manifest_or_lock(importer
                       "backend_mutated": False}
     assert calls == [("list", 1), ("list", 1)]
     after = manifest.stat()
-    assert manifest.read_bytes() == b"do not touch\n"
+    assert manifest.read_bytes() == b'{"documents":[]}\n'
     assert (after.st_ino, after.st_size, after.st_mtime_ns) == (before.st_ino, before.st_size, before.st_mtime_ns)
     assert not lock.exists()
 
 
-def test_verify_only_exits_nonzero_when_any_document_is_incomplete(importer, monkeypatch, capsys):
+def test_verify_only_exits_nonzero_when_any_document_is_incomplete(importer, monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(importer, "OUT", tmp_path / "manifest.json")
     doc = importer.item("x.md", b"content")
     client, calls = _recovery_client(listed=[])
     monkeypatch.setattr(importer, "canonical_documents", lambda: [doc])
@@ -584,6 +585,40 @@ def test_schema_v4_backfill_cli_requires_all_explicit_counts(importer, monkeypat
     args = importer.parse_args()
     assert (args.expected_eligible, args.expected_owner_private,
             args.expected_family_shared) == (237, 133, 104)
+
+
+def test_dry_run_reads_only_source_and_manifest_and_returns_path_plan(importer, monkeypatch, capsys, tmp_path):
+    manifest = tmp_path / "manifest.json"
+    old = importer.item("Skills/Old.md", b"old")
+    manifest.write_text(json.dumps({"documents": [importer.record(old, _Result("id", "done"), "id")]}))
+    manifest.chmod(0o600)
+    before = manifest.stat(); before_bytes = manifest.read_bytes()
+    new = importer.item("Skills/New.md", b"new")
+    lock = tmp_path / "sync.lock"
+    monkeypatch.setattr(importer, "OUT", manifest)
+    monkeypatch.setattr(importer, "LOCK", lock)
+    monkeypatch.setattr(importer, "canonical_documents", lambda: [new])
+    monkeypatch.setattr(importer, "Supermemory", lambda **kwargs: (_ for _ in ()).throw(AssertionError("provider constructed")))
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--dry-run"])
+    importer.main()
+    result = json.loads(capsys.readouterr().out)
+    assert result["plan"] == [
+        {"action": "add", "relative_path": "Skills/New.md"},
+        {"action": "delete", "relative_path": "Skills/Old.md"},
+    ]
+    after = manifest.stat()
+    assert before_bytes == manifest.read_bytes()
+    assert (before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns) == (
+        after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns)
+    assert not lock.exists()
+
+
+def test_read_only_modes_reject_output_file(importer, monkeypatch, tmp_path):
+    for mode in ("--dry-run", "--verify-only"):
+        monkeypatch.setattr(sys, "argv", [str(SCRIPT), mode, "--output", str(tmp_path / "out.json")])
+        with pytest.raises(SystemExit):
+            importer.parse_args()
+    assert not (tmp_path / "out.json").exists()
 
 
 def test_schema_v4_backfill_cli_is_mutually_exclusive_with_read_only_modes(importer, monkeypatch):

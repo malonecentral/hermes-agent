@@ -24,11 +24,27 @@ from plugins.memory.supermemory.canonical_policy import (
     CANONICAL_CONTAINERS,
     FAMILY_CONTAINER,
     OWNER_CONTAINER,
+    SENSITIVE_CONTENT,
     canonical_scope_from_path,
+    canonical_entity_type,
+    canonical_exclusion_reason,
+    canonical_frontmatter_values,
     canonical_visibility_from_path,
     stable_custom_id_from_path,
 )
 from plugins.memory.supermemory.search_v4 import normalize_document_chunk, search_documents_v4
+from plugins.memory.supermemory.readiness_receipts import (
+    build_storage_reconciliation_receipt,
+    build_vector_readiness_receipt,
+    canonical_bytes,
+    canonical_digest,
+    generate_receipt_key,
+    read_receipt_key,
+    readiness_from_paths,
+    scan_canonical_source,
+    source_fingerprint_from_documents,
+    validate_readiness_receipts,
+)
 
 ROOT = Path('/Users/dennis/Documents/ObsidianVault/Personal/Hermes').resolve()
 ENV = Path('/Users/dennis/.hermes/.env')
@@ -38,9 +54,7 @@ BASE_URL = 'http://127.0.0.1:6767'
 CONTAINER = OWNER_CONTAINER
 CONVERSATION_CONTAINER = 'owner_conversations'
 INDEX_SCHEMA_VERSION = 4
-SENSITIVE_CONTENT = re.compile(
-    r'(?i)(?:[#?&](?:access_)?token=|(?:api[_-]?key|password|secret)\s*[:=])'
-)
+
 TERMINAL = {'done', 'failed', 'error'}
 
 
@@ -78,23 +92,7 @@ def container_for_row(row: dict[str, Any]) -> str:
     # Pre-isolation manifests implicitly placed every canonical record in Owner.
     return str(row.get('container') or CONTAINER)
 
-def _frontmatter_values(source: str) -> dict[str, list[str]]:
-    values = {}
-    if not source.startswith("---\n"): return values
-    end = source.find("\n---\n", 4)
-    if end < 0: raise ValueError("malformed frontmatter")
-    for line in source[4:end].splitlines():
-        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_-]*):\s*(.*?)\s*", line)
-        if not match: continue
-        key, raw = match.groups()
-        if key in values: raise ValueError("duplicate frontmatter field")
-        if raw.startswith("["):
-            if not raw.endswith("]"): raise ValueError("malformed frontmatter list")
-            values[key] = [v.strip().strip("\"'") for v in raw[1:-1].split(",") if v.strip()]
-        elif raw in {"", "null", "[]"}: values[key] = []
-        elif raw[:1] in {"|", ">"}: raise ValueError("unsupported multiline frontmatter")
-        else: values[key] = [raw.strip("\"'")]
-    return values
+_frontmatter_values = canonical_frontmatter_values
 
 def trusted_event_date(fields: dict[str, list[str]]) -> str:
     normalized = []
@@ -185,7 +183,7 @@ def canonical_documents() -> list[dict[str, Any]]:
 def item(rel: str, raw: bytes) -> dict[str, Any]:
     path = normalized_relative_path(rel); source = raw.decode("utf-8")
     parsed = _frontmatter_values(source); fields = {k: v[0] for k, v in parsed.items() if len(v) == 1}
-    entity_type = fields.get("type") or ("restaurant" if "/Food/Restaurants/" in f"/{rel}" else "dish" if "/Food/Dishes/" in f"/{rel}" else "person" if "/People/" in f"/{rel}" else "document")
+    entity_type = canonical_entity_type(rel, fields)
     entity_name = fields.get("restaurant") or fields.get("category") or path.stem
     branch = path.stem.split(" - ", 1)[1] if entity_type == "restaurant" and " - " in path.stem else ""
     identity = {"canonical_path": rel, "entity_type": entity_type, "entity_name": entity_name, "schema_version": fields.get("schema_version", ""), "venue_name": fields.get("restaurant", "") if entity_type == "restaurant" else "", "branch": fields.get("location", "") or branch}
@@ -2676,10 +2674,21 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument('--rollback-schema-v3', action='store_true',
                       help='Restore a verified logical backend-returned v3 snapshot.')
     parser.add_argument('--snapshot', type=Path)
+    parser.add_argument('--output', type=Path,
+                        help='Normal-mode output path; read-only modes are stdout-only.')
+    parser.add_argument('--manifest', type=Path, help='Manifest path (primarily for isolated tests).')
+    parser.add_argument('--storage-receipt', type=Path,
+                        help='Separate storage reconciliation receipt path.')
+    parser.add_argument('--vector-receipt', type=Path,
+                        help='Separate per-document vector readiness receipt path.')
+    parser.add_argument('--behavioral-receipt', type=Path,
+                        help='Read-only external behavioral benchmark receipt path.')
     parser.add_argument('--expected-eligible', type=int)
     parser.add_argument('--expected-owner-private', type=int)
     parser.add_argument('--expected-family-shared', type=int)
     args = parser.parse_args()
+    if (args.dry_run or args.verify_only) and args.output is not None:
+        parser.error('read-only modes are stdout-only; --output is not allowed')
     expected = (args.expected_eligible, args.expected_owner_private, args.expected_family_shared)
     migration_mode = args.backfill_schema_v4 or args.rollback_schema_v3
     if migration_mode and any(value is None for value in expected):
@@ -2710,8 +2719,8 @@ def project_canonical_documents(scanned: list[dict[str, Any]]) -> dict[str, Any]
             raise ValueError('invalid canonical projection')
         if not isinstance(doc.get('sha256'), str) or not isinstance(doc.get('bytes'), int):
             raise ValueError('invalid canonical projection')
-        reason = ('sensitive_content' if SENSITIVE_CONTENT.search(doc.get('content', ''))
-                  else 'template' if doc.get('is_template') else '')
+        source = doc.get('content', '').split('[/canonical-identity]', 1)[-1].lstrip('\n')
+        reason = canonical_exclusion_reason(rel, source, str(doc.get('identity', {}).get('entity_type', '')))
         if reason:
             excluded.append({'relative_path': rel, 'reason': reason})
         else:
@@ -2973,20 +2982,35 @@ def verify_indexed_documents(client: Supermemory, current: dict[str, dict[str, A
 
 
 def completion_readiness(client: Supermemory, current: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    """Combine dual inventory, backend validation, and exhaustive indexed readback."""
+    """Combine closed inventory, backend validation, and exhaustive indexed readback."""
     try:
-        inventory = schema_v4_backend_inventory(client, {doc['custom_id'] for doc in current.values()})
+        closed = provider_inventory(client)
+        classification = classify_inventory(current, closed)
+        blockers = {key: value for key, value in classification.items()
+                    if key != 'expected' and value}
+        all_rows = [(container, row) for container in sorted(closed) for row in closed[container]]
+        inventory: dict[str, Any] | None = {}
+        for container, raw in all_rows:
+            row = dict(raw)
+            row['_inventory_container'] = container
+            custom_id = _alias(row, 'custom_id', 'customId')
+            if custom_id in inventory:
+                raise ReconciliationRequired('duplicate provider stable identity')
+            inventory[custom_id] = row
+        exact_set = (not blockers and len(all_rows) == len(current)
+                     and classification['expected'] == tuple(sorted(current)))
     except Exception:
         inventory = None
+        exact_set = False
     reconciled = 0
-    if inventory is not None:
+    if inventory is not None and exact_set:
         for doc in current.values():
             try:
                 validate_backend_document(inventory.get(doc['custom_id']), doc)
             except Exception:
                 continue
             reconciled += 1
-    inventory_complete = inventory is not None and reconciled == len(current)
+    inventory_complete = exact_set and reconciled == len(current)
     search = verify_indexed_documents(client, current, inventory)
     return {**canonical_container_fields(current), **search,
             'backend_reconciled_count': reconciled,
@@ -2995,8 +3019,48 @@ def completion_readiness(client: Supermemory, current: dict[str, dict[str, Any]]
             'submission_failure_count': 0, 'still_pending_count': 0}
 
 
+def write_verified_readiness_receipts(
+        private_root: Path, current: dict[str, dict[str, Any]], inventory: list[dict[str, Any]],
+        vectors: dict[str, list[Any]], *, generation: str, generated_at: Any,
+        initialize_key: bool = False, rotate_key: bool = False) -> dict[str, Any]:
+    """Persist separate proofs only after their complete in-memory validation.
+
+    This intentionally has no live CLI call site in this slice. Behavioral
+    benchmark receipts are external artifacts and are never accepted here.
+    """
+    key_path = private_root / 'readiness/receipt-hmac.key'
+    if initialize_key or rotate_key:
+        generate_receipt_key(key_path, rotate=rotate_key)
+    key = read_receipt_key(key_path)
+    if key is None:
+        raise ReconciliationRequired('readiness receipt key is unavailable or unsafe')
+    storage = build_storage_reconciliation_receipt(
+        current, inventory, generation=generation, generated_at=generated_at, key=key)
+    vector = build_vector_readiness_receipt(
+        current, vectors, generation=generation, generated_at=generated_at, key=key,
+    )
+    if not validate_readiness_receipts(
+            storage, vector, key=key,
+            current_fingerprint=source_fingerprint_from_documents(current), now=generated_at):
+        raise ReconciliationRequired('readiness receipt proof is incomplete')
+    storage_digest = private_json_write(
+        private_root, 'readiness/storage-reconciliation.json', storage,
+    )
+    vector_digest = private_json_write(
+        private_root, 'readiness/vector-readiness.json', vector,
+    )
+    return {
+        'generation': generation,
+        'storage_receipt_sha256': storage_digest,
+        'vector_receipt_sha256': vector_digest,
+    }
+
+
 def main() -> None:
+    global OUT
     args = parse_args()
+    if args.manifest is not None:
+        OUT = args.manifest
     started = time.time()
     if args.backfill_schema_v4 or args.rollback_schema_v3:
         if CONTAINER == CONVERSATION_CONTAINER:
@@ -3051,6 +3115,7 @@ def main() -> None:
     if args.verify_only:
         scanned = canonical_documents()
         current = eligible_documents(scanned)
+        previous = load_previous()
         client = Supermemory(api_key=api_key(), base_url=BASE_URL, timeout=30.0, max_retries=1)
         verification = verify_backend(client, current)
         readiness = completion_readiness(client, current)
@@ -3062,6 +3127,7 @@ def main() -> None:
             'eligible': len(current),
             'owner_private_count': sum(doc['visibility'] == 'owner_private' for doc in current.values()),
             'family_shared_count': sum(doc['visibility'] == 'family_shared' for doc in current.values()),
+            'manifest_count': len(previous),
             **verification,
             'verify_only': True,
             'filesystem_mutated': False,
@@ -3072,10 +3138,13 @@ def main() -> None:
             raise SystemExit(1)
         return
     if args.dry_run:
-        previous = load_previous(); scanned = canonical_documents()
+        scanned = canonical_documents(); previous = load_previous()
         current = eligible_documents(scanned)
         changed = {r for r in set(current) & set(previous) if current[r]['sha256'] != previous[r].get('sha256') or previous[r].get('index_schema_version') != INDEX_SCHEMA_VERSION or container_for_row(previous[r]) != container_for_doc(current[r])}
-        print(json.dumps({'scanned': len(scanned), 'eligible': len(current), 'new': len(set(current)-set(previous)), 'changed': len(changed), 'unchanged': len(set(current)&set(previous)-changed), 'removed': len(set(previous)-set(current)), 'dry_run': True}, indent=2)); return
+        plan = ([{'action': 'add', 'relative_path': path} for path in sorted(set(current)-set(previous))]
+                + [{'action': 'replace', 'relative_path': path} for path in sorted(changed)]
+                + [{'action': 'delete', 'relative_path': path} for path in sorted(set(previous)-set(current))])
+        print(json.dumps({'scanned': len(scanned), 'eligible': len(current), 'new': len(set(current)-set(previous)), 'changed': len(changed), 'unchanged': len(set(current)&set(previous)-changed), 'removed': len(set(previous)-set(current)), 'plan': plan, 'dry_run': True, 'filesystem_mutated': False, 'backend_mutated': False}, indent=2)); return
 
     # A true unchanged run is read-only: do not create/touch the lock or rewrite
     # the manifest. Readiness still comes from exhaustive backend validation.

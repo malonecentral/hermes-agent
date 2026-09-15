@@ -678,39 +678,19 @@ def _load_supermemory_config(hermes_home: str) -> dict:
     return config
 
 
-def _verified_v4_import_ready(hermes_home: str) -> bool:
-    """Require a privacy-safe reconciliation receipt, never a toggle alone."""
-    try:
-        payload = json.loads((Path(hermes_home) / "obsidian-supermemory-import.json").read_text())
-        rows = payload.get("documents")
-        expected = payload.get("expected_count", payload.get("eligible_file_count"))
-        counts = payload.get("canonical_container_counts")
-        containers = payload.get("canonical_containers")
-        row_containers = {"owner_private": "owner_primary", "family_shared": "family_shared"}
-        return bool(
-            payload.get("schema_version") == 4
-            and payload.get("reconciliation_complete") is True
-            and isinstance(rows, list) and isinstance(expected, int)
-            and len(rows) == expected
-            and payload.get("backend_reconciled_count") == expected
-            and payload.get("search_verified_count") == expected
-            and payload.get("search_readiness_complete") is True
-            and payload.get("search_failure_count") == 0
-            and payload.get("submission_failure_count") == 0
-            and payload.get("still_pending_count") == 0
-            and payload.get("inventory_complete") is True
-            and containers == ["owner_primary", "family_shared"]
-            and isinstance(counts, dict)
-            and set(counts) == {"owner_primary", "family_shared"}
-            and all(isinstance(value, int) and value >= 0 for value in counts.values())
-            and sum(counts.values()) == expected
-            and all(isinstance(row, dict) and row.get("index_schema_version") == 4
-                    and row.get("final_status") == "done"
-                    and row_containers.get(row.get("visibility")) == row.get("container")
-                    for row in rows)
-        )
-    except (OSError, ValueError, TypeError):
-        return False
+def _verified_v4_import_ready(hermes_home: str, *, storage_path: str | None = None,
+                              vector_path: str | None = None, key_path: str | None = None,
+                              source_root: str | None = None) -> bool:
+    """Require current separate storage and vector receipts; never legacy aggregate state."""
+    from .readiness_receipts import readiness_from_paths
+    root = Path(hermes_home) / "readiness"
+    storage = Path(storage_path) if storage_path else root / "storage-reconciliation.json"
+    vector = Path(vector_path) if vector_path else root / "vector-readiness.json"
+    key = Path(key_path) if key_path else root / "receipt-hmac.key"
+    canonical_root = Path(source_root) if source_root else Path(
+        "~/Documents/ObsidianVault/Personal/Hermes"
+    ).expanduser()
+    return readiness_from_paths(storage, vector, key_path=key, source_root=canonical_root)
 
 
 def _save_supermemory_config(values: dict, hermes_home: str) -> None:
@@ -1792,7 +1772,13 @@ class SupermemoryMemoryProvider(MemoryProvider):
             self._context_char_budget = min(self._context_char_budget, max(1024, measured_chars // 8))
         self._temporal_filters_schema_v4_ready = bool(
             self._config["temporal_filters_schema_v4_ready"]
-            and _verified_v4_import_ready(self._hermes_home)
+            and _verified_v4_import_ready(
+                self._hermes_home,
+                storage_path=self._config.get("storage_reconciliation_receipt_path"),
+                vector_path=self._config.get("vector_readiness_receipt_path"),
+                key_path=self._config.get("readiness_receipt_key_path"),
+                source_root=self._config.get("canonical_source_root"),
+            )
         )
         # Base URL: config > SUPERMEMORY_BASE_URL env var > api.supermemory.ai.
         # Supports self-hosted Supermemory servers.
