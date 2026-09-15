@@ -1511,12 +1511,15 @@ class DurableReconciliationExecutor:
             raise ReconciliationRequired('provider returned content is inconsistent')
         return row
 
-    def _snapshot(self, records: list[dict[str, Any]]) -> str:
+    def _snapshot(self, records: list[dict[str, Any]],
+                  pre_inventory: list[dict[str, Any]]) -> str:
         payload = {
             'snapshot_schema_version': 1, 'transaction_id': self._transaction_id,
             'plan_digest': transaction_plan_digest(self._plan),
             'label': 'provider-returned logical snapshot; not raw source bytes',
             'count': len(records), 'records': records,
+            'expected_pre_inventory': pre_inventory,
+            'expected_pre_inventory_digest': _canonical_digest(pre_inventory),
             'container_counts': {c: sum(r['container'] == c for r in records)
                                  for c in sorted(CANONICAL_CONTAINERS)},
         }
@@ -1634,6 +1637,24 @@ class DurableReconciliationExecutor:
         self._validate_current(current)
         journal_exists = self.journal_path.is_file()
         if not journal_exists:
+            # Capture the complete provider-returned logical pre-state before any
+            # mutation.  Rollback must prove the whole two-container inventory,
+            # not merely reconstruct state from the old manifest.
+            pre_inventory = []
+            for container, rows in self._inventory().items():
+                for listed in rows:
+                    identity = provider_identity(listed, container)
+                    remote = self._hydrate(identity)
+                    pre_inventory.append({
+                        'content': remote['content'], 'metadata': remote['metadata'],
+                        'custom_id': identity['custom_id'],
+                        'backend_identity': identity['document_id'],
+                        'container': container, 'sha256': identity['sha256'],
+                        'bytes': identity['bytes'], 'status': 'done',
+                        'task_type': 'superrag',
+                    })
+            pre_inventory.sort(key=lambda row: (row['container'], row['custom_id'],
+                                                row['backend_identity']))
             snapshots = []
             for order, record in enumerate(self._plan):
                 identity = record['expected_pre_identity']
@@ -1648,7 +1669,7 @@ class DurableReconciliationExecutor:
                     'container': identity['container'], 'sha256': identity['sha256'],
                     'bytes': identity['bytes'], 'task_type': 'superrag',
                 })
-            self._snapshot_digest = self._snapshot(snapshots)
+            self._snapshot_digest = self._snapshot(snapshots, pre_inventory)
             state = self._checkpoint(new_transaction_journal(
                 transaction_id, self._plan, snapshot_digest=self._snapshot_digest,
             ))
@@ -1739,6 +1760,560 @@ class DurableReconciliationExecutor:
         return state | {'complete': True, 'verification_digest': proof['digest'],
                         'verified_count': proof['count'],
                         'verified_container_counts': proof['container_counts']}
+
+ROLLBACK_STAGES = frozenset({
+    'existing', 'remove_verified', 'remove_submitted', 'removed', 'restore_submitted',
+    'processing', 'done', 'reconcile_required',
+})
+ROLLBACK_TRANSITIONS = {
+    'remove': {
+        'existing': {'remove_verified', 'removed', 'reconcile_required'},
+        'remove_verified': {'remove_submitted', 'reconcile_required'},
+        'remove_submitted': {'removed', 'reconcile_required'},
+        'reconcile_required': {'remove_verified', 'removed', 'reconcile_required'},
+        'removed': {'done'}, 'done': set(),
+    },
+    'restore': {
+        'existing': {'restore_submitted', 'reconcile_required'},
+        'restore_submitted': {'processing', 'done', 'reconcile_required'},
+        'processing': {'done', 'reconcile_required'},
+        'reconcile_required': {'restore_submitted', 'processing', 'done', 'reconcile_required'},
+        'done': set(),
+    },
+    'replace': {
+        'existing': {'remove_verified', 'removed', 'reconcile_required'},
+        'remove_verified': {'remove_submitted', 'reconcile_required'},
+        'remove_submitted': {'removed', 'reconcile_required'},
+        'removed': {'restore_submitted', 'reconcile_required'},
+        'restore_submitted': {'processing', 'done', 'reconcile_required'},
+        'processing': {'done', 'reconcile_required'},
+        'reconcile_required': {'remove_verified', 'removed', 'restore_submitted',
+                               'processing', 'done', 'reconcile_required'},
+        'done': set(),
+    },
+}
+
+
+def _snapshot_logical_record(row: Any) -> dict[str, Any]:
+    """Validate and return a privacy-sensitive provider logical snapshot row."""
+    if not isinstance(row, dict) or set(row) != {
+            'content', 'metadata', 'custom_id', 'backend_identity', 'container',
+            'sha256', 'bytes', 'status', 'task_type'}:
+        raise TransactionJournalError('rollback snapshot record fields are invalid')
+    content, metadata_value = row['content'], row['metadata']
+    if (type(content) is not str or not isinstance(metadata_value, dict)
+            or type(row['custom_id']) is not str or not row['custom_id']
+            or type(row['backend_identity']) is not str or not row['backend_identity']
+            or row['container'] not in CANONICAL_CONTAINERS
+            or not _is_sha256(row['sha256']) or type(row['bytes']) is not int
+            or row['bytes'] < 0 or row['status'] != 'done' or row['task_type'] != 'superrag'
+            or metadata_value.get('content_sha256') != row['sha256']
+            or metadata_value.get('content_bytes') != row['bytes']):
+        raise TransactionJournalError('rollback snapshot record is invalid')
+    marker = '[/canonical-identity]\n\n'
+    if content.count(marker) != 1:
+        raise TransactionJournalError('rollback snapshot content envelope is invalid')
+    logical_content = content.split(marker, 1)[1]
+    candidates = (logical_content, logical_content.rstrip(' \t\r\n'))
+    if not any(hashlib.sha256(value.encode('utf-8')).hexdigest() == row['sha256']
+               and len(value.encode('utf-8')) == row['bytes'] for value in candidates):
+        raise TransactionJournalError('rollback snapshot content digest is inconsistent')
+    rel = metadata_value.get('relative_path')
+    required = {'source': 'obsidian', 'authority': 'canonical',
+                'index_schema_version': INDEX_SCHEMA_VERSION, 'identity_scope': 'owner',
+                'canonical_root': 'owner'}
+    if (canonical_scope_from_path(rel) != row['container']
+            or stable_custom_id_from_path(rel) != row['custom_id']
+            or metadata_value.get('visibility') != canonical_visibility_from_path(rel)
+            or any(metadata_value.get(key) != value for key, value in required.items())):
+        raise TransactionJournalError('rollback snapshot metadata is unsafe')
+    return _plain_json(row)
+
+
+def _rollback_plan(forward_plan: Any, snapshot: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    plan = _validated_transaction_plan(forward_plan)
+    snapshots = snapshot.get('records')
+    if not isinstance(snapshots, list):
+        raise TransactionJournalError('rollback snapshot records are invalid')
+    by_order: dict[int, dict[str, Any]] = {}
+    for row in snapshots:
+        if not isinstance(row, dict) or type(row.get('order')) is not int:
+            raise TransactionJournalError('rollback mutation snapshot is invalid')
+        logical = {key: value for key, value in row.items() if key != 'order' and key != 'relative_path'}
+        logical['status'] = 'done'
+        validated = _snapshot_logical_record(logical)
+        if row['order'] in by_order:
+            raise TransactionJournalError('duplicate rollback snapshot order')
+        by_order[row['order']] = validated
+    inverse = []
+    for reverse_order, (forward_order, record) in enumerate(reversed(tuple(enumerate(plan)))):
+        action = {'add': 'remove', 'delete': 'restore', 'replace': 'replace'}[record['action']]
+        old = by_order.get(forward_order)
+        if action in {'restore', 'replace'} and old is None:
+            raise TransactionJournalError('rollback restore snapshot is missing')
+        inverse.append({'order': reverse_order, 'forward_order': forward_order,
+                        'action': action, 'custom_id': record['custom_id'],
+                        'expected_forward_identity': record['expected_post_identity'],
+                        'restore_snapshot': old})
+    return tuple(inverse)
+
+
+def _project_forward_post_inventory(
+        forward_plan: Any, expected_pre_inventory: Any) -> tuple[dict[str, Any], ...]:
+    """Purely project the logical forward post-state from immutable inputs."""
+    plan = _validated_transaction_plan(forward_plan)
+    if not isinstance(expected_pre_inventory, (list, tuple)):
+        raise TransactionJournalError('forward pre-inventory is invalid')
+    projected: dict[str, dict[str, Any]] = {}
+    for raw in expected_pre_inventory:
+        row = _snapshot_logical_record(raw)
+        if row['custom_id'] in projected:
+            raise TransactionJournalError('forward pre-inventory contains duplicate identity')
+        projected[row['custom_id']] = {
+            'custom_id': row['custom_id'], 'container': row['container'],
+            'sha256': row['sha256'], 'bytes': row['bytes'],
+            'document_id': row['backend_identity'],
+        }
+    for record in plan:
+        if record['action'] == 'delete':
+            projected.pop(record['custom_id'], None)
+        else:
+            # Provider-assigned ids are deliberately not authority.  Forward
+            # execution validates this same canonical identity with the actual
+            # id substituted only for the provider read being checked.
+            projected[record['custom_id']] = _plain_json(record['expected_post_identity'])
+    rows = tuple(sorted(projected.values(), key=lambda row: (
+        row['container'], row['custom_id'], row['document_id'] or '',
+    )))
+    if len({(row['container'], row['custom_id']) for row in rows}) != len(rows):
+        raise TransactionJournalError('projected forward post-inventory is ambiguous')
+    return rows
+
+
+def validate_rollback_journal(journal: Any, rollback_plan: Any, *, rollback_transaction_id: str,
+                              forward_transaction_id: str, forward_plan_digest: str,
+                              forward_journal_digest: str, snapshot_digest: str,
+                              pre_inventory_digest: str, post_inventory_digest: str,
+                              expected_post_inventory: Any) -> MappingProxyType:
+    _validate_transaction_id(rollback_transaction_id, label='rollback transaction id')
+    _validate_transaction_id(forward_transaction_id, label='forward transaction id')
+    for value in (forward_plan_digest, forward_journal_digest, snapshot_digest,
+                  pre_inventory_digest, post_inventory_digest):
+        if not _is_sha256(value):
+            raise TransactionJournalError('rollback binding digest is invalid')
+    if (not isinstance(expected_post_inventory, (list, tuple))
+            or _canonical_digest(expected_post_inventory) != post_inventory_digest):
+        raise TransactionJournalError('rollback expected post-inventory is invalid')
+    value = thaw_transaction_journal(journal)
+    fields = {'journal_schema_version', 'rollback_transaction_id', 'forward_transaction_id',
+              'forward_plan_digest', 'forward_journal_digest', 'snapshot_digest',
+              'pre_inventory_digest', 'post_inventory_digest', 'rollback_plan_digest',
+              'expected_post_inventory', 'records', 'verification_digest', 'verified_count',
+              'verified_container_counts'}
+    if set(value) != fields or value['journal_schema_version'] != 1:
+        raise TransactionJournalError('rollback journal fields are invalid')
+    expected_header = {
+        'rollback_transaction_id': rollback_transaction_id,
+        'forward_transaction_id': forward_transaction_id,
+        'forward_plan_digest': forward_plan_digest, 'forward_journal_digest': forward_journal_digest,
+        'snapshot_digest': snapshot_digest, 'pre_inventory_digest': pre_inventory_digest,
+        'post_inventory_digest': post_inventory_digest,
+        'expected_post_inventory': _plain_json(expected_post_inventory),
+        'rollback_plan_digest': _canonical_digest(rollback_plan),
+    }
+    if any(value.get(key) != expected for key, expected in expected_header.items()):
+        raise TransactionJournalError('rollback journal binding mismatch')
+    rows = value['records']
+    if not isinstance(rows, list) or len(rows) != len(rollback_plan):
+        raise TransactionJournalError('rollback journal record count mismatch')
+    runtime = {'stage', 'history', 'restored_document_id'}
+    for expected, row in zip(rollback_plan, rows, strict=True):
+        if (not isinstance(row, dict) or set(row) != set(expected) | runtime
+                or not _exact_json_equal({key: row[key] for key in expected}, expected)
+                or (row['restored_document_id'] is not None
+                    and (type(row['restored_document_id']) is not str or not row['restored_document_id']))):
+            raise TransactionJournalError('rollback journal record mismatch')
+        history = row['history']; stage = row['stage']
+        if (not isinstance(history, list) or not history or history[0] != 'existing'
+                or history[-1] != stage or any(item not in ROLLBACK_STAGES for item in history)
+                or any(right not in ROLLBACK_TRANSITIONS[row['action']].get(left, set())
+                       for left, right in zip(history, history[1:]))):
+            raise TransactionJournalError('rollback journal transition is invalid')
+    complete = all(row['stage'] == 'done' for row in rows)
+    if complete:
+        if (not _is_sha256(value['verification_digest'])
+                or type(value['verified_count']) is not int or value['verified_count'] < 0
+                or not isinstance(value['verified_container_counts'], dict)
+                or set(value['verified_container_counts']) != CANONICAL_CONTAINERS
+                or any(type(count) is not int or count < 0
+                       for count in value['verified_container_counts'].values())):
+            raise TransactionJournalError('rollback terminal verification is invalid')
+    elif any(value[key] is not None for key in ('verification_digest', 'verified_count',
+                                                'verified_container_counts')):
+        raise TransactionJournalError('nonterminal rollback journal has verification proof')
+    return _freeze_json(value)
+
+
+class DurableRollbackExecutor:
+    """Resume an inverse transaction from provider truth and prove exact pre-state."""
+    def __init__(self, client: Supermemory, private_root: Path,
+                 sleep: Callable[[float], None] = time.sleep, poll_limit: int = 360,
+                 fault_injector: Callable[[str], None] | None = None,
+                 poll_attempts: int | None = None):
+        self.client, self.private_root = client, Path(private_root)
+        self.sleep = sleep
+        self.poll_limit = poll_attempts if poll_attempts is not None else poll_limit
+        self.fault_injector = fault_injector
+        self.bindings: dict[str, Any] = {}
+        self.plan: tuple[dict[str, Any], ...] = ()
+        self.expected_pre: list[dict[str, Any]] = []
+        self.expected_post: dict[str, dict[str, Any]] = {}
+
+    def _fault(self, point: str) -> None:
+        if self.fault_injector:
+            self.fault_injector(point)
+
+    def _inventory(self) -> dict[str, tuple[dict[str, Any], ...]]:
+        self._fault('before_inventory')
+        try:
+            result = provider_inventory(self.client)
+            for rows in result.values():
+                for row in rows: _require_superrag_task(row)
+        except Exception:
+            raise ReconciliationRequired('rollback provider inventory is unavailable') from None
+        self._fault('after_inventory')
+        return result
+
+    def _matches(self, custom_id: str) -> list[dict[str, Any]]:
+        result = []
+        for container, rows in self._inventory().items():
+            for raw in rows:
+                if _alias(raw, 'custom_id', 'customId') == custom_id:
+                    row = dict(raw); row['_inventory_container'] = container; result.append(row)
+        return result
+
+    def _write(self, state: dict[str, Any]) -> dict[str, Any]:
+        validate_rollback_journal(state, self.plan, **self.bindings)
+        self._fault('before_rollback_journal_write')
+        digest = private_json_write(self.private_root, 'journals/rollback.json', state)
+        self._fault('after_rollback_journal_write')
+        persisted = private_json_read(self.private_root, 'journals/rollback.json', expected_sha256=digest)
+        validate_rollback_journal(persisted, self.plan, **self.bindings)
+        return persisted
+
+    def _advance(self, state: dict[str, Any], index: int, stage: str,
+                 restored_document_id: str | None = None) -> dict[str, Any]:
+        state = _plain_json(state); row = state['records'][index]
+        if stage not in ROLLBACK_TRANSITIONS[row['action']].get(row['stage'], set()):
+            raise TransactionJournalError('rollback journal transition is invalid')
+        row['stage'] = stage; row['history'].append(stage)
+        if restored_document_id is not None: row['restored_document_id'] = restored_document_id
+        if all(record['stage'] == 'done' for record in state['records']):
+            proof = self._proof(self.expected_pre)
+            state['verification_digest'] = proof['digest']
+            state['verified_count'] = proof['count']
+            state['verified_container_counts'] = proof['container_counts']
+        return self._write(state)
+
+    def _hydrated(self, match: dict[str, Any]) -> dict[str, Any]:
+        ident = str(match.get('id') or '')
+        self._fault('before_get')
+        try:
+            remote = self.client.documents.get(ident, timeout=15.0)
+            if isinstance(remote, dict):
+                row = dict(remote)
+            else:
+                model_dump = getattr(remote, 'model_dump', None)
+                if not callable(model_dump):
+                    raise TypeError
+                row = model_dump()
+                if not isinstance(row, dict):
+                    raise TypeError
+                row = dict(row)
+            for snake, camel in (('custom_id', 'customId'),
+                                  ('container_tags', 'containerTags'),
+                                  ('task_type', 'taskType')):
+                value = _alias(row, snake, camel)
+                row[snake] = value
+                row.pop(camel, None)
+            row['_inventory_container'] = match['_inventory_container']
+            if (type(row.get('id')) is not str or not row['id']
+                    or type(row.get('custom_id')) is not str or not row['custom_id']
+                    or status_name(row) not in {'processing', 'done'}
+                    or row.get('task_type') != 'superrag'
+                    or not isinstance(row.get('metadata'), dict)
+                    or type(row.get('content')) is not str
+                    or type(row.get('container_tags')) is not list
+                    or len(row['container_tags']) != 1
+                    or row['container_tags'][0] not in CANONICAL_CONTAINERS):
+                raise ValueError
+            _require_superrag_task(row)
+            self._fault('after_get')
+            return row
+        except Exception:
+            raise ReconciliationRequired('rollback hydration failed') from None
+
+    def _logical_matches(self, row: dict[str, Any], snapshot: dict[str, Any],
+                         *, require_backend_id: bool) -> bool:
+        try:
+            actual = provider_identity(row, row['_inventory_container'])
+        except ReconciliationRequired:
+            return False
+        expected = {'custom_id': snapshot['custom_id'], 'container': snapshot['container'],
+                    'sha256': snapshot['sha256'], 'bytes': snapshot['bytes'],
+                    'document_id': snapshot['backend_identity'] if require_backend_id
+                                   else actual['document_id']}
+        return (_exact_json_equal(actual, expected) and status_name(row) == 'done'
+                and row.get('content') == snapshot['content']
+                and _exact_json_equal(row.get('metadata'), snapshot['metadata']))
+
+    def _forward_matches(self, row: dict[str, Any], expected: dict[str, Any]) -> bool:
+        actual = provider_identity(row, row['_inventory_container'])
+        anchored = dict(expected)
+        if anchored['document_id'] is None:
+            anchored['document_id'] = actual['document_id']
+        if not _exact_json_equal(actual, anchored) or status_name(row) != 'done': return False
+        meta, content = row.get('metadata'), row.get('content')
+        marker = '[/canonical-identity]\n\n'
+        if not isinstance(meta, dict) or type(content) is not str or content.count(marker) != 1:
+            return False
+        rel = meta.get('relative_path')
+        required = {'source': 'obsidian', 'authority': 'canonical',
+                    'index_schema_version': INDEX_SCHEMA_VERSION,
+                    'visibility': canonical_visibility_from_path(rel),
+                    'identity_scope': 'owner', 'canonical_root': 'owner',
+                    'content_sha256': expected['sha256'], 'content_bytes': expected['bytes']}
+        if (canonical_scope_from_path(rel) != expected['container']
+                or stable_custom_id_from_path(rel) != expected['custom_id']
+                or any(meta.get(key) != value for key, value in required.items())):
+            return False
+        logical_content = content.split(marker, 1)[1].rstrip(' \t\r\n')
+        return (hashlib.sha256(logical_content.encode()).hexdigest() == expected['sha256']
+                and len(logical_content.encode()) == expected['bytes'])
+
+    def _remove(self, state: dict[str, Any], index: int) -> dict[str, Any]:
+        record = state['records'][index]
+        expected = self.expected_post.get(record['custom_id'])
+        matches = self._matches(record['custom_id'])
+        if not matches:
+            if record['stage'] in {'existing', 'reconcile_required'}:
+                return self._advance(state, index, 'removed')
+            return self._advance(state, index, 'removed')
+        if len(matches) != 1 or expected is None:
+            raise ReconciliationRequired('rollback delete identity is ambiguous')
+        hydrated = self._hydrated(matches[0])
+        if not self._forward_matches(hydrated, expected):
+            raise ReconciliationRequired('rollback delete target changed')
+        if record['stage'] in {'existing', 'reconcile_required'}:
+            state = self._advance(state, index, 'remove_verified')
+        if state['records'][index]['stage'] == 'remove_verified':
+            state = self._advance(state, index, 'remove_submitted')
+        # Immediate fresh hydration is the final provider call before delete.
+        fresh = self._hydrated(matches[0])
+        if not self._forward_matches(fresh, expected):
+            self._advance(state, index, 'reconcile_required')
+            raise ReconciliationRequired('rollback delete target changed')
+        self._fault('before_delete')
+        try: self.client.documents.delete(str(matches[0]['id']), timeout=30.0)
+        except Exception:
+            state = self._advance(state, index, 'reconcile_required')
+            raise ReconciliationRequired('rollback delete response is unknown') from None
+        self._fault('after_delete')
+        state = self._advance(state, index, 'removed')
+        if self._matches(record['custom_id']):
+            state = self._advance(state, index, 'reconcile_required')
+            raise ReconciliationRequired('rollback delete absence is unproven')
+        return state
+
+    def _restore(self, state: dict[str, Any], index: int) -> dict[str, Any]:
+        record = state['records'][index]; snapshot = record['restore_snapshot']
+        matches = self._matches(record['custom_id'])
+        if len(matches) > 1:
+            raise ReconciliationRequired('duplicate rollback restore identity')
+        if matches:
+            hydrated = self._hydrated(matches[0])
+            if not self._logical_matches(hydrated, snapshot, require_backend_id=False):
+                raise ReconciliationRequired('rollback restore identity is occupied')
+            if record['stage'] == 'existing':
+                state = self._advance(state, index, 'restore_submitted')
+            return self._advance(state, index, 'done', str(matches[0]['id']))
+        self._fault('before_add')
+        try:
+            self.client.documents.add(content=snapshot['content'], container_tag=snapshot['container'],
+                custom_id=snapshot['custom_id'], task_type=snapshot['task_type'],
+                metadata=snapshot['metadata'], timeout=30.0)
+        except Exception:
+            state = self._advance(state, index, 'reconcile_required')
+            raise ReconciliationRequired('rollback add response is unknown') from None
+        self._fault('after_add')
+        state = self._advance(state, index, 'restore_submitted')
+        for _ in range(self.poll_limit):
+            matches = self._matches(record['custom_id'])
+            if len(matches) == 1:
+                try:
+                    hydrated = self._hydrated(matches[0])
+                except ReconciliationRequired:
+                    self._advance(state, index, 'reconcile_required')
+                    raise
+                status = status_name(hydrated)
+                if status == 'done' and self._logical_matches(hydrated, snapshot, require_backend_id=False):
+                    return self._advance(state, index, 'done', str(matches[0]['id']))
+                if status == 'processing':
+                    if state['records'][index]['stage'] != 'processing':
+                        state = self._advance(state, index, 'processing')
+                else:
+                    state = self._advance(state, index, 'reconcile_required')
+                    raise ReconciliationRequired('rollback restore failed validation')
+            elif len(matches) > 1:
+                state = self._advance(state, index, 'reconcile_required')
+                raise ReconciliationRequired('duplicate rollback restore identity')
+            self.sleep(5)
+        state = self._advance(state, index, 'reconcile_required')
+        raise ReconciliationRequired('rollback restore polling timed out')
+
+    def _proof(self, expected_pre: list[dict[str, Any]]) -> dict[str, Any]:
+        inventory = self._inventory()
+        actual_rows = [(container, row) for container in sorted(inventory)
+                       for row in inventory[container]]
+        if len(actual_rows) != len(expected_pre):
+            raise ReconciliationRequired('exact rollback pre-state count mismatch')
+        expected_by_key = {(row['container'], row['custom_id']): row for row in expected_pre}
+        if len(expected_by_key) != len(expected_pre):
+            raise TransactionJournalError('rollback pre-state contains duplicate identity')
+        proofs = []
+        for container, listed in actual_rows:
+            key = (container, _alias(listed, 'custom_id', 'customId'))
+            snapshot = expected_by_key.get(key)
+            if snapshot is None:
+                raise ReconciliationRequired('rollback left an unexpected object')
+            match = dict(listed)
+            match['_inventory_container'] = container
+            hydrated = self._hydrated(match)
+            if not self._logical_matches(hydrated, snapshot, require_backend_id=False):
+                raise ReconciliationRequired('restored object differs from exact pre-state')
+            proofs.append({'custom_id': snapshot['custom_id'], 'container': container,
+                           'sha256': snapshot['sha256'], 'bytes': snapshot['bytes'],
+                           'status': 'done', 'task_type': 'superrag',
+                           'metadata_digest': _canonical_digest(snapshot['metadata']),
+                           'content_digest': hashlib.sha256(snapshot['content'].encode()).hexdigest()})
+        proofs.sort(key=lambda row: (row['container'], row['custom_id']))
+        return {'digest': _canonical_digest(proofs), 'count': len(proofs),
+                'container_counts': {container: sum(p['container'] == container for p in proofs)
+                                     for container in sorted(CANONICAL_CONTAINERS)}}
+
+    def execute(self, forward_plan: Any, forward_transaction_id: str,
+                rollback_transaction_id: str = 'rollback') -> dict[str, Any]:
+        forward_plan = _validated_transaction_plan(forward_plan)
+        forward_raw = private_json_read(self.private_root, 'journals/forward.json')
+        snapshot_digest = forward_raw.get('snapshot_digest')
+        if not _is_sha256(snapshot_digest): raise TransactionJournalError('forward snapshot binding is invalid')
+        forward = validate_transaction_journal(forward_raw, forward_plan,
+            expected_transaction_id=forward_transaction_id, expected_snapshot_digest=snapshot_digest)
+        if any(row['stage'] != 'done' for row in forward['records']):
+            raise ReconciliationRequired('forward transaction is not complete')
+        snapshot = private_json_read(self.private_root, 'snapshots/forward.json',
+                                     expected_sha256=snapshot_digest)
+        if (snapshot.get('transaction_id') != forward_transaction_id
+                or snapshot.get('plan_digest') != transaction_plan_digest(forward_plan)):
+            raise TransactionJournalError('forward snapshot binding mismatch')
+        expected_pre = snapshot.get('expected_pre_inventory')
+        if (not isinstance(expected_pre, list)
+                or snapshot.get('expected_pre_inventory_digest') != _canonical_digest(expected_pre)):
+            raise TransactionJournalError('forward pre-inventory snapshot is invalid')
+        expected_pre = [_snapshot_logical_record(row) for row in expected_pre]
+        anchored_post = _project_forward_post_inventory(forward_plan, expected_pre)
+        self.expected_pre = expected_pre
+        self.plan = _rollback_plan(forward_plan, snapshot)
+        forward_digest = _canonical_digest(forward_raw)
+        journal_path = self.private_root / 'journals/rollback.json'
+        if journal_path.is_file():
+            # Once inverse mutations begin the forward post-state intentionally no
+            # longer exists. Re-derive it from the validated forward plan and bound
+            # pre-snapshot before trusting any rollback journal field or provider read.
+            state = private_json_read(self.private_root, 'journals/rollback.json')
+            self.bindings = dict(rollback_transaction_id=rollback_transaction_id,
+                forward_transaction_id=forward_transaction_id,
+                forward_plan_digest=transaction_plan_digest(forward_plan),
+                forward_journal_digest=forward_digest, snapshot_digest=snapshot_digest,
+                pre_inventory_digest=_canonical_digest(expected_pre),
+                post_inventory_digest=_canonical_digest(anchored_post),
+                expected_post_inventory=anchored_post)
+            state = thaw_transaction_journal(validate_rollback_journal(
+                state, self.plan, **self.bindings))
+        else:
+            # Derive and prove the exact logical forward post-state before creating
+            # the rollback journal. Provider-assigned ids are never trust anchors.
+            post_inventory = self._inventory()
+            expected_ids = {row['custom_id']: row for row in anchored_post}
+            expected_keys = set(expected_ids)
+            listed_matches = []
+            for container, rows in post_inventory.items():
+                for listed in rows:
+                    cid = _alias(listed, 'custom_id', 'customId')
+                    if cid not in expected_keys:
+                        raise ReconciliationRequired('forward post-state has collateral objects')
+                    match = dict(listed)
+                    match['_inventory_container'] = container
+                    listed_matches.append((cid, match))
+            if (len(listed_matches) != len(expected_keys)
+                    or {cid for cid, _ in listed_matches} != expected_keys):
+                raise ReconciliationRequired('forward post-state is incomplete')
+            post_rows = list(anchored_post)
+            self.bindings = dict(rollback_transaction_id=rollback_transaction_id,
+                forward_transaction_id=forward_transaction_id,
+                forward_plan_digest=transaction_plan_digest(forward_plan),
+                forward_journal_digest=forward_digest, snapshot_digest=snapshot_digest,
+                pre_inventory_digest=_canonical_digest(expected_pre),
+                post_inventory_digest=_canonical_digest(post_rows),
+                expected_post_inventory=post_rows)
+            state = dict(journal_schema_version=1, **self.bindings,
+                rollback_plan_digest=_canonical_digest(self.plan),
+                records=[dict(row, stage='existing', history=['existing'], restored_document_id=None)
+                         for row in self.plan], verification_digest=None, verified_count=None,
+                verified_container_counts=None)
+            state = self._write(state)
+            record_indexes = {row['custom_id']: index
+                              for index, row in enumerate(state['records'])}
+            for cid, match in listed_matches:
+                try:
+                    hydrated = self._hydrated(match)
+                    expected_forward = expected_ids[cid]
+                    if expected_forward['document_id'] is None:
+                        if not self._forward_matches(hydrated, expected_forward):
+                            raise ReconciliationRequired('rollback hydration failed')
+                    else:
+                        snap = next(row for row in expected_pre if row['custom_id'] == cid)
+                        if not self._logical_matches(hydrated, snap, require_backend_id=True):
+                            raise ReconciliationRequired('rollback hydration failed')
+                except ReconciliationRequired:
+                    index = record_indexes.get(cid, 0)
+                    state = self._advance(state, index, 'reconcile_required')
+                    raise ReconciliationRequired('rollback hydration failed') from None
+        self.expected_post = {row['custom_id']: row
+                              for row in self.bindings['expected_post_inventory']}
+        for index, row in enumerate(state['records']):
+            if row['stage'] == 'done': continue
+            try:
+                if row['action'] in {'remove', 'replace'} and row['stage'] not in {
+                        'removed', 'restore_submitted', 'processing'}:
+                    state = self._remove(state, index)
+                if row['action'] == 'remove':
+                    if state['records'][index]['stage'] == 'removed':
+                        state = self._advance(state, index, 'done')
+                else:
+                    state = self._restore(state, index)
+            except ReconciliationRequired:
+                current_stage = state['records'][index]['stage']
+                if ('reconcile_required' in ROLLBACK_TRANSITIONS[row['action']].get(
+                        current_stage, set())):
+                    state = self._advance(state, index, 'reconcile_required')
+                raise
+        proof = self._proof(expected_pre)
+        state['verification_digest'] = proof['digest']; state['verified_count'] = proof['count']
+        state['verified_container_counts'] = proof['container_counts']
+        state = self._write(state)
+        return state | {'complete': True, 'snapshot_digest': snapshot_digest}
+
 
 def _private_json_write(path: Path, payload: dict[str, Any]) -> bytes:
     """Atomically write private deterministic JSON and return its exact bytes."""
