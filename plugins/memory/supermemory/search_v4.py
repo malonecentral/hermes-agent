@@ -1,32 +1,15 @@
 """Small SDK adapter for document-only v4 search; no audience policy here."""
 
-import hashlib
 from typing import Any
 
+from .canonical_policy import (
+    CANONICAL_CONTAINERS,
+    canonical_scope_from_path,
+    canonical_visibility_from_path,
+    stable_custom_id_from_path,
+)
 
-_CANONICAL_CONTAINERS = {"owner_primary", "family_shared"}
-_OWNER_CANONICAL_ROOTS = {"Jarvis", "Skills"}
 _MISSING = object()
-
-
-def canonical_scope_from_path(relative_path: Any) -> str | None:
-    """Return canonical scope only for a normalized vault-relative Markdown path."""
-    if (not isinstance(relative_path, str) or not relative_path
-            or relative_path != relative_path.strip()
-            or relative_path.startswith(("/", "./")) or "\\" in relative_path
-            or not relative_path.endswith(".md")):
-        return None
-    parts = relative_path.split("/")
-    if any(part in {"", ".", ".."} for part in parts):
-        return None
-    if parts[:2] == ["Jarvis", "Family Shared"]:
-        return "family_shared" if len(parts) > 2 else None
-    # The importer scans the canonical Hermes root itself plus these two
-    # top-level trees.  Do not turn an arbitrary vault-relative prefix into an
-    # Owner authorization merely because it is syntactically normalized.
-    if len(parts) == 1 or parts[0] in _OWNER_CANONICAL_ROOTS:
-        return "owner_primary"
-    return None
 
 
 def _summary_custom_id(result: Any) -> Any:
@@ -68,7 +51,7 @@ def _summary_proves_identity(result: Any, container_tag: str) -> bool:
         return False
     parent = parents[0]
     relative_path = metadata["relative_path"]
-    expected = "obsidian-" + hashlib.sha256(relative_path.encode()).hexdigest()
+    expected = stable_custom_id_from_path(relative_path)
     custom_id = _summary_custom_id(result)
     tags = field(parent, "container_tags", field(parent, "containerTags"))
     tag = field(parent, "container_tag", field(parent, "containerTag"))
@@ -78,7 +61,7 @@ def _summary_proves_identity(result: Any, container_tag: str) -> bool:
 def canonical_chunk_preauthorized(result: Any, container_tag: str) -> bool:
     """Reject malformed canonical identity before fetching its parent."""
     metadata = field(result, "metadata")
-    if not isinstance(metadata, dict) or container_tag not in _CANONICAL_CONTAINERS:
+    if not isinstance(metadata, dict) or container_tag not in CANONICAL_CONTAINERS:
         return False
     parents = field(result, "documents")
     if (not _explicit_container_claim_agrees(result, container_tag)
@@ -94,8 +77,8 @@ def canonical_chunk_preauthorized(result: Any, container_tag: str) -> bool:
         and metadata.get("authority") == "canonical"
         and metadata.get("identity_scope") == "owner"
         and metadata.get("canonical_root") == "owner"
-        and metadata.get("visibility") == (
-            "family_shared" if scope == "family_shared" else "owner_private"
+        and metadata.get("visibility") == canonical_visibility_from_path(
+            metadata.get("relative_path")
         )
     )
 
@@ -139,10 +122,7 @@ def normalize_document_chunk(result, container_tag: str, hydrated_parent,
         return None
     relative_path = metadata.get("relative_path")
     source_container = canonical_scope_from_path(relative_path) or ""
-    expected_custom_id = (
-        "obsidian-" + hashlib.sha256(relative_path.encode()).hexdigest()
-        if isinstance(relative_path, str) and relative_path else ""
-    )
+    expected_custom_id = stable_custom_id_from_path(relative_path) or ""
     proof_parent = hydrated_parent
     if proof_parent is None and allow_summary_proof and _summary_proves_identity(result, container_tag):
         proof_parent = parent
