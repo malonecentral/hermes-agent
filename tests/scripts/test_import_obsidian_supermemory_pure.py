@@ -110,6 +110,195 @@ def test_inventory_rejects_unprovable_pagination(importer, pages):
         importer.provider_inventory(type("Client", (), {"documents": Documents()})())
 
 
+def _explicit_memory(*, custom_id=None, metadata=None, **fields):
+    row = {
+        "id": "explicit-provider-row",
+        "createdAt": "2026-09-15T00:00:00.000Z",
+        "custom_id": custom_id,
+        "metadata": {"sm_source": "hermes", "target": "user", "type": "explicit_memory"}
+        if metadata is None else metadata,
+        "status": "done",
+        "type": "text",
+        "updatedAt": "2026-09-15T00:00:01.000Z",
+        "containerTags": ["owner_primary"],
+    }
+    row.update(fields)
+    return row
+
+
+def test_present_null_sdk_custom_id_excludes_exact_production_three_and_keeps_two_adds(importer):
+    from supermemory.types.document_list_response import Memory
+
+    first = importer.item("Skills/Missing One.md", b"one")
+    second = importer.item("Jarvis/Family Shared/Missing Two.md", b"two")
+    current = {doc["relative_path"]: doc for doc in (first, second)}
+    inventory = {
+        "owner_primary": tuple(
+            Memory.model_validate(
+                _explicit_memory(custom_id=None, id=f"explicit-{index}")
+            ).model_dump()
+            for index in range(3)
+        ),
+        "family_shared": (),
+    }
+
+    classification = importer.classify_inventory(current, inventory)
+
+    assert all("custom_id" in row and "customId" not in row
+               for row in inventory["owner_primary"])
+
+    assert classification["malformed"] == ()
+    assert classification["untrusted_orphans"] == ()
+    assert importer.reconciliation_plan(classification) == (
+        {"action": "add", "relative_path": "Jarvis/Family Shared/Missing Two.md",
+         "reason": "missing"},
+        {"action": "add", "relative_path": "Skills/Missing One.md", "reason": "missing"},
+    )
+
+
+@pytest.mark.parametrize("custom_id", [
+    "value", 0, 1, False, True, 0.0, 1.5, [], [None], {}, {"id": None}, (), (None,), object(),
+], ids=lambda value: type(value).__name__ + "-" + repr(value))
+def test_non_null_custom_id_types_remain_inventory_and_require_operator_review(
+        importer, custom_id):
+    classification = importer.classify_inventory({}, {
+        "owner_primary": (_explicit_memory(custom_id=custom_id),), "family_shared": (),
+    })
+    assert classification["malformed"] == ("*",)
+    assert importer.reconciliation_plan(classification) == (
+        {"action": "operator_review", "relative_path": "*", "reason": "malformed"},
+    )
+
+
+@pytest.mark.parametrize("row", [
+    {key: value for key, value in _explicit_memory().items() if key != "custom_id"},
+    {key: value for key, value in _explicit_memory().items() if key != "custom_id"}
+    | {"customId": None},
+    _explicit_memory() | {"customId": None},
+    _explicit_memory() | {"customId": "conflict"},
+])
+def test_missing_or_aliased_custom_id_remains_inventory_and_requires_operator_review(importer, row):
+    classification = importer.classify_inventory({}, {
+        "owner_primary": (row,), "family_shared": (),
+    })
+    assert classification["malformed"] == ("*",)
+    assert importer.reconciliation_plan(classification) == (
+        {"action": "operator_review", "relative_path": "*", "reason": "malformed"},
+    )
+
+
+@pytest.mark.parametrize("canonical_marker", [
+    {"relative_path": "Skills/Forged.md"},
+    {"canonical_path": "Skills/Forged.md"},
+    {"index_schema_version": 4},
+    {"source": "obsidian", "authority": "canonical"},
+    {"schema_version": "4"},
+    {"entity_type": "person"},
+    {"relativePath": "Skills/Forged.md"},
+    {"canonicalPath": "Skills/Forged.md"},
+    {"identityScope": "owner"},
+    {"canonicalRoot": "owner"},
+    {"contentSha256": "0" * 64},
+])
+def test_explicit_memory_claim_cannot_hide_canonical_metadata(importer, canonical_marker):
+    row = _explicit_memory(metadata={
+        "sm_source": "hermes", "target": "user", "type": "explicit_memory",
+        **canonical_marker,
+    })
+    classification = importer.classify_inventory({}, {
+        "owner_primary": (row,), "family_shared": (),
+    })
+    assert classification["malformed"] == ("*",)
+    assert importer.reconciliation_plan(classification) == (
+        {"action": "operator_review", "relative_path": "*", "reason": "malformed"},
+    )
+
+
+@pytest.mark.parametrize("row", [
+    _explicit_memory(type="pdf"),
+    _explicit_memory(status="unknown"),
+    _explicit_memory(containerTags=["unknown"]),
+    _explicit_memory(mystery="unknown-provider-field"),
+    _explicit_memory() | {"content": "unexpected"},
+    _explicit_memory(metadata={"sm_source": "hermes", "target": "user",
+                               "type": "explicit_memory", "mystery": True}),
+    _explicit_memory(metadata={"sm_source": "hermes", "target": "user", "type": "unknown"}),
+    {"id": "unknown", "customId": None, "metadata": None, "status": "done", "type": "text"},
+])
+def test_unknown_or_malformed_noncanonical_rows_remain_fail_closed(importer, row):
+    classification = importer.classify_inventory({}, {
+        "owner_primary": (row,), "family_shared": (),
+    })
+    assert classification["malformed"] == ("*",)
+    assert importer.reconciliation_plan(classification)[0]["action"] == "operator_review"
+
+
+def test_canonical_custom_id_alias_on_explicit_claim_remains_fail_closed(importer):
+    row = _explicit_memory(customId="obsidian-" + "a" * 64)
+    classification = importer.classify_inventory({}, {
+        "owner_primary": (row,), "family_shared": (),
+    })
+    assert classification["malformed"] == ("*",)
+    assert importer.reconciliation_plan(classification) == (
+        {"action": "operator_review", "relative_path": "*", "reason": "malformed"},
+    )
+
+
+def test_explicit_memory_exclusion_is_owner_only_and_canonical_rows_are_unchanged(importer):
+    owner = importer.item("Skills/Owner.md", b"owner")
+    family = importer.item("Jarvis/Family Shared/Family.md", b"family")
+    current = {doc["relative_path"]: doc for doc in (owner, family)}
+    inventory = {
+        "owner_primary": (_row(importer, owner, ident="owner-canonical"),),
+        "family_shared": (
+            _row(importer, family, ident="family-canonical"),
+            _explicit_memory(id="family-forgery", containerTags=["family_shared"]),
+        ),
+    }
+    classification = importer.classify_inventory(current, inventory)
+    assert classification["expected"] == (
+        "Jarvis/Family Shared/Family.md", "Skills/Owner.md",
+    )
+    assert classification["missing"] == ()
+    assert classification["malformed"] == ("*",)
+    assert importer.reconciliation_plan(classification) == (
+        {"action": "operator_review", "relative_path": "*", "reason": "malformed"},
+    )
+
+
+def test_only_exact_production_explicit_memory_shapes_are_excluded(importer):
+    camel_user = _explicit_memory(id="user")
+    camel_memory = _explicit_memory(
+        id="memory",
+        metadata={"sm_source": "hermes", "target": "memory", "type": "explicit_memory"},
+    )
+    snake = _explicit_memory(id="snake")
+    snake["container_tags"] = snake.pop("containerTags")
+    snake["created_at"] = snake.pop("createdAt")
+    snake["updated_at"] = snake.pop("updatedAt")
+    classification = importer.classify_inventory({}, {
+        "owner_primary": (camel_user, camel_memory, snake), "family_shared": (),
+    })
+    assert classification["malformed"] == ()
+    assert importer.reconciliation_plan(classification) == ()
+
+
+def test_mixed_explicit_and_canonical_signals_and_family_scope_fail_closed(importer):
+    mixed = _explicit_memory(metadata={
+        "sm_source": "hermes", "target": "user", "type": "explicit_memory",
+        "schema_version": "4", "entity_type": "person",
+        "canonical_path": "Jarvis/Family Shared/Person.md",
+    })
+    family = _explicit_memory(id="family", containerTags=["family_shared"])
+    classification = importer.classify_inventory({}, {
+        "owner_primary": (mixed,), "family_shared": (family,),
+    })
+    assert classification["malformed"] == ("*",)
+    assert importer.reconciliation_plan(classification) == (
+        {"action": "operator_review", "relative_path": "*", "reason": "malformed"},
+    )
+
+
 def test_classification_and_plan_cover_moves_staleness_duplicates_orphans_and_status(importer):
     clean = importer.item("clean.md", b"clean")
     missing = importer.item("missing.md", b"missing")

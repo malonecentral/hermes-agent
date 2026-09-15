@@ -611,6 +611,91 @@ def _raw_identity_tokens(row: Any) -> tuple[set[tuple[str, str]], bool]:
     return {(kind, value) for kind, values in claims.items() for value in values}, ambiguous
 
 
+_EXPLICIT_MEMORY_METADATA = frozenset({'sm_source', 'target', 'type'})
+# These are the only harmless fields returned by the document-list endpoint for
+# a Hermes explicit write. ``model_dump()`` uses the snake-case SDK field names;
+# wire-format camel aliases remain recognized only so they can fail closed.
+_EXPLICIT_MEMORY_ROW_FIELDS = frozenset({
+    'id', 'created_at', 'createdAt', 'custom_id', 'customId', 'metadata',
+    'status', 'type', 'updated_at', 'updatedAt', 'container_tags',
+    'containerTags', 'container_tag', 'containerTag', '_inventory_container',
+    'connection_id', 'filepath', 'summary', 'title', 'content', 'url',
+})
+# Keep this exhaustive with every schema, identity, provenance, path, ACL, and
+# content field consumed or emitted by canonical metadata parsing. The exact
+# metadata allowlist below is the future-safe boundary; this list documents the
+# canonical-like signals that must never be mistaken for provider operations.
+_CANONICAL_METADATA_MARKERS = frozenset({
+    'source', 'authority', 'relative_path', 'relativePath', 'canonical_path',
+    'canonicalPath', 'index_schema_version', 'indexSchemaVersion',
+    'schema_version', 'schemaVersion', 'entity_type', 'entityType',
+    'entity_name', 'entityName', 'venue_name', 'venueName', 'branch',
+    'fact_subject', 'factSubject', 'fact_key', 'factKey', 'fact_value',
+    'factValue', 'person_id', 'personId', 'entity_id', 'entityId',
+    'event_date', 'eventDate', 'event_date_ordinal', 'eventDateOrdinal',
+    'event_year', 'eventYear', 'event_month', 'eventMonth', 'visibility',
+    'identity_scope', 'identityScope', 'canonical_root', 'canonicalRoot',
+    'content_sha256', 'contentSha256', 'content_bytes', 'contentBytes',
+})
+
+
+def _is_noncanonical_explicit_memory(row: Any, source_container: str) -> bool:
+    """Exclude only the exact, documented Hermes explicit-write envelope."""
+    if not isinstance(row, dict) or source_container != OWNER_CONTAINER:
+        return False
+    if not set(row).issubset(_EXPLICIT_MEMORY_ROW_FIELDS):
+        return False
+    # provider_inventory normalizes SDK models with model_dump(), whose exact
+    # custom-ID key is custom_id. Absence, a wire alias, duplicate aliases, or
+    # any value other than the singleton None must remain in closed inventory.
+    if 'custom_id' not in row or 'customId' in row or row['custom_id'] is not None:
+        return False
+    if any(sum(name in row for name in aliases) > 1 for aliases in (
+        ('created_at', 'createdAt'),
+        ('updated_at', 'updatedAt'),
+        ('container_tags', 'containerTags', 'container_tag', 'containerTag'),
+    )):
+        return False
+    try:
+        metadata_value = _field(row, 'metadata')
+        ident = _field(row, 'id')
+        created_at = _alias(row, 'created_at', 'createdAt')
+        updated_at = _alias(row, 'updated_at', 'updatedAt')
+        inventory_container = _field(row, '_inventory_container', source_container)
+        if (
+            not isinstance(ident, str) or not ident
+            or not isinstance(created_at, str) or not created_at
+            or not isinstance(updated_at, str) or not updated_at
+            or any(row.get(name) is not None for name in (
+                'connection_id', 'filepath', 'summary', 'title', 'content', 'url'))
+            or _field(row, 'type') != 'text'
+            or status_name(row) != 'done'
+            or not isinstance(metadata_value, dict)
+            or set(metadata_value) != _EXPLICIT_MEMORY_METADATA
+            or bool(_CANONICAL_METADATA_MARKERS & metadata_value.keys())
+            or metadata_value.get('type') != 'explicit_memory'
+            or metadata_value.get('sm_source') != 'hermes'
+            or metadata_value.get('target') not in {'memory', 'user'}
+            or inventory_container != source_container
+            or not _explicit_container_claim_agrees(row, source_container)
+        ):
+            return False
+    except ReconciliationRequired:
+        return False
+    return True
+
+
+def _claims_explicit_memory(row: Any) -> bool:
+    """Identify any row carrying a Hermes explicit-write signal."""
+    if not isinstance(row, dict):
+        return False
+    metadata_value = row.get('metadata')
+    return isinstance(metadata_value, dict) and (
+        metadata_value.get('type') == 'explicit_memory'
+        or metadata_value.get('sm_source') == 'hermes'
+    )
+
+
 def _globally_tainted_rows(rows: list[tuple[str, Any]]) -> tuple[set[int], set[tuple[str, str]]]:
     """Taint complete raw-identity components containing a collision or ambiguity."""
     tokens_by_row: list[set[tuple[str, str]]] = []
@@ -661,12 +746,22 @@ def classify_inventory(
     expected_by_id = {doc['custom_id']: doc for doc in current.values()}
     matches: dict[str, list[dict[str, Any]]] = {key: [] for key in expected_by_id}
     orphan_candidates: list[tuple[str | None, dict[str, Any], str | None]] = []
-    raw_rows = [(container, raw) for container in sorted(inventory) for raw in inventory[container]]
+    raw_rows = [
+        (container, raw)
+        for container in sorted(inventory)
+        for raw in inventory[container]
+        if not _is_noncanonical_explicit_memory(raw, container)
+    ]
     tainted_rows, tainted_tokens = _globally_tainted_rows(raw_rows)
     if tainted_rows:
         categories['identity_collision'].add('*')
     for row_index, (container, raw) in enumerate(raw_rows):
         if not isinstance(raw, dict):
+            categories['malformed'].add('*')
+            continue
+        if _claims_explicit_memory(raw):
+            # Any explicit-like row reaching the canonical inventory failed the
+            # exact exclusion contract and therefore requires operator review.
             categories['malformed'].add('*')
             continue
         row = dict(raw)
