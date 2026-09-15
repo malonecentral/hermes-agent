@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -487,6 +488,74 @@ def _alias(obj: Any, snake: str, camel: str, default: Any = None) -> Any:
     if left is not marker and right is not marker and left != right:
         raise ReconciliationRequired('ambiguous provider response aliases')
     return left if left is not marker else right if right is not marker else default
+
+
+_PROVIDER_FIELD_ALIASES = (
+    ('custom_id', 'customId'),
+    ('task_type', 'taskType'),
+    ('container_tags', 'containerTags'),
+    ('container_tag', 'containerTag'),
+)
+
+
+def _recursive_exact_type_equal(left: Any, right: Any) -> bool:
+    """Compare alias values without Python's cross-type equality coercions."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(
+            _recursive_exact_type_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    if isinstance(left, Mapping):
+        if len(left) != len(right):
+            return False
+        unmatched = list(right.items())
+        for left_key, left_value in left.items():
+            for index, (right_key, right_value) in enumerate(unmatched):
+                if (_recursive_exact_type_equal(left_key, right_key)
+                        and _recursive_exact_type_equal(left_value, right_value)):
+                    unmatched.pop(index)
+                    break
+            else:
+                return False
+        return True
+    return left == right
+
+
+def normalize_provider_object(remote: Any) -> dict[str, Any]:
+    """Convert an SDK/wire object to one unambiguous canonical provider row.
+
+    Supermemory 3.50.0 preserves wire aliases as Pydantic extras, so its
+    ``model_dump()`` can contain both ``container_tags`` and ``containerTags``
+    (and the other aliased identity fields).  Collapse only equivalent aliases;
+    conflicting, non-mapping, and unserializable provider objects fail closed.
+    """
+    try:
+        if isinstance(remote, dict):
+            row = dict(remote)
+        else:
+            model_dump = getattr(remote, 'model_dump', None)
+            if not callable(model_dump):
+                raise TypeError
+            dumped = model_dump()
+            if not isinstance(dumped, dict):
+                raise TypeError
+            row = dict(dumped)
+    except Exception:
+        raise ReconciliationRequired('provider object is malformed') from None
+    if any(type(key) is not str for key in row):
+        raise ReconciliationRequired('provider object is malformed')
+    marker = object()
+    for canonical, alias in _PROVIDER_FIELD_ALIASES:
+        left, right = row.get(canonical, marker), row.get(alias, marker)
+        if (left is not marker and right is not marker
+                and not _recursive_exact_type_equal(left, right)):
+            raise ReconciliationRequired('ambiguous provider response aliases')
+        if left is marker and right is not marker:
+            row[canonical] = right
+        row.pop(alias, None)
+    return row
 
 
 def _require_superrag_task(obj: Any) -> None:
@@ -1539,7 +1608,7 @@ def private_json_read(root: Path, child: str, *, max_bytes: int = 8 * 1024 * 102
 
 def provider_identity(remote: Any, container: str | None = None) -> dict[str, Any]:
     """Extract a complete, delete-safe provider identity."""
-    row = dict(remote) if isinstance(remote, dict) else remote.model_dump()
+    row = normalize_provider_object(remote)
     meta = row.get('metadata'); custom_id = _alias(row, 'custom_id', 'customId')
     ident = row.get('id'); tags = _alias(row, 'container_tags', 'containerTags')
     actual_container = container or row.get('_inventory_container')
@@ -1640,7 +1709,7 @@ class DurableReconciliationExecutor:
         return self._validate_installed(remote, identity)
 
     def _validate_installed(self, remote: Any, identity: dict[str, Any]) -> dict[str, Any]:
-        row = dict(remote) if isinstance(remote, dict) else remote.model_dump()
+        row = normalize_provider_object(remote)
         row['_inventory_container'] = identity['container']
         _require_superrag_task(row)
         if not _exact_json_equal(provider_identity(row, identity['container']), identity):
@@ -1666,7 +1735,7 @@ class DurableReconciliationExecutor:
 
     def _validate_post(self, remote: Any, doc: dict[str, Any], container: str,
                        expected: dict[str, Any]) -> dict[str, Any]:
-        row = dict(remote) if isinstance(remote, dict) else remote.model_dump()
+        row = normalize_provider_object(remote)
         row['_inventory_container'] = container
         _require_superrag_task(row)
         actual = provider_identity(row, container)

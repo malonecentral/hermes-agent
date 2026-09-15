@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 
 import pytest
+from supermemory.types.document_get_response import DocumentGetResponse
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/import-obsidian-supermemory.py"
 
@@ -100,6 +101,22 @@ def remote(importer, doc, ident, *, content=None, container=None, status="done",
             "container_tags": [container or importer.container_for_doc(doc)]}
 
 
+def sdk_get_response(importer, doc, ident):
+    """Build the same SDK model returned by documents.get in supermemory 3.50.0."""
+    row = remote(importer, doc, ident)
+    return DocumentGetResponse.model_validate({
+        **row,
+        "customId": row["custom_id"],
+        "taskType": row["task_type"],
+        "containerTags": row["container_tags"],
+        "createdAt": "2026-09-15T00:00:00Z",
+        "updatedAt": "2026-09-15T00:00:00Z",
+        "dreamingStatus": "done",
+        "raw": None,
+        "type": "text",
+    })
+
+
 def identity(importer, row):
     meta = row["metadata"]
     return {"custom_id": row["custom_id"], "container": row["container_tags"][0],
@@ -172,6 +189,57 @@ def test_content_accepts_only_narrow_terminal_whitespace_equivalence(importer, t
         root.mkdir(mode=0o700)
         with pytest.raises(importer.ReconciliationRequired):
             run(importer, root, [doc], [], FakeClient(importer, [remote(importer, doc, "a", content=bad)]))
+
+
+def test_installed_sdk_provider_object_normalizes_duplicate_sdk_aliases(importer, tmp_path):
+    doc = importer.item("Jarvis/Family Shared/a.md", b"body")
+    row = remote(importer, doc, "a")
+    client = FakeClient(importer, [row])
+    client.documents.get = lambda ident, timeout: sdk_get_response(importer, doc, ident)
+
+    state = run(importer, tmp_path, [doc], [], client)
+
+    assert state["complete"] and state["verified_count"] == 1
+
+
+@pytest.mark.parametrize("invalid", [
+    object(),
+    type("BadDump", (), {"model_dump": lambda self: []})(),
+    type("ExplodingDump", (), {"model_dump": lambda self: (_ for _ in ()).throw(ValueError())})(),
+])
+def test_provider_object_sanitizer_rejects_invalid_objects(importer, invalid):
+    with pytest.raises(importer.ReconciliationRequired, match="provider object is malformed"):
+        importer.normalize_provider_object(invalid)
+
+
+@pytest.mark.parametrize("canonical,alias", [
+    ("custom_id", "customId"),
+    ("task_type", "taskType"),
+    ("container_tags", "containerTags"),
+    ("container_tag", "containerTag"),
+])
+@pytest.mark.parametrize("left,right", [
+    ("canonical", "different"),
+    (1, True),
+    ([1], [True]),
+    ({"nested": [1]}, {"nested": [True]}),
+    ({1: "value"}, {True: "value"}),
+])
+def test_provider_object_sanitizer_rejects_conflicting_aliases(
+        importer, canonical, alias, left, right):
+    with pytest.raises(importer.ReconciliationRequired, match="ambiguous provider response aliases"):
+        importer.normalize_provider_object({canonical: left, alias: right})
+
+
+@pytest.mark.parametrize("canonical,alias,value", [
+    ("custom_id", "customId", "shared-id"),
+    ("task_type", "taskType", "superrag"),
+    ("container_tags", "containerTags", ["family"]),
+    ("container_tag", "containerTag", {"scope": ("family", 1)}),
+])
+def test_provider_object_sanitizer_collapses_exact_duplicate_aliases(
+        importer, canonical, alias, value):
+    assert importer.normalize_provider_object({canonical: value, alias: value}) == {canonical: value}
 
 
 def test_immediate_delete_revalidation_rejects_stale_identity_without_mutation(importer, tmp_path):
