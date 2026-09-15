@@ -314,11 +314,9 @@ def _validate_projected_source(
                 accepted.append(checked)
         elif source == "explicit":
             if (
-                set(metadata) == {"sm_source", "target", "type"}
-                and metadata.get("sm_source") == "hermes"
+                set(metadata) == {"target", "type"}
                 and metadata.get("type") == "explicit_memory"
-                and isinstance(metadata.get("target"), str)
-                and bool(metadata["target"].strip())
+                and metadata.get("target") in {"memory", "user"}
                 and not item.get("_source_custom_id")
             ):
                 accepted.append(item)

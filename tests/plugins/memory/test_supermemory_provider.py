@@ -494,6 +494,29 @@ def _projected_conversation(memory, container="owner_chat_v2"):
     }
 
 
+def _live_supermemory_explicit(memory="EXPLICIT", *, target="memory", **metadata_extras):
+    """Normalized shape emitted by the bundled Supermemory on_memory_write hook."""
+    return {
+        "id": f"explicit-{target}", "memory": memory,
+        "metadata": {"target": target, "type": "explicit_memory", **metadata_extras},
+        "_source_container": "owner_primary", "_source_custom_id": "",
+    }
+
+
+@pytest.mark.parametrize("target", ["memory", "user"])
+def test_projected_owner_accepts_live_supermemory_explicit_shape(provider, target):
+    provider._config.update({
+        "routing_projection_enabled": True,
+        "owner_canonical_container": "owner_canonical_v2",
+        "owner_explicit_container": "owner_primary",
+    })
+    provider._client.search_results_by_container = {
+        "owner_primary": [_live_supermemory_explicit(target=target)],
+    }
+
+    assert "EXPLICIT" in provider.prefetch("What should I remember?")
+
+
 def test_enabled_owner_projection_queries_four_independent_sources(provider):
     provider._config.update({
         "routing_projection_enabled": True, "owner_canonical_container": "canonical_v2",
@@ -504,9 +527,8 @@ def test_enabled_owner_projection_queries_four_independent_sources(provider):
     private["_source_container"] = "canonical_v2"
     shared = _canonical("SHARED", "Jarvis/Family Shared/People/Shared.md", "family_shared")
     shared["_source_container"] = "shared_v2"
-    explicit = {"id": "explicit", "memory": "EXPLICIT", "metadata": {
-        "sm_source": "hermes", "target": "MEMORY.md", "type": "explicit_memory",
-    }, "_source_container": "explicit_v2", "_source_custom_id": ""}
+    explicit = _live_supermemory_explicit()
+    explicit["_source_container"] = "explicit_v2"
     provider._client.search_results_by_container = {
         "canonical_v2": [private], "shared_v2": [shared], "explicit_v2": [explicit],
         "owner_chat_v2": [_projected_conversation("CHAT")],
@@ -521,21 +543,43 @@ def test_enabled_owner_projection_queries_four_independent_sources(provider):
 
 
 def test_projected_owner_rejects_forged_rows_before_reranker(provider, monkeypatch):
-    provider._config["routing_projection_enabled"] = True
+    provider._config.update({
+        "routing_projection_enabled": True,
+        "owner_canonical_container": "owner_canonical_v2",
+        "owner_explicit_container": "owner_primary",
+    })
     forged = _canonical("FORGED", "Jarvis/Family Shared/Secret.md", "family_shared")
     forged["_source_container"] = "owner_primary"
-    wrong_container_explicit = {
-        "id": "wrong-container-explicit", "memory": "FORGED EXPLICIT",
-        "metadata": {"sm_source": "hermes", "target": "MEMORY.md",
-                     "type": "explicit_memory"},
-        "_source_container": "not-owner-primary", "_source_custom_id": "",
-    }
+    wrong_container_explicit = _live_supermemory_explicit("FORGED EXPLICIT")
+    wrong_container_explicit["_source_container"] = "not-owner-primary"
     provider._client.search_results_by_container = {
         "owner_primary": [forged, wrong_container_explicit]
     }
     calls = []
     monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker",
                         lambda *args, **kwargs: calls.append((args, kwargs)))
+    assert provider.prefetch("forged") == ""
+    assert calls == []
+
+
+@pytest.mark.parametrize("forged", [
+    _live_supermemory_explicit(sm_source="hermes"),
+    _live_supermemory_explicit(authority="canonical"),
+    _live_supermemory_explicit(source="obsidian"),
+    _live_supermemory_explicit(type="owner_conversation"),
+    _live_supermemory_explicit(target="MEMORY.md"),
+])
+def test_projected_owner_rejects_forged_explicit_metadata(provider, monkeypatch, forged):
+    provider._config.update({
+        "routing_projection_enabled": True,
+        "owner_canonical_container": "owner_canonical_v2",
+        "owner_explicit_container": "owner_primary",
+    })
+    provider._client.search_results_by_container = {"owner_primary": [forged]}
+    calls = []
+    monkeypatch.setattr("plugins.memory.supermemory._call_owner_reranker",
+                        lambda *args, **kwargs: calls.append((args, kwargs)))
+
     assert provider.prefetch("forged") == ""
     assert calls == []
 
