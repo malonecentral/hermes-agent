@@ -460,6 +460,12 @@ def _alias(obj: Any, snake: str, camel: str, default: Any = None) -> Any:
     return left if left is not marker else right if right is not marker else default
 
 
+def _require_superrag_task(obj: Any) -> None:
+    """Require the SDK's exact task type, rejecting missing/conflicting aliases."""
+    if _alias(obj, 'task_type', 'taskType') != 'superrag':
+        raise ReconciliationRequired('provider task type is not exactly superrag')
+
+
 def _page_integer(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ReconciliationRequired('provider pagination metadata is invalid')
@@ -820,6 +826,7 @@ TRANSACTION_TRANSITIONS = {
         'add_submitted': {'processing', 'done', 'failed', 'reconcile_required'},
         'processing': {'done', 'failed', 'reconcile_required'},
         'failed': {'reconcile_required'},
+        'reconcile_required': {'add_submitted'},
     },
     'replace': {
         'existing': {'delete_verified', 'failed', 'reconcile_required'},
@@ -829,6 +836,7 @@ TRANSACTION_TRANSITIONS = {
         'add_submitted': {'processing', 'done', 'failed', 'reconcile_required'},
         'processing': {'done', 'failed', 'reconcile_required'},
         'failed': {'reconcile_required'},
+        'reconcile_required': {'delete_verified', 'deleted', 'add_submitted'},
     },
     'delete': {
         'existing': {'delete_verified', 'failed', 'reconcile_required'},
@@ -836,6 +844,7 @@ TRANSACTION_TRANSITIONS = {
         'delete_submitted': {'deleted', 'failed', 'reconcile_required'},
         'deleted': {'done', 'failed', 'reconcile_required'},
         'failed': {'reconcile_required'},
+        'reconcile_required': {'delete_verified', 'deleted'},
     },
 }
 
@@ -919,7 +928,7 @@ def _validate_transaction_identity(identity: Any, record: dict[str, Any], label:
 
 
 def _validated_transaction_plan(plan_records: Any) -> tuple[dict[str, Any], ...]:
-    if not isinstance(plan_records, (tuple, list)) or not plan_records:
+    if not isinstance(plan_records, (tuple, list)):
         raise TransactionJournalError('transaction plan records are invalid')
     records: list[dict[str, Any]] = []
     paths: set[str] = set()
@@ -1359,6 +1368,377 @@ def private_json_read(root: Path, child: str, *, max_bytes: int = 8 * 1024 * 102
         if root_fd >= 0:
             os.close(root_fd)
 
+
+def provider_identity(remote: Any, container: str | None = None) -> dict[str, Any]:
+    """Extract a complete, delete-safe provider identity."""
+    row = dict(remote) if isinstance(remote, dict) else remote.model_dump()
+    meta = row.get('metadata'); custom_id = _alias(row, 'custom_id', 'customId')
+    ident = row.get('id'); tags = _alias(row, 'container_tags', 'containerTags')
+    actual_container = container or row.get('_inventory_container')
+    if actual_container is None and type(tags) is list and len(tags) == 1: actual_container = tags[0]
+    sha256 = meta.get('content_sha256') if isinstance(meta, dict) else None
+    byte_count = meta.get('content_bytes') if isinstance(meta, dict) else None
+    if (type(custom_id) is not str or not custom_id or type(ident) is not str or not ident
+            or actual_container not in CANONICAL_CONTAINERS or not _is_sha256(sha256)
+            or type(byte_count) is not int or byte_count < 0):
+        raise ReconciliationRequired('provider identity is incomplete')
+    if not isinstance(meta, dict):
+        raise ReconciliationRequired('provider identity metadata is incomplete')
+    return {'custom_id': custom_id, 'container': actual_container, 'sha256': sha256,
+            'bytes': byte_count, 'document_id': ident}
+
+
+class DurableReconciliationExecutor:
+    """Execute canonical plans with a strictly validated durable journal.
+
+    Supermemory does not expose compare-and-delete.  The final hydration and
+    delete are deliberately adjacent (no callback, checkpoint, inventory, or
+    other provider call between them), minimizing but not eliminating the
+    provider-side TOCTOU window.
+    """
+    def __init__(self, client: Supermemory, private_root: Path,
+                 sleep: Callable[[float], None] = time.sleep, poll_limit: int = 360,
+                 fault_injector: Callable[[str], None] | None = None,
+                 poll_attempts: int | None = None):
+        self.client, self.private_root = client, Path(private_root)
+        self.sleep = sleep
+        self.poll_limit = poll_attempts if poll_attempts is not None else poll_limit
+        self.fault_injector = fault_injector
+        self.snapshot_path = self.private_root / 'snapshots/forward.json'
+        self.journal_path = self.private_root / 'journals/forward.json'
+        self._plan: tuple[dict[str, Any], ...] = ()
+        self._transaction_id = ''
+        self._snapshot_digest: str | None = None
+
+    def _fault(self, point: str) -> None:
+        if self.fault_injector:
+            self.fault_injector(point)
+
+    def _checkpoint(self, journal: Any) -> dict[str, Any]:
+        validated = validate_transaction_journal(
+            journal, self._plan, expected_transaction_id=self._transaction_id,
+            expected_snapshot_digest=self._snapshot_digest,
+        )
+        state = thaw_transaction_journal(validated)
+        self._fault('before_journal_write')
+        digest = private_json_write(self.private_root, 'journals/forward.json', state)
+        self._fault('after_journal_write')
+        persisted = private_json_read(
+            self.private_root, 'journals/forward.json', expected_sha256=digest,
+        )
+        validate_transaction_journal(
+            persisted, self._plan, expected_transaction_id=self._transaction_id,
+            expected_snapshot_digest=self._snapshot_digest,
+        )
+        self._fault('journal_written')
+        return state
+
+    def _advance(self, state: dict[str, Any], index: int, stage: str) -> dict[str, Any]:
+        advanced = advance_transaction_journal(
+            state, self._plan, index, stage,
+            expected_transaction_id=self._transaction_id,
+            expected_snapshot_digest=self._snapshot_digest,
+        )
+        return self._checkpoint(advanced)
+
+    def _inventory(self) -> dict[str, tuple[dict[str, Any], ...]]:
+        self._fault('before_inventory')
+        value = provider_inventory(self.client)
+        for rows in value.values():
+            for row in rows:
+                _require_superrag_task(row)
+        self._fault('after_inventory')
+        return value
+
+    def _matches(self, custom_id: str) -> list[dict[str, Any]]:
+        found = []
+        for container, rows in self._inventory().items():
+            for raw in rows:
+                if _alias(raw, 'custom_id', 'customId') == custom_id:
+                    row = dict(raw)
+                    row['_inventory_container'] = container
+                    found.append(row)
+        return found
+
+    def _hydrate(self, identity: dict[str, Any]) -> dict[str, Any]:
+        self._fault('before_get')
+        try:
+            remote = self.client.documents.get(identity['document_id'], timeout=15.0)
+        except Exception:
+            raise ReconciliationRequired('provider hydration failed') from None
+        self._fault('after_get')
+        return self._validate_installed(remote, identity)
+
+    def _validate_installed(self, remote: Any, identity: dict[str, Any]) -> dict[str, Any]:
+        row = dict(remote) if isinstance(remote, dict) else remote.model_dump()
+        row['_inventory_container'] = identity['container']
+        _require_superrag_task(row)
+        if not _exact_json_equal(provider_identity(row, identity['container']), identity):
+            raise ReconciliationRequired('installed identity changed')
+        meta, content = row.get('metadata'), row.get('content')
+        if not isinstance(meta, dict):
+            raise ReconciliationRequired('installed provider metadata is invalid')
+        rel = meta.get('relative_path')
+        required = {
+            'source': 'obsidian', 'authority': 'canonical', 'relative_path': rel,
+            'index_schema_version': INDEX_SCHEMA_VERSION,
+            'visibility': canonical_visibility_from_path(rel),
+            'identity_scope': 'owner', 'canonical_root': 'owner',
+        }
+        if (type(content) is not str
+                or canonical_scope_from_path(rel) != identity['container']
+                or stable_custom_id_from_path(rel) != identity['custom_id']
+                or status_name(row) != 'done'
+                or any(meta.get(key) != value for key, value in required.items())
+                or not _explicit_container_claim_agrees(row, identity['container'])):
+            raise ReconciliationRequired('installed provider object is invalid')
+        return row
+
+    def _validate_post(self, remote: Any, doc: dict[str, Any], container: str,
+                       expected: dict[str, Any]) -> dict[str, Any]:
+        row = dict(remote) if isinstance(remote, dict) else remote.model_dump()
+        row['_inventory_container'] = container
+        _require_superrag_task(row)
+        actual = provider_identity(row, container)
+        expected_actual = dict(expected)
+        expected_actual['document_id'] = actual['document_id']
+        if not _exact_json_equal(actual, expected_actual):
+            raise ReconciliationRequired('installed post identity changed')
+        validate_backend_document(row, doc)
+        content = row.get('content')
+        if (type(content) is not str
+                or content.rstrip(' \t\r\n') != doc['content'].rstrip(' \t\r\n')):
+            raise ReconciliationRequired('provider returned content is inconsistent')
+        return row
+
+    def _snapshot(self, records: list[dict[str, Any]]) -> str:
+        payload = {
+            'snapshot_schema_version': 1, 'transaction_id': self._transaction_id,
+            'plan_digest': transaction_plan_digest(self._plan),
+            'label': 'provider-returned logical snapshot; not raw source bytes',
+            'count': len(records), 'records': records,
+            'container_counts': {c: sum(r['container'] == c for r in records)
+                                 for c in sorted(CANONICAL_CONTAINERS)},
+        }
+        self._fault('before_snapshot_write')
+        digest = private_json_write(self.private_root, 'snapshots/forward.json', payload)
+        self._fault('after_snapshot_write')
+        if not _exact_json_equal(private_json_read(
+                self.private_root, 'snapshots/forward.json', expected_sha256=digest), payload):
+            raise ReconciliationRequired('snapshot read-back mismatch')
+        self._fault('snapshot_verified')
+        return digest
+
+    def _add(self, state: dict[str, Any], index: int, doc: dict[str, Any]) -> dict[str, Any]:
+        record = state['records'][index]
+        expected = record['expected_post_identity']
+        matches = self._matches(record['custom_id'])
+        if len(matches) > 1:
+            raise ReconciliationRequired('ambiguous duplicate stable identity')
+        if not matches:
+            self._fault('before_add')
+            try:
+                self.client.documents.add(
+                    content=doc['content'], container_tag=record['target_container'],
+                    custom_id=record['custom_id'], task_type='superrag',
+                    metadata=metadata(doc), timeout=30.0,
+                )
+            except Exception:
+                matches = self._matches(record['custom_id'])
+                if len(matches) != 1:
+                    return self._advance(state, index, 'reconcile_required')
+                state = self._advance(state, index, 'add_submitted')
+            else:
+                self._fault('after_add')
+                state = self._advance(state, index, 'add_submitted')
+        elif state['records'][index]['stage'] in {'existing', 'deleted', 'reconcile_required'}:
+            state = self._advance(state, index, 'add_submitted')
+        for _ in range(self.poll_limit):
+            matches = self._matches(record['custom_id'])
+            if len(matches) == 1:
+                row = matches[0]
+                ident = str(row.get('id') or '')
+                self._fault('before_get')
+                try:
+                    hydrated = self.client.documents.get(ident, timeout=15.0)
+                except Exception:
+                    return self._advance(state, index, 'reconcile_required')
+                self._fault('after_get')
+                status = status_name(hydrated)
+                if status in {'failed', 'error'}:
+                    return self._advance(state, index, 'reconcile_required')
+                if status == 'done':
+                    self._validate_post(hydrated, doc, record['target_container'], expected)
+                    return self._advance(state, index, 'done')
+                if status == 'processing':
+                    if state['records'][index]['stage'] != 'processing':
+                        state = self._advance(state, index, 'processing')
+                else:
+                    return self._advance(state, index, 'reconcile_required')
+            self.sleep(5)
+        return self._advance(state, index, 'reconcile_required')
+
+    def _verify(self, current: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        inventory = self._inventory()
+        classification = classify_inventory(current, inventory)
+        blockers = {key: value for key, value in classification.items()
+                    if key != 'expected' and value}
+        rows = [row for container in sorted(inventory) for row in inventory[container]]
+        if (blockers or classification['expected'] != tuple(sorted(current))
+                or len(rows) != len(current)):
+            raise ReconciliationRequired('exhaustive post-state proof failed')
+        proofs = []
+        post_by_id = {r['custom_id']: r['expected_post_identity'] for r in self._plan
+                      if r['expected_post_identity'] is not None}
+        for rel, doc in sorted(current.items()):
+            matches = [(container, row) for container in sorted(inventory)
+                       for row in inventory[container]
+                       if _alias(row, 'custom_id', 'customId') == doc['custom_id']]
+            if len(matches) != 1:
+                raise ReconciliationRequired('post-state identity count is not one')
+            container, row = matches[0]
+            remote = self.client.documents.get(str(row.get('id')), timeout=15.0)
+            expected = post_by_id.get(doc['custom_id'], {
+                'custom_id': doc['custom_id'], 'container': container,
+                'sha256': doc['sha256'], 'bytes': doc['bytes'], 'document_id': None,
+            })
+            validated = self._validate_post(remote, doc, container, expected)
+            proofs.append(provider_identity(validated, container))
+        return {'digest': _canonical_digest(proofs), 'count': len(proofs),
+                'container_counts': {c: sum(p['container'] == c for p in proofs)
+                                     for c in sorted(CANONICAL_CONTAINERS)}}
+
+    def _validate_current(self, current: dict[str, dict[str, Any]]) -> None:
+        for record in self._plan:
+            doc = current.get(record['relative_path'])
+            if record['action'] == 'delete':
+                if doc is not None:
+                    raise ReconciliationRequired('delete target remains in canonical projection')
+                continue
+            if not isinstance(doc, dict):
+                raise ReconciliationRequired('add target is absent from canonical projection')
+            expected = record['expected_post_identity']
+            if (doc.get('custom_id') != record['custom_id']
+                    or doc.get('sha256') != record['expected_sha256']
+                    or doc.get('bytes') != record['expected_bytes']
+                    or container_for_doc(doc) != record['target_container']
+                    or expected['sha256'] != doc['sha256']
+                    or expected['bytes'] != doc['bytes']):
+                raise ReconciliationRequired('canonical projection does not match transaction plan')
+
+    def execute(self, current: dict[str, dict[str, Any]], plan: Any,
+                transaction_id: str = 'forward') -> dict[str, Any]:
+        self._plan = _validated_transaction_plan(plan)
+        self._transaction_id = transaction_id
+        _validate_transaction_id(transaction_id)
+        self._validate_current(current)
+        journal_exists = self.journal_path.is_file()
+        if not journal_exists:
+            snapshots = []
+            for order, record in enumerate(self._plan):
+                identity = record['expected_pre_identity']
+                if identity is None:
+                    continue
+                remote = self._hydrate(identity)
+                snapshots.append({
+                    'order': order, 'relative_path': record['relative_path'],
+                    'content': remote['content'], 'metadata': remote['metadata'],
+                    'custom_id': identity['custom_id'],
+                    'backend_identity': identity['document_id'],
+                    'container': identity['container'], 'sha256': identity['sha256'],
+                    'bytes': identity['bytes'], 'task_type': 'superrag',
+                })
+            self._snapshot_digest = self._snapshot(snapshots)
+            state = self._checkpoint(new_transaction_journal(
+                transaction_id, self._plan, snapshot_digest=self._snapshot_digest,
+            ))
+        else:
+            raw = private_json_read(self.private_root, 'journals/forward.json')
+            snapshot_digest = raw.get('snapshot_digest') if isinstance(raw, dict) else None
+            if not _is_sha256(snapshot_digest):
+                raise TransactionJournalError('transaction snapshot digest mismatch')
+            self._snapshot_digest = snapshot_digest
+            validate_transaction_journal(
+                raw, self._plan, expected_transaction_id=transaction_id,
+                expected_snapshot_digest=snapshot_digest,
+            )
+            private_json_read(
+                self.private_root, 'snapshots/forward.json', expected_sha256=snapshot_digest,
+            )
+            state = thaw_transaction_journal(validate_transaction_journal(
+                raw, self._plan, expected_transaction_id=transaction_id,
+                expected_snapshot_digest=snapshot_digest,
+            ))
+
+        for index in range(len(state['records'])):
+            record = state['records'][index]
+            stage, action = record['stage'], record['action']
+            if stage == 'done':
+                continue
+            destructive_reconcile = (
+                stage == 'reconcile_required' and 'deleted' not in record['history']
+            )
+            if action in {'replace', 'delete'} and (
+                    stage in {'existing', 'delete_verified', 'delete_submitted'}
+                    or destructive_reconcile):
+                identity = record['expected_pre_identity']
+                matches = self._matches(record['custom_id'])
+                exact = []
+                malformed = False
+                for match in matches:
+                    try:
+                        if _exact_json_equal(
+                                provider_identity(match, match.get('_inventory_container')),
+                                identity):
+                            exact.append(match)
+                        else:
+                            malformed = True
+                    except ReconciliationRequired:
+                        malformed = True
+                if not matches:
+                    state = self._advance(state, index, 'deleted')
+                elif len(matches) != 1 or len(exact) != 1 or malformed:
+                    if stage != 'reconcile_required':
+                        state = self._advance(state, index, 'reconcile_required')
+                    raise ReconciliationRequired('destructive identity is ambiguous')
+                else:
+                    if stage in {'existing', 'reconcile_required'}:
+                        state = self._advance(state, index, 'delete_verified')
+                    if state['records'][index]['stage'] == 'delete_verified':
+                        state = self._advance(state, index, 'delete_submitted')
+                    self._fault('before_delete')
+                    self._fault('before_delete_validation')
+                    # Final provider operation before delete: no local callback or
+                    # durable checkpoint is permitted in this critical section.
+                    self._validate_installed(
+                        self.client.documents.get(identity['document_id'], timeout=15.0), identity,
+                    )
+                    try:
+                        self.client.documents.delete(identity['document_id'], timeout=30.0)
+                    except Exception:
+                        matches = self._matches(record['custom_id'])
+                        if not matches:
+                            state = self._advance(state, index, 'deleted')
+                        else:
+                            state = self._advance(state, index, 'reconcile_required')
+                            raise ReconciliationRequired('delete response is unknown') from None
+                    else:
+                        self._fault('after_delete')
+                        state = self._advance(state, index, 'deleted')
+            if action == 'delete':
+                if state['records'][index]['stage'] == 'deleted':
+                    state = self._advance(state, index, 'done')
+                continue
+            state = self._add(state, index, current[record['relative_path']])
+            if state['records'][index]['stage'] == 'reconcile_required':
+                raise ReconciliationRequired('add outcome requires reconciliation')
+
+        if any(record['stage'] != 'done' for record in state['records']):
+            raise ReconciliationRequired('transaction is not terminal')
+        proof = self._verify(current)
+        return state | {'complete': True, 'verification_digest': proof['digest'],
+                        'verified_count': proof['count'],
+                        'verified_container_counts': proof['container_counts']}
 
 def _private_json_write(path: Path, payload: dict[str, Any]) -> bytes:
     """Atomically write private deterministic JSON and return its exact bytes."""
