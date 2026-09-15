@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .canonical_policy import (
-    CANONICAL_CONTAINERS,
     canonical_entity_type,
     canonical_exclusion_reason,
     canonical_frontmatter_values,
@@ -64,10 +63,16 @@ def _timestamp(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _source_rows(current: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]]:
+def _destination(path: str, owner_canonical_container: str) -> str | None:
+    scope = canonical_scope_from_path(path)
+    return owner_canonical_container if scope == "owner_primary" else scope
+
+
+def _source_rows(current: Mapping[str, Mapping[str, Any]], *,
+                 owner_canonical_container: str = "owner_primary") -> list[dict[str, Any]]:
     rows = []
     for path, doc in current.items():
-        container = canonical_scope_from_path(path)
+        container = _destination(path, owner_canonical_container)
         if (container is None or doc.get("relative_path") != path
                 or doc.get("custom_id") != stable_custom_id_from_path(path)
                 or not isinstance(doc.get("sha256"), str) or not SHA256.fullmatch(doc["sha256"])
@@ -80,16 +85,18 @@ def _source_rows(current: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any
     return sorted(rows, key=lambda row: row["relative_path"])
 
 
-def source_fingerprint_from_documents(current: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
-    rows = _source_rows(current)
+def source_fingerprint_from_documents(current: Mapping[str, Mapping[str, Any]], *,
+                                      owner_canonical_container: str = "owner_primary") -> dict[str, Any]:
+    rows = _source_rows(current, owner_canonical_container=owner_canonical_container)
+    containers = {owner_canonical_container, "family_shared"}
     counts = {name: sum(row["container"] == name for row in rows)
-              for name in sorted(CANONICAL_CONTAINERS)}
+              for name in sorted(containers)}
     return {"method": "canonical-relative-path-byte-sha256", "method_version": 1,
             "digest": canonical_digest(rows), "document_count": len(rows),
             "byte_count": sum(row["bytes"] for row in rows), "container_counts": counts}
 
 
-def scan_canonical_source(root: Path) -> dict[str, Any]:
+def scan_canonical_source(root: Path, *, owner_canonical_container: str = "owner_primary") -> dict[str, Any]:
     """Read a bounded canonical tree without following symlinks; fail on any scan error."""
     root = Path(root)
     rows: list[dict[str, Any]] = []
@@ -157,7 +164,7 @@ def scan_canonical_source(root: Path) -> dict[str, Any]:
                     raise OSError("canonical source decode or policy failed") from exc
                 if not excluded:
                     rows.append({"relative_path": rel, "sha256": hashlib.sha256(raw).hexdigest(),
-                                 "bytes": size, "container": canonical_scope_from_path(rel)})
+                                 "bytes": size, "container": _destination(rel, owner_canonical_container)})
         if visited != set(expected) or (os.fstat(root_fd).st_dev, os.fstat(root_fd).st_ino) != root_id:
             raise OSError("canonical traversal changed or was incomplete")
     except OSError as exc:
@@ -168,8 +175,9 @@ def scan_canonical_source(root: Path) -> dict[str, Any]:
     if not rows:
         raise RuntimeError("canonical source scan found no documents")
     rows.sort(key=lambda row: row["relative_path"])
+    containers = {owner_canonical_container, "family_shared"}
     counts = {name: sum(row["container"] == name for row in rows)
-              for name in sorted(CANONICAL_CONTAINERS)}
+              for name in sorted(containers)}
     return {"method": "canonical-relative-path-byte-sha256", "method_version": 1,
             "digest": canonical_digest(rows), "document_count": len(rows),
             "byte_count": sum(row["bytes"] for row in rows),
@@ -268,9 +276,9 @@ def _base(schema: str, fingerprint: dict[str, Any], generation: str, generated_a
             "index_schema_version": 4, "source_fingerprint": fingerprint}
 
 
-def build_storage_reconciliation_receipt(current: Mapping[str, Mapping[str, Any]], inventory: list[dict[str, Any]], *, generation: str, generated_at: datetime, key: bytes) -> dict[str, Any]:
-    fingerprint = source_fingerprint_from_documents(current)
-    expected = {row["relative_path"]: row for row in _source_rows(current)}
+def build_storage_reconciliation_receipt(current: Mapping[str, Mapping[str, Any]], inventory: list[dict[str, Any]], *, generation: str, generated_at: datetime, key: bytes, owner_canonical_container: str = "owner_primary") -> dict[str, Any]:
+    fingerprint = source_fingerprint_from_documents(current, owner_canonical_container=owner_canonical_container)
+    expected = {row["relative_path"]: row for row in _source_rows(current, owner_canonical_container=owner_canonical_container)}
     seen: set[str] = set()
     document_ids: set[str] = set()
     for row in inventory:
@@ -375,9 +383,9 @@ def _unique_run_index(current: Mapping[str, Mapping[str, Any]]) -> dict[tuple[st
     return {run: frozenset(paths) for run, paths in owners.items()}
 
 
-def build_vector_readiness_receipt(current: Mapping[str, Mapping[str, Any]], observations: Mapping[str, list[Any]], *, generation: str, generated_at: datetime, key: bytes) -> dict[str, Any]:
+def build_vector_readiness_receipt(current: Mapping[str, Mapping[str, Any]], observations: Mapping[str, list[Any]], *, generation: str, generated_at: datetime, key: bytes, owner_canonical_container: str = "owner_primary") -> dict[str, Any]:
     """Verify production-shaped indexed observations and derive all proof digests."""
-    fingerprint = source_fingerprint_from_documents(current)
+    fingerprint = source_fingerprint_from_documents(current, owner_canonical_container=owner_canonical_container)
     if set(observations) != set(current):
         raise ValueError("vector observations do not exactly cover canonical source")
     proof_rows = []
@@ -411,7 +419,7 @@ def build_vector_readiness_receipt(current: Mapping[str, Mapping[str, Any]], obs
         aggregated = _alias(result, "is_aggregated", "isAggregated")
         task_type = _alias(parent, "task_type", "taskType", required=True)
         status = str(_field(parent, "status", "") or "").lower()
-        container = canonical_scope_from_path(path)
+        container = _destination(path, owner_canonical_container)
         _container_claim(parent, str(container), required=True)
         _container_claim(result, str(container), required=False)
         if (metadata != parent_meta or metadata != expected_meta
@@ -492,13 +500,13 @@ def read_receipt(path: Path) -> dict[str, Any] | None:
             os.close(fd)
 
 
-def readiness_from_paths(storage_path: Path, vector_path: Path, *, key_path: Path, source_root: Path, now: datetime | None = None) -> bool:
+def readiness_from_paths(storage_path: Path, vector_path: Path, *, key_path: Path, source_root: Path, now: datetime | None = None, owner_canonical_container: str = "owner_primary") -> bool:
     """Runtime gate: read existing key/receipts and recompute live source once."""
     key = read_receipt_key(key_path)
     if key is None:
         return False
     try:
-        fingerprint = scan_canonical_source(source_root)
+        fingerprint = scan_canonical_source(source_root, owner_canonical_container=owner_canonical_container)
     except RuntimeError:
         return False
     return validate_readiness_receipts(read_receipt(storage_path), read_receipt(vector_path),

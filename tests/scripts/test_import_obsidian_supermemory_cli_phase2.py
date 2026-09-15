@@ -93,6 +93,75 @@ def test_phase2_dry_run_never_constructs_client_or_writes(importer, tmp_path, mo
     assert not private.exists()
 
 
+def test_topology_fresh_empty_owner_destination_plans_only_adds(
+        importer, tmp_path, monkeypatch, capsys):
+    source = tmp_path / "source"; _source(source)
+    private = tmp_path / "private"; private.mkdir(mode=0o700)
+    client = StatefulClient()
+    monkeypatch.setattr(importer, "_client", lambda _: client)
+
+    result = _run_command(importer, monkeypatch, capsys, [
+        "plan", "--transaction-id", "fresh", "--source-root", str(source),
+        "--private-root", str(private), "--owner-canonical-container", "canonical_v2",
+        "--owner-explicit-container", "explicit_v2",
+    ])
+
+    assert result["actions"] == {"add": 1}
+    assert result["containers"] == ["canonical_v2", "family_shared"]
+    assert client.documents.calls == [("list", "canonical_v2"), ("list", "family_shared")]
+    assert "owner_primary" not in json.dumps(result)
+
+
+def test_topology_fresh_rebuild_binds_writes_manifest_and_receipts(
+        importer, tmp_path, monkeypatch, capsys):
+    source = tmp_path / "source"; _source(source)
+    private = tmp_path / "private"; private.mkdir(mode=0o700)
+    importer.generate_receipt_key(private / "readiness/receipt-hmac.key")
+    plist = tmp_path / "agent.plist"; plist.write_bytes(plistlib.dumps({"Label": "fresh"}))
+    client = StatefulClient()
+    monkeypatch.setattr(importer, "_client", lambda _: client)
+    _install_search(importer, monkeypatch, client)
+    common = [
+        "--source-root", str(source), "--private-root", str(private),
+        "--owner-canonical-container", "canonical_v2",
+        "--owner-explicit-container", "explicit_v2",
+    ]
+    planned = _run_command(importer, monkeypatch, capsys, [
+        "plan", "--transaction-id", "fresh_execute", *common,
+    ])
+    result = _run_command(importer, monkeypatch, capsys, [
+        "reconcile", "--execute", "--transaction-id", "fresh_execute",
+        "--confirm", "fresh_execute", "--confirm-plan", planned["plan_digest"],
+        "--plist", str(plist), "--first-install", *common,
+    ])
+
+    assert result["readiness"] is True
+    writes = [row for row in client.documents.calls if row[0] in {"add", "delete"}]
+    assert writes == [("add", next(iter(client.documents.rows.values()))["custom_id"])]
+    assert next(iter(client.documents.rows.values()))["container_tags"] == ["canonical_v2"]
+    plan = importer.private_json_read(private, "transactions/fresh_execute/plan.json")
+    assert plan["records"][0]["source_container"] is None
+    assert plan["records"][0]["expected_pre_identity"] is None
+    triple = [importer.private_json_read(private, child)
+              for _, child in importer.PUBLICATION_ARTIFACTS]
+    assert len({row["generation"] for row in triple}) == 1
+    assert triple[2]["documents"][0]["container"] == "canonical_v2"
+    assert "owner_primary" not in json.dumps(triple)
+
+
+def test_topology_collision_fails_before_scan_or_provider(importer, monkeypatch):
+    effects = []
+    monkeypatch.setattr(importer, "_scan_at", lambda _: effects.append("scan"))
+    monkeypatch.setattr(importer, "_client", lambda _: effects.append("client"))
+    with pytest.raises(SystemExit, match="collide"):
+        importer._phase2_main([
+            "plan", "--transaction-id", "collision", "--source-root", "/tmp/source",
+            "--private-root", "/tmp/private", "--owner-canonical-container", "same",
+            "--owner-explicit-container", "same",
+        ])
+    assert effects == []
+
+
 def test_key_commands_are_explicit_and_rotation_invalidates_old_key(importer, tmp_path, monkeypatch, capsys):
     root = tmp_path / "private"
     root.mkdir(mode=0o700)

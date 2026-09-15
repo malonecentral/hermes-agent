@@ -56,6 +56,8 @@ LOCK = Path('/Users/dennis/.hermes/obsidian-supermemory-sync.lock')
 BASE_URL = 'http://127.0.0.1:6767'
 CONTAINER = OWNER_CONTAINER
 CONVERSATION_CONTAINER = 'owner_conversations'
+OWNER_EXPLICIT_CONTAINER = OWNER_CONTAINER
+CANONICAL_CONTAINERS = frozenset({CONTAINER, FAMILY_CONTAINER})
 INDEX_SCHEMA_VERSION = 4
 
 TERMINAL = {'done', 'failed', 'error'}
@@ -88,7 +90,33 @@ def container_for_doc(doc: dict[str, Any]) -> str:
     scope = canonical_scope_from_path(doc.get('relative_path'))
     if scope is None or doc.get('visibility') != canonical_visibility_from_path(doc.get('relative_path')):
         raise ValueError('invalid canonical projection')
-    return scope
+    return CONTAINER if scope == OWNER_CONTAINER else FAMILY_CONTAINER
+
+
+def destination_for_path(relative_path: Any) -> str | None:
+    """Map a policy-derived logical scope to its configured exact destination."""
+    scope = canonical_scope_from_path(relative_path)
+    if scope == OWNER_CONTAINER:
+        return CONTAINER
+    if scope == FAMILY_CONTAINER:
+        return FAMILY_CONTAINER
+    return None
+
+
+def configure_destinations(owner_canonical: str, owner_explicit: str) -> None:
+    """Bind validated destinations before inventory or provider construction."""
+    global CONTAINER, OWNER_EXPLICIT_CONTAINER, CANONICAL_CONTAINERS
+    valid = re.compile(r'[A-Za-z0-9][A-Za-z0-9_]{0,127}').fullmatch
+    if not valid(owner_canonical) or not valid(owner_explicit):
+        raise SystemExit('Owner memory destination is invalid')
+    protected = (owner_canonical, owner_explicit, FAMILY_CONTAINER, CONVERSATION_CONTAINER)
+    topology_enabled = (owner_canonical, owner_explicit) != (OWNER_CONTAINER, OWNER_CONTAINER)
+    if topology_enabled and (len(set(protected)) != len(protected)
+            or any(tag.startswith('requester_conversations_') for tag in protected)):
+        raise SystemExit('Owner memory destinations collide with protected topology')
+    CONTAINER = owner_canonical
+    OWNER_EXPLICIT_CONTAINER = owner_explicit
+    CANONICAL_CONTAINERS = frozenset({CONTAINER, FAMILY_CONTAINER})
 
 
 def container_for_row(row: dict[str, Any]) -> str:
@@ -564,7 +592,7 @@ def _trusted_orphan_path(row: dict[str, Any], source_container: str) -> str | No
                 or inventory_container != source_container or state != 'done'):
             return None
         rel = metadata_value.get('relative_path')
-        derived_container = canonical_scope_from_path(rel)
+        derived_container = destination_for_path(rel)
         expected_visibility = canonical_visibility_from_path(rel)
         if (derived_container is None or derived_container != source_container
                 or custom_id != stable_custom_id_from_path(rel)):
@@ -641,7 +669,7 @@ _CANONICAL_METADATA_MARKERS = frozenset({
 
 def _is_noncanonical_explicit_memory(row: Any, source_container: str) -> bool:
     """Exclude only the exact, documented Hermes explicit-write envelope."""
-    if not isinstance(row, dict) or source_container != OWNER_CONTAINER:
+    if not isinstance(row, dict) or source_container != OWNER_EXPLICIT_CONTAINER:
         return False
     if not set(row).issubset(_EXPLICIT_MEMORY_ROW_FIELDS):
         return False
@@ -1628,7 +1656,7 @@ class DurableReconciliationExecutor:
             'identity_scope': 'owner', 'canonical_root': 'owner',
         }
         if (type(content) is not str
-                or canonical_scope_from_path(rel) != identity['container']
+                or destination_for_path(rel) != identity['container']
                 or stable_custom_id_from_path(rel) != identity['custom_id']
                 or status_name(row) != 'done'
                 or any(meta.get(key) != value for key, value in required.items())
@@ -1969,7 +1997,7 @@ def _snapshot_logical_record(row: Any) -> dict[str, Any]:
     required = {'source': 'obsidian', 'authority': 'canonical',
                 'index_schema_version': INDEX_SCHEMA_VERSION, 'identity_scope': 'owner',
                 'canonical_root': 'owner'}
-    if (canonical_scope_from_path(rel) != row['container']
+    if (destination_for_path(rel) != row['container']
             or stable_custom_id_from_path(rel) != row['custom_id']
             or metadata_value.get('visibility') != canonical_visibility_from_path(rel)
             or any(metadata_value.get(key) != value for key, value in required.items())):
@@ -2231,7 +2259,7 @@ class DurableRollbackExecutor:
                     'visibility': canonical_visibility_from_path(rel),
                     'identity_scope': 'owner', 'canonical_root': 'owner',
                     'content_sha256': expected['sha256'], 'content_bytes': expected['bytes']}
-        if (canonical_scope_from_path(rel) != expected['container']
+        if (destination_for_path(rel) != expected['container']
                 or stable_custom_id_from_path(rel) != expected['custom_id']
                 or any(meta.get(key) != value for key, value in required.items())):
             return False
@@ -3189,13 +3217,16 @@ def write_verified_readiness_receipts(
     if key is None:
         raise ReconciliationRequired('readiness receipt key is unavailable or unsafe')
     storage = build_storage_reconciliation_receipt(
-        current, inventory, generation=generation, generated_at=generated_at, key=key)
+        current, inventory, generation=generation, generated_at=generated_at, key=key,
+        owner_canonical_container=CONTAINER)
     vector = build_vector_readiness_receipt(
         current, vectors, generation=generation, generated_at=generated_at, key=key,
+        owner_canonical_container=CONTAINER,
     )
     if not validate_readiness_receipts(
             storage, vector, key=key,
-            current_fingerprint=source_fingerprint_from_documents(current), now=generated_at):
+            current_fingerprint=source_fingerprint_from_documents(
+                current, owner_canonical_container=CONTAINER), now=generated_at):
         raise ReconciliationRequired('readiness receipt proof is incomplete')
     storage_digest = private_json_write(
         private_root, 'readiness/storage-reconciliation.json', storage,
@@ -3518,6 +3549,10 @@ def _phase2_parser() -> argparse.ArgumentParser:
     common.add_argument('--private-root', type=Path, required=True)
     common.add_argument('--manifest', type=Path)
     common.add_argument('--base-url', default=BASE_URL)
+    common.add_argument('--owner-canonical-container', default=OWNER_CONTAINER,
+                        help='Exact validated destination for Owner canonical documents')
+    common.add_argument('--owner-explicit-container', default=OWNER_CONTAINER,
+                        help='Exact validated destination reserved for Owner explicit memories')
     sub.add_parser('dry-run', parents=[common])
     plan = sub.add_parser('plan', parents=[common])
     plan.add_argument('--transaction-id', required=True, type=_transaction_id_argument)
@@ -3539,6 +3574,8 @@ def _phase2_parser() -> argparse.ArgumentParser:
     rollback.add_argument('--confirm', required=True,
                           help='Must exactly equal ROLLBACK:<forward transaction id>')
     rollback.add_argument('--base-url', default=BASE_URL)
+    rollback.add_argument('--owner-canonical-container', default=OWNER_CONTAINER)
+    rollback.add_argument('--owner-explicit-container', default=OWNER_CONTAINER)
     for name in ('key-init', 'key-rotate'):
         key = sub.add_parser(name)
         key.add_argument('--private-root', type=Path, required=True)
@@ -3734,7 +3771,8 @@ def _write_storage_receipt(root: Path, current: dict[str, dict[str, Any]], inven
     if key is None:
         raise ReconciliationRequired('readiness receipt key is unavailable or unsafe')
     value = build_storage_reconciliation_receipt(
-        current, inventory, generation=generation, generated_at=generated_at, key=key)
+        current, inventory, generation=generation, generated_at=generated_at, key=key,
+        owner_canonical_container=CONTAINER)
     return private_json_write(root, 'readiness/storage-reconciliation.json', value)
 
 
@@ -3744,7 +3782,8 @@ def _write_vector_receipt(root: Path, current: dict[str, dict[str, Any]], observ
     if key is None:
         raise ReconciliationRequired('readiness receipt key is unavailable or unsafe')
     value = build_vector_readiness_receipt(
-        current, observations, generation=generation, generated_at=generated_at, key=key)
+        current, observations, generation=generation, generated_at=generated_at, key=key,
+        owner_canonical_container=CONTAINER)
     return private_json_write(root, 'readiness/vector-readiness.json', value)
 
 
@@ -3931,10 +3970,13 @@ def publish_readiness_pair(
     if key is None:
         raise ReconciliationRequired('readiness receipt key is unavailable or unsafe')
     storage = build_storage_reconciliation_receipt(
-        current, inventory, generation=generation, generated_at=generated_at, key=key)
+        current, inventory, generation=generation, generated_at=generated_at, key=key,
+        owner_canonical_container=CONTAINER)
     vector = build_vector_readiness_receipt(
-        current, observations, generation=generation, generated_at=generated_at, key=key)
-    fingerprint = source_fingerprint_from_documents(current)
+        current, observations, generation=generation, generated_at=generated_at, key=key,
+        owner_canonical_container=CONTAINER)
+    fingerprint = source_fingerprint_from_documents(
+        current, owner_canonical_container=CONTAINER)
     if not validate_readiness_receipts(storage, vector, key=key,
                                        current_fingerprint=fingerprint, now=generated_at):
         raise ReconciliationRequired('staged readiness receipt pair failed validation')
@@ -4136,6 +4178,8 @@ def _phase2_main(argv: list[str]) -> None:
             sys.argv = old_argv
         return
     args = _phase2_parser().parse_args(argv)
+    if hasattr(args, 'owner_canonical_container'):
+        configure_destinations(args.owner_canonical_container, args.owner_explicit_container)
     if args.command in {'key-init', 'key-rotate'}:
         key_id = generate_receipt_key(
             args.private_root / 'readiness/receipt-hmac.key', rotate=args.command == 'key-rotate')
@@ -4199,13 +4243,15 @@ def _phase2_main(argv: list[str]) -> None:
             vector = private_json_read(root, 'readiness/vector-readiness.json')
             receipts_valid = key is not None and validate_readiness_receipts(
                 storage, vector, key=key,
-                current_fingerprint=source_fingerprint_from_documents(current),
+                current_fingerprint=source_fingerprint_from_documents(
+                    current, owner_canonical_container=CONTAINER),
                 now=datetime.now(timezone.utc))
             # Re-run the complete vector receipt validator against the live
             # search/get observations without persisting its transient proof.
             live_vector_valid = key is not None and bool(build_vector_readiness_receipt(
                 current, observations, generation=str(vector.get('generation', '')),
-                generated_at=datetime.now(timezone.utc), key=key))
+                generated_at=datetime.now(timezone.utc), key=key,
+                owner_canonical_container=CONTAINER))
         except Exception:
             receipts_valid = False
             live_vector_valid = False

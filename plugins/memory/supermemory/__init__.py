@@ -29,7 +29,7 @@ from .search_v4 import (
     normalize_document_chunk,
     search_documents_v4,
 )
-from .topology import load_routing_projection
+from .topology import load_routing_projection, validate_topology_destinations
 
 from agent.memory_provider import MemoryProvider
 from agent.secret_scope import get_secret, is_multiplex_active
@@ -799,13 +799,15 @@ def _load_supermemory_config(hermes_home: str) -> dict:
     config["routing_projection_enabled"] = _as_bool(
         config.get("routing_projection_enabled"), False
     )
+    validate_topology_destinations(config)
 
     return config
 
 
 def _verified_v4_import_ready(hermes_home: str, *, storage_path: str | None = None,
                               vector_path: str | None = None, key_path: str | None = None,
-                              source_root: str | None = None) -> bool:
+                              source_root: str | None = None,
+                              owner_canonical_container: str = "owner_primary") -> bool:
     """Require current separate storage and vector receipts; never legacy aggregate state."""
     from .readiness_receipts import readiness_from_paths
     root = Path(hermes_home) / "readiness"
@@ -815,7 +817,10 @@ def _verified_v4_import_ready(hermes_home: str, *, storage_path: str | None = No
     canonical_root = Path(source_root) if source_root else Path(
         "~/Documents/ObsidianVault/Personal/Hermes"
     ).expanduser()
-    return readiness_from_paths(storage, vector, key_path=key, source_root=canonical_root)
+    return readiness_from_paths(
+        storage, vector, key_path=key, source_root=canonical_root,
+        owner_canonical_container=owner_canonical_container,
+    )
 
 
 def _save_supermemory_config(values: dict, hermes_home: str) -> None:
@@ -1912,6 +1917,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 vector_path=self._config.get("vector_readiness_receipt_path"),
                 key_path=self._config.get("readiness_receipt_key_path"),
                 source_root=self._config.get("canonical_source_root"),
+                owner_canonical_container=self._config["owner_canonical_container"],
             )
         )
         # Base URL: config > SUPERMEMORY_BASE_URL env var > api.supermemory.ai.
@@ -2883,10 +2889,16 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
         def _run():
             try:
+                explicit_container = None
+                if self._config.get("routing_projection_enabled"):
+                    explicit_container = load_routing_projection(
+                        self._config, audience="owner"
+                    ).explicit_container
                 self._client.add_memory(
                     content.strip(),
                     metadata={"target": target, "type": "explicit_memory"},
                     entity_context=self._entity_context,
+                    container_tag=explicit_container,
                 )
             except Exception:
                 logger.debug("Supermemory on_memory_write failed", exc_info=True)
@@ -2968,11 +2980,24 @@ class SupermemoryMemoryProvider(MemoryProvider):
             tag = self._resolve_tool_container_tag(args)
         except ValueError as exc:
             return tool_error(str(exc))
+        if self._config.get("routing_projection_enabled"):
+            explicit = load_routing_projection(
+                self._config, audience="owner"
+            ).explicit_container
+            requested = str(args.get("container_tag") or "").strip()
+            if requested and requested != explicit:
+                return tool_error(
+                    "Explicit saves may only target the configured Owner explicit container"
+                )
+            tag = explicit
         metadata = args.get("metadata") or {}
         if not isinstance(metadata, dict):
             metadata = {}
-        metadata.setdefault("type", _detect_category(content))
-        metadata.pop("source", None)
+        if self._config.get("routing_projection_enabled"):
+            metadata = {"target": "memory", "type": "explicit_memory"}
+        else:
+            metadata.setdefault("type", _detect_category(content))
+            metadata.pop("source", None)
         try:
             result = self._client.add_memory(content, metadata=metadata, entity_context=self._entity_context, container_tag=tag)
             preview = content[:80] + ("..." if len(content) > 80 else "")

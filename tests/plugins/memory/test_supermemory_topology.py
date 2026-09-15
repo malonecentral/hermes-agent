@@ -122,3 +122,21 @@ def test_family_projection_fails_closed_without_trusted_projection(tmp_path):
 def test_projection_rejects_unknown_audience(tmp_path):
     with pytest.raises(RoutingProjectionError, match="audience"):
         load_routing_projection(_load_supermemory_config(str(tmp_path)), audience="guest")
+
+
+@pytest.mark.parametrize("updates", [
+    {"owner_canonical_container": "same", "owner_explicit_container": "same"},
+    {"owner_canonical_container": "family_shared"},
+    {"owner_explicit_container": "owner_conversations"},
+    {"owner_canonical_container": "requester_conversations_reserved"},
+])
+def test_enabled_topology_rejects_protected_destination_collisions(tmp_path, updates):
+    values = {
+        "routing_projection_enabled": True,
+        "owner_canonical_container": "canonical_v2",
+        "owner_explicit_container": "explicit_v2",
+        **updates,
+    }
+    (tmp_path / "supermemory.json").write_text(json.dumps(values))
+    with pytest.raises(RoutingProjectionError, match="collid"):
+        _load_supermemory_config(str(tmp_path))

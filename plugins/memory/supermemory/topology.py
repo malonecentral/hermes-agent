@@ -18,6 +18,27 @@ class RoutingProjectionError(ValueError):
     """The requested audience has no valid production topology projection."""
 
 
+_REQUESTER_CONVERSATION_PREFIX = "requester_conversations_"
+
+
+def validate_topology_destinations(config: Mapping[str, Any]) -> None:
+    """Reject an enabled topology whose server-owned namespaces overlap."""
+    if config.get("routing_projection_enabled") is not True:
+        return
+    names = (
+        "owner_canonical_container", "owner_explicit_container",
+        "family_shared_container", "owner_conversation_container",
+    )
+    tags = [config.get(name) for name in names]
+    if any(not isinstance(tag, str) or not tag for tag in tags):
+        raise RoutingProjectionError("memory topology contains an invalid destination")
+    tags = [str(tag) for tag in tags]
+    if len(set(tags)) != len(tags):
+        raise RoutingProjectionError("memory topology destinations collide")
+    if any(tag.startswith(_REQUESTER_CONVERSATION_PREFIX) for tag in tags):
+        raise RoutingProjectionError("memory topology collides with a protected requester namespace")
+
+
 @dataclass(frozen=True, slots=True)
 class MemoryRoutingProjection:
     """One immutable, server-owned projection of allowed memory containers."""
@@ -68,6 +89,7 @@ def load_routing_projection(
     a namespace key is configured, and the authenticated registry projection is
     available through :func:`agent.request_context.get_mcp_meta`.
     """
+    validate_topology_destinations(config)
     if audience == "owner":
         return MemoryRoutingProjection(
             audience="owner",

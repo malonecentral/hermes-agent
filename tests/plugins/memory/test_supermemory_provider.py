@@ -541,7 +541,10 @@ def test_projected_owner_rejects_forged_rows_before_reranker(provider, monkeypat
 
 
 def test_projected_owner_source_failure_preserves_other_source(provider):
-    provider._config["routing_projection_enabled"] = True
+    provider._config.update({
+        "routing_projection_enabled": True,
+        "owner_explicit_container": "owner_explicit",
+    })
     shared = _canonical("SURVIVES", "Jarvis/Family Shared/Fact.md", "family_shared")
     provider._client.search_results_by_container = {"family_shared": [shared]}
     provider._client.fail_containers = {"owner_primary"}
@@ -551,7 +554,9 @@ def test_projected_owner_source_failure_preserves_other_source(provider):
 
 def test_enabled_family_projection_call_count_tracks_request_identity(family_provider):
     family_provider._config.update({
-        "routing_projection_enabled": True, "requester_conversation_projection": True,
+        "routing_projection_enabled": True,
+        "owner_explicit_container": "owner_explicit",
+        "requester_conversation_projection": True,
         "requester_identity_server": "family_identity",
         "requester_conversation_namespace_key": "a sufficiently long namespace secret",
     })
@@ -2497,6 +2502,56 @@ def test_explicit_approved_store_is_not_blocked_by_auto_capture(monkeypatch, tmp
     result = json.loads(p.handle_tool_call("supermemory_store", {"content": "Approved explicit fact"}))
     assert result["saved"] is True
     assert len(p._client.add_calls) == 1
+
+
+def test_topology_routes_direct_and_mirrored_explicit_writes(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({
+        "routing_projection_enabled": True,
+        "owner_canonical_container": "canonical_v2",
+        "owner_explicit_container": "explicit_v2",
+    }, str(tmp_path))
+    provider = SupermemoryMemoryProvider()
+    provider.initialize("s1", hermes_home=str(tmp_path), platform="cli")
+
+    result = json.loads(provider.handle_tool_call(
+        "supermemory-save", {"content": "Approved explicit fact"}
+    ))
+    provider.on_memory_write("add", "user", "User likes exact metadata")
+    provider.shutdown()
+
+    assert result["container_tag"] == "explicit_v2"
+    assert [call["container_tag"] for call in provider._client.add_calls] == [
+        "explicit_v2", "explicit_v2",
+    ]
+    assert provider._client.add_calls[0]["metadata"] == {
+        "target": "memory", "type": "explicit_memory",
+    }
+    assert provider._client.add_calls[1]["metadata"] == {
+        "target": "user", "type": "explicit_memory",
+    }
+
+
+def test_topology_direct_save_rejects_non_explicit_destination(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({
+        "routing_projection_enabled": True,
+        "owner_canonical_container": "canonical_v2",
+        "owner_explicit_container": "explicit_v2",
+        "enable_custom_container_tags": True,
+        "custom_containers": ["canonical_v2", "explicit_v2"],
+    }, str(tmp_path))
+    provider = SupermemoryMemoryProvider()
+    provider.initialize("s1", hermes_home=str(tmp_path), platform="cli")
+
+    result = json.loads(provider.handle_tool_call("supermemory-save", {
+        "content": "Ambiguous fact", "container_tag": "canonical_v2",
+    }))
+
+    assert "error" in result
+    assert provider._client.add_calls == []
 
 
 def test_merge_metadata_stamps_sm_source():
