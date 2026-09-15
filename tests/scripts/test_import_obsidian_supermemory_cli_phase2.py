@@ -40,6 +40,8 @@ class StatefulDocuments:
         self.calls.append(("list", container))
         rows = [copy.deepcopy(row) for row in self.rows.values()
                 if row["container_tags"] == [container]]
+        for row in rows:
+            row.pop("task_type", None)  # production list responses omit this field
         return {"memories": rows, "pagination": {"current_page": 1,
                 "total_pages": 1 if rows else 0, "total_items": len(rows)}}
 
@@ -147,6 +149,33 @@ def test_topology_fresh_rebuild_binds_writes_manifest_and_receipts(
     assert len({row["generation"] for row in triple}) == 1
     assert triple[2]["documents"][0]["container"] == "canonical_v2"
     assert "owner_primary" not in json.dumps(triple)
+
+
+def test_sync_canonical_adds_then_reports_verified_noop(
+        importer, tmp_path, monkeypatch, capsys):
+    source = tmp_path / "source"; _source(source)
+    private = tmp_path / "private"; private.mkdir(mode=0o700)
+    importer.generate_receipt_key(private / "readiness/receipt-hmac.key")
+    client = StatefulClient()
+    monkeypatch.setattr(importer, "_client", lambda _: client)
+    _install_search(importer, monkeypatch, client)
+    common = ["--source-root", str(source), "--private-root", str(private),
+              "--owner-canonical-container", "canonical_v2",
+              "--owner-explicit-container", "explicit_v2"]
+
+    changed = _run_command(importer, monkeypatch, capsys, ["sync-canonical", *common])
+    assert changed["readiness"] is True
+    assert changed["actions"] == {"add": 1}
+    assert changed["backend_mutated"] is True
+
+    calls_before = list(client.documents.calls)
+    noop = _run_command(importer, monkeypatch, capsys, ["sync-canonical", *common])
+    assert noop["readiness"] is True
+    assert noop["change_count"] == 0
+    assert noop["container_counts"] == {"canonical_v2": 1, "family_shared": 0}
+    assert noop["filesystem_mutated"] is noop["backend_mutated"] is False
+    assert not [call for call in client.documents.calls[len(calls_before):]
+                if call[0] in {"add", "delete"}]
 
 
 def test_topology_collision_fails_before_scan_or_provider(importer, monkeypatch):

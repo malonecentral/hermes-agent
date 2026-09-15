@@ -1793,9 +1793,10 @@ class DurableReconciliationExecutor:
     def _inventory(self) -> dict[str, tuple[dict[str, Any], ...]]:
         self._fault('before_inventory')
         value = provider_inventory(self.client)
-        for rows in value.values():
-            for row in rows:
-                _require_superrag_task(row)
+        # The production SDK's list response omits task_type.  Classification
+        # proves canonical identity from the complete listed metadata, and
+        # every row is hydrated and task-type validated before mutation or
+        # snapshot publication.
         self._fault('after_inventory')
         return value
 
@@ -2331,9 +2332,9 @@ class DurableRollbackExecutor:
     def _inventory(self) -> dict[str, tuple[dict[str, Any], ...]]:
         self._fault('before_inventory')
         try:
+            # Production list responses omit task_type.  Rollback hydrates and
+            # validates every identity before using it.
             result = provider_inventory(self.client)
-            for rows in result.values():
-                for row in rows: _require_superrag_task(row)
         except Exception:
             raise ReconciliationRequired('rollback provider inventory is unavailable') from None
         self._fault('after_inventory')
@@ -3715,7 +3716,7 @@ def legacy_main() -> None:
 # migration utility, but all scheduled/new invocations use these explicit
 # subcommands and the durable executors.
 PHASE2_COMMANDS = frozenset({
-    'dry-run', 'plan', 'verify-only', 'reconcile', 'rollback', 'key-init', 'key-rotate',
+    'dry-run', 'plan', 'verify-only', 'sync-canonical', 'reconcile', 'rollback', 'key-init', 'key-rotate',
     'install', 'reload-instructions', 'legacy-reconcile', 'rebuild-owner-canonical',
 })
 
@@ -3736,6 +3737,7 @@ def _phase2_parser() -> argparse.ArgumentParser:
     plan = sub.add_parser('plan', parents=[common])
     plan.add_argument('--transaction-id', required=True, type=_transaction_id_argument)
     sub.add_parser('verify-only', parents=[common])
+    sub.add_parser('sync-canonical', parents=[common])
     rebuild = sub.add_parser('rebuild-owner-canonical', parents=[common])
     rebuild.set_defaults(rebuild_owner_canonical_container='owner_canonical',
                          rebuild_owner_explicit_container='owner_explicit')
@@ -4469,6 +4471,56 @@ def _phase2_main(argv: list[str]) -> None:
                           'containers': sorted(CANONICAL_CONTAINERS),
                           'reason_codes': sorted({row['action'] for row in proposed_plan}),
                           'filesystem_mutated': False, 'backend_mutated': False}))
+        return
+    if args.command == 'sync-canonical':
+        if any(row['action'] == 'operator_review' for row in proposed_plan):
+            raise ReconciliationRequired('canonical sync requires operator review')
+        if not proposed_plan:
+            storage_rows = _receipt_inventory(client, current)
+            counts = {container: sum(row['container'] == container for row in storage_rows)
+                      for container in sorted(CANONICAL_CONTAINERS)}
+            print(json.dumps({'mode': args.command, **summary, 'readiness': True,
+                              'container_counts': counts, 'storage_count': len(storage_rows),
+                              'storage_digest': _canonical_digest(storage_rows),
+                              'filesystem_mutated': False, 'backend_mutated': False}))
+            return
+        transaction_id = f'sync_{proposed_digest[:24]}'
+        plan_child = f'transactions/{transaction_id}/plan.json'
+        plan_path = root / plan_child
+        if plan_path.exists():
+            payload = private_json_read(root, plan_child)
+            plan = _validated_transaction_plan(payload.get('records'))
+            if (payload.get('transaction_id') != transaction_id
+                    or payload.get('plan_digest') != transaction_plan_digest(plan)
+                    or transaction_plan_digest(plan) != proposed_digest):
+                raise TransactionJournalError('persisted unattended sync plan binding is invalid')
+        else:
+            plan = proposed_plan
+            payload = {'transaction_id': transaction_id, 'records': _plain_json(plan),
+                       'plan_digest': proposed_digest, 'unattended': True}
+            digest = private_json_write(root, plan_child, payload)
+            if private_json_read(root, plan_child, expected_sha256=digest) != payload:
+                raise PrivateArtifactError('unattended sync plan read-back mismatch')
+        try:
+            state = DurableReconciliationExecutor(client, root).execute(current, plan, transaction_id)
+            generated_at = datetime.now(timezone.utc)
+            generation = f'{transaction_id}:{state["verification_digest"]}'
+            storage_rows = _receipt_inventory(client, current)
+            observations = _vector_observations(client, current)
+            manifest = {'schema_version': INDEX_SCHEMA_VERSION, 'transaction_id': transaction_id,
+                        'generation': generation,
+                        'documents': sorted(storage_rows, key=lambda row: row['relative_path'])}
+            storage_digest, vector_digest = publish_readiness_pair(
+                root, current, storage_rows, observations, generation, generated_at,
+                manifest=manifest, manifest_child=manifest_path.relative_to(root).as_posix())
+        except Exception:
+            print(json.dumps({'mode': args.command, 'transaction_id': transaction_id,
+                              'readiness': False, 'resume': True}))
+            raise SystemExit(1) from None
+        print(json.dumps({'mode': args.command, **summary, 'transaction_id': transaction_id,
+                          'storage_receipt_sha256': storage_digest,
+                          'vector_receipt_sha256': vector_digest, 'readiness': True,
+                          'filesystem_mutated': True, 'backend_mutated': True}))
         return
     if args.confirm != args.transaction_id:
         raise SystemExit('reconcile confirmation token mismatch')
