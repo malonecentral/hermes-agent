@@ -29,6 +29,7 @@ from plugins.memory.supermemory import (
     _probe_supermemory_connection,
     _save_supermemory_config,
     _scope_owner_dated_event_results,
+    _scope_owner_person_sections,
     _scope_owner_restaurant_results,
 )
 from plugins.memory.supermemory.topology import load_routing_projection
@@ -1619,6 +1620,59 @@ def test_owner_recall_keeps_only_requested_person_section(provider):
 
     assert "Madison Bumgarner on sourdough" in result
     assert "Ike's Reuben" not in result
+
+
+def test_owner_person_scope_preserves_shared_restaurant_sections():
+    item = {
+        "memory": (
+            "restaurant: J. Alexander's - Chandler\n"
+            "## Current preferences by person\n"
+            "### Dennis\n- Not established.\n"
+            "### Courtnee\n- Not established.\n"
+            "## Dishes\n- Hong Kong shrimp was pretty good.\n"
+            "## Visit history\n- Dennis and Courtnee visited together."
+        ),
+        "metadata": {
+            "relative_path": "Jarvis/Family Shared/Food/Restaurants/J. Alexander's - Chandler.md",
+        },
+    }
+
+    scoped = _scope_owner_person_sections("What did I have at J. Alexander's?", [item])
+
+    assert "### Dennis" in scoped[0]["memory"]
+    assert "### Courtnee" not in scoped[0]["memory"]
+    assert "Hong Kong shrimp" in scoped[0]["memory"]
+    assert "Dennis and Courtnee visited together" in scoped[0]["memory"]
+
+
+def test_owner_context_distinguishes_missing_usual_from_recorded_visit_facts():
+    context = _format_prefetch_context(
+        [], [], [{"memory": "### Dennis\n- Not established.\n## Dishes\n- Shrimp was liked."}],
+        5, owner_context=True,
+    )
+
+    assert "missing usual order or current preference does not erase" in context
+    assert "broad venue questions must use all explicit sections" in context
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What do I know about J Alexanders?",
+        "What did Courtnee and I have at J. Alexander's?",
+    ],
+)
+def test_owner_broad_or_multi_person_restaurant_query_keeps_all_people(query):
+    item = {
+        "memory": "restaurant: J. Alexander's\n### Dennis\n- Filet.\n### Courtnee\n- Shrimp.",
+        "metadata": {
+            "relative_path": "Jarvis/Family Shared/Food/Restaurants/J. Alexander's - Chandler.md",
+        },
+    }
+
+    scoped = _scope_owner_person_sections(query, [item])
+
+    assert scoped == [item]
 
 
 def test_owner_named_parlay_recall_excludes_zipps_person_collision(provider):

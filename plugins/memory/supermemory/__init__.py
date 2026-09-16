@@ -1198,6 +1198,17 @@ def _rank_owner_canonical_results(query: str, results: list) -> list:
 def _owner_query_subject(query: str) -> str:
     """Resolve only the person explicitly requested by an Owner fact query."""
     text = (query or "").strip()
+    # Broad venue questions and explicit multi-person questions need the whole
+    # selected record.  Treating every first-person pronoun as a request to
+    # retain only Dennis's subsection discards shared dishes and visit history.
+    if re.search(r"\bwhat\s+do\s+I\s+(?:know|remember)\s+about\b", text, re.IGNORECASE):
+        return ""
+    if re.search(
+        r"\b(?:[A-Z][A-Za-z.'’-]+(?:\s+[A-Z][A-Za-z.'’-]+){0,2})\s+(?:and|&)\s+I\b"
+        r"|\bI\s+(?:and|&)\s+(?:[A-Z][A-Za-z.'’-]+(?:\s+[A-Z][A-Za-z.'’-]+){0,2})\b",
+        text,
+    ):
+        return ""
     if re.search(r"\b(?:my|I|me)\b", text, re.IGNORECASE):
         return "Dennis"
     match = re.search(
@@ -1228,8 +1239,19 @@ def _scope_owner_person_sections(query: str, items: list[dict]) -> list[dict]:
             if heading.start() > selected.start() and len(heading.group(1)) <= level:
                 end = heading.start()
                 break
+        # Preserve later ancestor-level sections such as Dishes and Visit
+        # history.  Only sibling person subsections are excluded.
+        suffix_start = len(memory)
+        for heading in headings:
+            if heading.start() >= end and len(heading.group(1)) < level:
+                suffix_start = heading.start()
+                break
         copy = dict(item)
-        copy["memory"] = (memory[:headings[0].start()] + memory[selected.start():end]).strip()
+        copy["memory"] = (
+            memory[:headings[0].start()]
+            + memory[selected.start():end]
+            + memory[suffix_start:]
+        ).strip()
         scoped.append(copy)
     return scoped
 
@@ -1305,7 +1327,9 @@ def _format_prefetch_context(
             "user-authored conversation fact may answer when canonical evidence is silent. "
             "Prefer a terse list or direct sentence over narrative prose. If a canonical venue record says a person's usual "
             "order is not stated, answer that no usual order is recorded; never promote liked foods, occasional choices, or "
-            "drinks into a usual order. If the requested identity differs from the selected record, "
+            "drinks into a usual order. A missing usual order or current preference does not erase separately recorded dishes, "
+            "reactions, or visit history; broad venue questions must use all explicit sections supplied below. "
+            "If the requested identity differs from the selected record, "
             "state the mismatch rather than treating them as the same person. Answer in plain text facts; never emit Obsidian wikilinks. "
         )
     elif family_context:
