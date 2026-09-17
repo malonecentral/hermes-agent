@@ -1675,6 +1675,45 @@ def test_owner_broad_or_multi_person_restaurant_query_keeps_all_people(query):
     assert scoped == [item]
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Tell me all about Perfect Pear Bistro.",
+        "Is there anything I like at Rubio's?",
+        "What did I like at Chili's?",
+        "Was there anything else I liked at Parlay?",
+    ],
+)
+def test_owner_requester_broad_venue_queries_keep_household_sections(query):
+    item = {
+        "memory": "restaurant: Fixture\n### Dennis\n- One fact.\n### Molly\n- Another fact.\n## Dishes\n- Shared fact.",
+        "metadata": {"relative_path": "Jarvis/Family Shared/Food/Restaurants/Fixture.md"},
+    }
+
+    assert _scope_owner_person_sections(query, [item]) == [item]
+
+
+@pytest.mark.parametrize(
+    ("query", "person"),
+    [
+        ("What do I normally get at Chili's?", "Dennis"),
+        ("Did I like the chili at Perfect Pear Bistro?", "Dennis"),
+        ("Does Molly like the Triple Dipper at Chili's?", "Molly"),
+        ("What did Courtnee get at J. Alexander's?", "Courtnee"),
+    ],
+)
+def test_owner_narrow_venue_queries_still_scope_to_requested_person(query, person):
+    item = {
+        "memory": "restaurant: Fixture\n### Dennis\n- One fact.\n### Molly\n- Another fact.\n### Courtnee\n- Third fact.\n## Dishes\n- Shared fact.",
+        "metadata": {"relative_path": "Jarvis/Family Shared/Food/Restaurants/Fixture.md"},
+    }
+
+    scoped = _scope_owner_person_sections(query, [item])[0]["memory"]
+    assert f"### {person}" in scoped
+    assert "## Dishes" in scoped
+    assert scoped.count("### ") == 1
+
+
 def test_owner_named_parlay_recall_excludes_zipps_person_collision(provider):
     provider._container_tag = "owner_primary"
     provider._client.profile_response = {"static": [], "dynamic": [], "search_results": [
@@ -1771,7 +1810,7 @@ def test_exact_venue_hydrates_full_perfect_pear_preferences_before_one_rerank(pr
 
     assert "Chili was pretty good" in result
     assert "Pear Martini and Pear Mule" in result
-    assert "Green Chili Mac" not in result
+    assert "Green Chili Mac" in result
     assert len(provider._client.get_document_calls) == 1
     assert reranks == []  # one hydrated candidate bypasses; never adds a second request
 
@@ -2746,8 +2785,8 @@ def test_owner_search_tool_scopes_first_person_restaurant_results(provider):
     content = "\n".join(item["content"] for item in result["results"])
     assert "### Dennis" in content
     assert "Pear Martini" in content
-    assert "Courtnee" not in content
-    assert "Green Chili Mac" not in content
+    assert "Courtnee" in content
+    assert "Green Chili Mac" in content
     assert provider._client.search_calls[0]["container_tag"] == "owner_primary"
     assert provider._client.search_calls[0]["search_mode"] == "documents"
     assert "Dennis asks about himself" in provider._client.search_calls[0]["query"]

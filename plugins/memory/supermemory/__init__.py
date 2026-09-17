@@ -1035,9 +1035,21 @@ def _scope_owner_restaurant_results(query: str, results: list) -> tuple[list, bo
         relative_path = str(metadata.get("relative_path") or "")
         if not re.search(r"/Food/Dishes/[^/]+\.md$", relative_path, re.IGNORECASE):
             continue
-        memory_key = _restaurant_key(str(item.get("memory") or ""))
+        memory = str(item.get("memory") or "")
+        memory_key = _restaurant_key(memory)
         if f"restaurants{venue_key}" in memory_key:
-            reciprocal.append(item)
+            # Dish records can be reciprocal indexes for several venues. Keep
+            # only their heading plus lines that explicitly reference the
+            # selected venue so exact venue admission cannot leak another
+            # restaurant's facts into synthesis.
+            kept = []
+            for line in memory.splitlines():
+                if re.match(r"^#{1,6}\s+", line) or f"restaurants{venue_key}" in _restaurant_key(line):
+                    kept.append(line)
+            scoped_item = dict(item)
+            scoped_item["memory"] = "\n".join(kept).strip()
+            if scoped_item["memory"]:
+                reciprocal.append(scoped_item)
     query_words = {
         word for word in re.findall(r"\b[A-Z][a-z]+\b", query or "")
         if word not in {"What", "Where", "When", "Who", "Does", "Did", "Tell"}
@@ -1201,7 +1213,11 @@ def _owner_query_subject(query: str) -> str:
     # Broad venue questions and explicit multi-person questions need the whole
     # selected record.  Treating every first-person pronoun as a request to
     # retain only Dennis's subsection discards shared dishes and visit history.
-    if re.search(r"\bwhat\s+do\s+I\s+(?:know|remember)\s+about\b", text, re.IGNORECASE):
+    if re.search(
+        r"\b(?:what\s+do\s+I\s+(?:know|remember)\s+about|tell\s+me\s+(?:all\s+)?about)\b"
+        r"|\b(?:anything(?:\s+else)?|what)\s+(?:(?:do|did)\s+)?I\s+(?:like|liked|know|remember)\b",
+        text, re.IGNORECASE,
+    ):
         return ""
     if re.search(
         r"\b(?:[A-Z][A-Za-z.'’-]+(?:\s+[A-Z][A-Za-z.'’-]+){0,2})\s+(?:and|&)\s+I\b"
@@ -1212,10 +1228,13 @@ def _owner_query_subject(query: str) -> str:
     if re.search(r"\b(?:my|I|me)\b", text, re.IGNORECASE):
         return "Dennis"
     match = re.search(
-        r"\b(?:does|did|is|was|about)\s+([A-Z][A-Za-z.'’-]+(?:\s+[A-Z][A-Za-z.'’-]+){0,2})(?:['’]s)?\b",
+        r"\b(?:does|did|is|was)\s+([A-Z][A-Za-z.'’-]+(?:\s+[A-Z][A-Za-z.'’-]+){0,2}?)"
+        r"(?:['’]s)?\s+(?:like|likes|liked|get|gets|got|order|orders|ordered|usual|favorite|favourite)\b"
+        r"|\babout\s+([A-Z][A-Za-z.'’-]+(?:\s+[A-Z][A-Za-z.'’-]+){0,2})(?:['’]s)?\b",
         text,
+        re.IGNORECASE,
     )
-    return match.group(1).strip() if match else ""
+    return (match.group(1) or match.group(2)).strip() if match else ""
 
 
 def _scope_owner_person_sections(query: str, items: list[dict]) -> list[dict]:
@@ -1337,8 +1356,12 @@ def _format_prefetch_context(
             "This is read-only canonical Family Shared evidence for an authenticated Family requester. "
             "It contains no Owner-private or conversational memory. Use only explicit facts below, preserve "
             "person attribution and relationship direction, and never infer that a described person is the requester. "
-            "Canonical Family Shared evidence is authoritative. Prefer a terse direct answer, state when evidence is "
-            "missing or ambiguous, and never emit Obsidian wikilinks. "
+            "Canonical Family Shared evidence is authoritative. For a broad venue question, give a useful digest of all "
+            "material explicit facts in the selected venue record, including clearly attributed preferences for other household "
+            "members, shared dishes or guidance, and visit history. For a requester-specific broad venue question, lead with the "
+            "requester's facts and then concisely include clearly attributed household facts. For a narrow dish, person, usual-order, "
+            "or predicate question, answer only that fact with enough provenance to distinguish unknown from negative. A missing usual "
+            "order is not the same as no recorded likes or history. State when evidence is missing or ambiguous, and never emit Obsidian wikilinks. "
         )
     intro += "Do not force memories into the conversation."
     body = "\n\n".join(sections)
@@ -2549,6 +2572,17 @@ class SupermemoryMemoryProvider(MemoryProvider):
                         retrieval_query, family_results + requester_results,
                         retrieval_context=temporal_scope,
                     )
+                    restaurant_results, named_restaurant = _scope_owner_restaurant_results(
+                        retrieval_query, family_results,
+                    )
+                    if named_restaurant:
+                        hydrated_restaurant = self._hydrate_exact_restaurant(
+                            restaurant_results, deadline=deadline,
+                        )
+                        scoped_ids = {id(item) for item in restaurant_results}
+                        family_results = hydrated_restaurant + [
+                            item for item in family_results if id(item) not in scoped_ids
+                        ]
                     search_results = self._rerank_owner_candidates(
                         retrieval_query, family_results, deadline=deadline,
                         trusted_conversation_items=requester_results,
