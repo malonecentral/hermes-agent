@@ -24821,6 +24821,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
 
+        quick_ack = os.getenv("HERMES_DISCORD_VOICE_QUICK_ACK", "true").strip().lower()
+        if quick_ack not in {"0", "false", "no", "off"}:
+            play_ack = getattr(adapter, "play_ack_in_voice", None)
+            if callable(play_ack):
+                try:
+                    logger.info("Sending quick voice acknowledgement (guild=%s)", guild_id)
+                    await play_ack(
+                        guild_id,
+                        os.getenv("HERMES_DISCORD_VOICE_QUICK_ACK_TEXT", "").strip() or None,
+                    )
+                except Exception:
+                    logger.debug("Quick voice acknowledgement failed", exc_info=True)
+
         # Show transcript in text channel (after auth, with mention sanitization)
         try:
             channel = adapter._client.get_channel(text_ch_id)

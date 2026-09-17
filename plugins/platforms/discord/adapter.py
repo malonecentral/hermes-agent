@@ -1137,6 +1137,18 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_sources: Dict[int, Dict[str, Any]] = {}  # guild_id -> linked text channel source metadata
         self._voice_timeout_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> timeout task
         self._voice_timeout_seconds = self._load_voice_timeout()
+        self._voice_auto_join_enabled = self._voice_extra_bool(
+            "voice_auto_join", "HERMES_DISCORD_VOICE_AUTO_JOIN", default=False
+        )
+        self._voice_auto_join_channel_id = self._voice_extra_optional_int(
+            "voice_auto_join_channel_id", "HERMES_DISCORD_VOICE_AUTO_JOIN_CHANNEL_ID"
+        )
+        self._voice_auto_join_channel_name = self._voice_extra_string(
+            "voice_auto_join_channel_name", "HERMES_DISCORD_VOICE_AUTO_JOIN_CHANNEL_NAME"
+        )
+        self._voice_auto_join_text_channel_id = self._voice_extra_optional_int(
+            "voice_auto_join_text_channel_id", "HERMES_DISCORD_VOICE_AUTO_JOIN_TEXT_CHANNEL_ID"
+        )
         self._playback_timeout_seconds = self._load_playback_timeout()
         # Phase 2: voice listening
         self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
@@ -2451,6 +2463,11 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return
         try:
+            # Voice is an endpoint, not a side effect of command registration.
+            # A saturated slash-command bucket can sleep for minutes, so attach
+            # it before attempting any Discord application-command mutation.
+            await self._maybe_auto_join_voice_channel()
+
             sync_policy = self._get_discord_command_sync_policy()
             if sync_policy == "off":
                 logger.info("[%s] Skipping Discord slash command sync (policy=off)", self.name)
@@ -4409,11 +4426,45 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _load_voice_timeout(self) -> int:
         """Return voice-channel inactivity timeout seconds; 0 disables it."""
+        raw = os.getenv("HERMES_DISCORD_VOICE_TIMEOUT_SECONDS")
+        if raw is None:
+            raw = self.config.extra.get("voice_timeout_seconds")
+        if raw is not None:
+            try:
+                return max(0, int(raw))
+            except (TypeError, ValueError):
+                logger.warning("Ignoring invalid Discord voice timeout %r", raw)
         return self._load_discord_int_config(
             "voice_channel_inactivity_timeout_seconds",
             self.VOICE_TIMEOUT,
             minimum=0,
         )
+
+    def _voice_extra_bool(self, key: str, env_key: str, *, default: bool) -> bool:
+        raw = os.getenv(env_key)
+        if raw is None:
+            raw = self.config.extra.get(key, default)
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(raw)
+
+    def _voice_extra_optional_int(self, key: str, env_key: str) -> Optional[int]:
+        raw = os.getenv(env_key)
+        if raw is None:
+            raw = self.config.extra.get(key)
+        if raw is None or str(raw).strip() == "":
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid Discord %s %r", key, raw)
+            return None
+
+    def _voice_extra_string(self, key: str, env_key: str) -> str:
+        raw = os.getenv(env_key)
+        if raw is None:
+            raw = self.config.extra.get(key, "")
+        return str(raw or "").strip()
 
     def _load_playback_timeout(self) -> int:
         """Return minimum playback wait seconds for Discord VC audio."""
@@ -4552,15 +4603,13 @@ class DiscordAdapter(BasePlatformAdapter):
     async def play_ack_in_voice(self, guild_id: int, phrase: Optional[str] = None) -> bool:
         """Speak a short acknowledgement over the ambient bed.
 
-        Called from the gateway's tool-progress hook on the first tool call of
-        a turn, so the user hears "let me look into that" before the bot goes
-        quiet to work.  No-op unless the mixer is installed and acks enabled.
+        Called before long voice work so the user hears an immediate response.
+        Prefer the mixer when available, but retain a one-shot playback fallback
+        for ordinary voice joins where voice effects are not enabled.
         """
         if not self._voice_fx_cfg.get("ack_enabled"):
             return False
         mixer = self._voice_mixers.get(guild_id)
-        if mixer is None:
-            return False
         if phrase is None:
             import random
             phrases = self._voice_fx_cfg.get("ack_phrases") or ["One moment."]
@@ -4582,6 +4631,8 @@ class DiscordAdapter(BasePlatformAdapter):
             actual = result.get("file_path", audio_path)
             if not result.get("success") or not os.path.isfile(actual):
                 return False
+            if mixer is None:
+                return await self.play_in_voice_channel(guild_id, actual)
             try:
                 from voice_mixer import decode_to_pcm
             except ImportError:
@@ -4799,6 +4850,76 @@ class DiscordAdapter(BasePlatformAdapter):
                     receiver.resume()
         finally:
             self._reset_voice_timeout(guild_id)
+
+    async def _maybe_auto_join_voice_channel(self) -> None:
+        """Restore the configured voice endpoint before slash sync can block."""
+        if not self._voice_auto_join_enabled or not self._client:
+            return
+
+        target = None
+        for guild in getattr(self._client, "guilds", ()):
+            for channel in getattr(guild, "voice_channels", ()):
+                if self._voice_auto_join_channel_id is not None:
+                    if channel.id == self._voice_auto_join_channel_id:
+                        target = channel
+                        break
+                elif (
+                    self._voice_auto_join_channel_name
+                    and channel.name.casefold() == self._voice_auto_join_channel_name.casefold()
+                ):
+                    target = channel
+                    break
+            if target is not None:
+                break
+
+        if target is None:
+            logger.warning(
+                "Discord voice auto-join enabled, but channel %r/%r was not found",
+                self._voice_auto_join_channel_id,
+                self._voice_auto_join_channel_name,
+            )
+            return
+
+        text_channel_id = self._voice_auto_join_text_channel_id
+        if text_channel_id is None:
+            text_channel_id = getattr(getattr(target.guild, "system_channel", None), "id", None)
+        if text_channel_id is None:
+            logger.warning("Discord voice auto-join has no linked text channel for guild %s", target.guild.id)
+            return
+
+        runner = self.gateway_runner
+        if runner is not None:
+            bind = getattr(runner, "_bind_voice_input_callback", None)
+            if callable(bind):
+                bind(self)
+            cleanup = getattr(runner, "_handle_voice_timeout_cleanup", None)
+            if callable(cleanup):
+                self._on_voice_disconnect = lambda chat_id: cleanup(chat_id, adapter=self)
+            profile = getattr(self, "_owner_profile", None)
+            self._voice_mode_getter = lambda chat_id: runner._voice_mode.get(
+                runner._voice_key(Platform.DISCORD, str(chat_id), profile=profile), "off"
+            )
+
+        if not await self.join_voice_channel(target, text_channel_id=int(text_channel_id)):
+            logger.warning("Discord voice auto-join failed for %s (%s)", target.name, target.id)
+            return
+
+        if runner is not None:
+            try:
+                profile = getattr(self, "_owner_profile", None)
+                runner._voice_mode[
+                    runner._voice_key(Platform.DISCORD, str(text_channel_id), profile=profile)
+                ] = "all"
+                runner._save_voice_modes()
+                runner._set_adapter_auto_tts_enabled(self, str(text_channel_id), enabled=True)
+            except Exception:
+                logger.debug("Discord voice auto-join could not persist voice mode", exc_info=True)
+        logger.info(
+            "Discord voice auto-joined %s (%s) in guild %s",
+            target.name,
+            target.id,
+            target.guild.id,
+        )
 
     async def get_user_voice_channel(self, guild_id: int, user_id: str):
         """Return the voice channel the user is currently in, or None."""
