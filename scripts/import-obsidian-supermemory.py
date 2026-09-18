@@ -3941,13 +3941,21 @@ def _vector_observations(client: Supermemory,
     for rel, doc in sorted(current.items()):
         accepted = None
         for probe in indexed_content_probes(doc):
-            response = search_documents_v4(
-                client, probe, container_tag=container_for_doc(doc), limit=1, timeout=30.0,
-                filters={'AND': [{'key': 'source', 'value': 'obsidian'},
-                                 {'key': 'relative_path', 'value': rel}]},
-            )
-            results = _field(response, 'results')
-            total = _field(response, 'total')
+            # Some providers bound candidates before applying metadata filters.
+            # Expand only a genuinely empty proof response, never a malformed or
+            # ambiguous one; runtime retrieval and all proof checks stay unchanged.
+            for candidate_limit in (1, 5, 20):
+                response = search_documents_v4(
+                    client, probe, container_tag=container_for_doc(doc),
+                    limit=candidate_limit, timeout=30.0, threshold=0.0,
+                    filters={'AND': [{'key': 'source', 'value': 'obsidian'},
+                                     {'key': 'relative_path', 'value': rel}]},
+                )
+                results = _field(response, 'results')
+                total = _field(response, 'total')
+                if not (isinstance(results, list) and results == []
+                        and type(total) in (int, float) and total == 0):
+                    break
             if (isinstance(results, list) and len(results) == 1 and total == 1
                     and indexed_chunk_proves_probe(str(_field(results[0], 'chunk', '')),
                                                    probe, doc['content'])):
