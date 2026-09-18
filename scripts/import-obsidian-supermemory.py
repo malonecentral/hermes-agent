@@ -738,14 +738,21 @@ def rebuild_owner_canonical(
 
 
 def _explicit_container_claim_agrees(row: dict[str, Any], container: str) -> bool:
-    """Accept at most one exact provider container claim and reject alias ambiguity."""
+    """Accept one exact claim, including equal SDK/wire aliases of that claim."""
     claims: list[tuple[Any, bool]] = []
     marker = object()
-    for name, plural in (
-        ('container_tags', True), ('containerTags', True),
-        ('container_tag', False), ('containerTag', False),
+    for snake, camel, plural in (
+        ('container_tags', 'containerTags', True),
+        ('container_tag', 'containerTag', False),
     ):
-        value = _field(row, name, marker)
+        left = _field(row, snake, marker)
+        right = _field(row, camel, marker)
+        if left is not marker and right is not marker:
+            # SDK model_dump can retain the wire alias in model_extra. Do not
+            # confuse an exact duplicate with conflicting container authority.
+            if not _recursive_exact_type_equal(left, right):
+                return False
+        value = left if left is not marker else right
         if value is not marker:
             claims.append((value, plural))
     if not claims:
