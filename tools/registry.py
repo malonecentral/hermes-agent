@@ -1189,6 +1189,16 @@ class ToolRegistry:
                 result = entry.handler(args, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:
+            # Phase 1 observes dispatch exceptions only. Never pass args/results
+            # or the exception object, and never change existing error behavior.
+            try:
+                from agent.incidents import capture_dispatch
+                capture_dispatch(
+                    tool=name, exception_type=type(e).__name__, message=str(e),
+                    session_id=kwargs.get("task_id", "") or "",
+                )
+            except Exception:
+                pass
             # exc_info already renders the exception, so keep the message copy bounded.
             logger.exception(
                 "Tool %s dispatch error: %s", name, _bound_error_text(str(e))

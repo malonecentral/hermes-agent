@@ -5,6 +5,8 @@ verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 """
 
 DEFAULT_CONFIG = {
+    # Observation only: local dispatch-exception recording, never remediation.
+    "self_healing": {"enabled": False},
     "model": "",
     "providers": {},
     "fallback_providers": [],

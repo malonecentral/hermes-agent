@@ -3878,7 +3878,7 @@ def load_config() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=True)
 
 
-def load_config_readonly() -> Dict[str, Any]:
+def load_config_readonly(*, side_effects: bool = True) -> Dict[str, Any]:
     """Fast-path variant of ``load_config()`` for callers that ONLY READ.
 
     Returns the cached config dict directly without the defensive deepcopy
@@ -3897,8 +3897,12 @@ def load_config_readonly() -> Dict[str, Any]:
     Note: this returns a plain ``dict`` (not ``MappingProxyType``) so
     existing ``isinstance(x, dict)`` guards downstream keep working. The
     safety guarantee is purely documented, not enforced — be careful.
+
+    ``side_effects=False`` skips home initialization and raises on user config
+    parse errors instead of logging/backing up the file. Observation-only
+    callers can use the effective managed config without creating files.
     """
-    return _load_config_impl(want_deepcopy=False)
+    return _load_config_impl(want_deepcopy=False, side_effects=side_effects)
 
 
 def write_platform_config_field(
@@ -4074,9 +4078,10 @@ def apply_terminal_config_to_env(
     return target
 
 
-def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _load_config_impl(*, want_deepcopy: bool, side_effects: bool = True) -> Dict[str, Any]:
     with _CONFIG_LOCK:
-        ensure_hermes_home()
+        if side_effects:
+            ensure_hermes_home()
         config_path = get_config_path()
         path_key = str(config_path)
 
@@ -4152,6 +4157,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 # loaded config — keep serving it until the file is fixed.
                 # Fresh processes with no last-known-good keep the existing
                 # DEFAULT_CONFIG fallback.
+                if not side_effects:
+                    raise
                 lkg = _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
                 _warn_config_parse_failure(
                     config_path,
