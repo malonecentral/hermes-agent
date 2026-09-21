@@ -2100,6 +2100,56 @@ def test_owner_primary_routes_automatic_capture_to_conversations(monkeypatch, tm
     assert call["metadata"]["authority"] == "non-authoritative"
 
 
+def test_owner_cron_capture_reuses_job_identity_and_preserves_execution_metadata(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({"container_tag": "owner_primary", "auto_capture": True}, str(tmp_path))
+    p = SupermemoryMemoryProvider()
+    p.initialize("bootstrap", hermes_home=str(tmp_path), platform="cron")
+
+    for session_id in (
+        "cron_74188853b55f_20260921_100045",
+        "cron_74188853b55f_20260921_110002",
+    ):
+        p.sync_turn(
+            "Eve's low-battery alert triggers below 30 percent.",
+            "No alert needed.",
+            session_id=session_id,
+        )
+
+    first, second = p._client.add_calls
+    assert first["custom_id"] == "hermes-owner-conversation:cron_74188853b55f"
+    assert second["custom_id"] == first["custom_id"]
+    assert first["metadata"] == {
+        "type": "owner_conversation",
+        "session_id": "cron_74188853b55f",
+        "message_count": 1,
+        "authority": "non-authoritative",
+        "provenance": "user-authored role-delimited statement",
+        "execution_session_id": "cron_74188853b55f_20260921_100045",
+        "cron_job_id": "74188853b55f",
+        "source_kind": "cron",
+    }
+    assert second["metadata"]["execution_session_id"] == "cron_74188853b55f_20260921_110002"
+
+
+def test_owner_cron_capture_identity_validator_requires_matching_job_metadata():
+    from plugins.memory.supermemory import _owner_capture_custom_id
+
+    item = {
+        "_source_custom_id": "hermes-owner-conversation:cron_74188853b55f",
+        "metadata": {
+            "session_id": "cron_74188853b55f",
+            "execution_session_id": "cron_74188853b55f_20260921_100045",
+            "cron_job_id": "74188853b55f",
+            "source_kind": "cron",
+        },
+    }
+    assert _owner_capture_custom_id(item) is True
+    item["metadata"]["cron_job_id"] = "other"
+    assert _owner_capture_custom_id(item) is False
+
+
 def test_capture_owner_app_turn_uses_request_scoped_id_and_existing_filters(monkeypatch, tmp_path):
     monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
     monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)

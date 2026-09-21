@@ -74,6 +74,7 @@ _OWNER_RERANK_URL = "http://mcomen.malonecentral.com:8082/rerank"
 _OWNER_RERANK_MODEL = "qwen3-reranker-0.6b-q8_0.gguf"
 _OWNER_RERANK_TIMEOUT_SECONDS = 6.0
 _OWNER_RERANK_NONCANONICAL_MIN_SCORE = 0.05
+_CRON_SESSION_RE = re.compile(r"^cron_([A-Za-z0-9]+)_\d{8}_\d{6}$")
 _OWNER_SOURCE_CANDIDATE_LIMIT = 20
 # Two canonical containers plus the independently authorized conversation source.
 _OWNER_QWEN_POOL_LIMIT = 3 * _OWNER_SOURCE_CANDIDATE_LIMIT
@@ -261,13 +262,38 @@ def _owner_capture_custom_id(item: dict) -> bool:
         return False
     hermes = re.fullmatch(r"hermes-owner-conversation:([^\s:]+)", value)
     if hermes:
-        return metadata.get("session_id") == hermes.group(1)
+        capture_session_id = hermes.group(1)
+        if metadata.get("session_id") != capture_session_id:
+            return False
+        execution_session_id = metadata.get("execution_session_id")
+        if execution_session_id is None:
+            return True
+        cron = _CRON_SESSION_RE.fullmatch(str(execution_session_id))
+        return bool(
+            cron
+            and capture_session_id == f"cron_{cron.group(1)}"
+            and metadata.get("cron_job_id") == cron.group(1)
+            and metadata.get("source_kind") == "cron"
+        )
     owner_app = re.fullmatch(r"jarvis-owner-app:([^\s:]+):([^\s:]+)", value)
     return bool(
         owner_app
         and metadata.get("session_id") == owner_app.group(1)
         and metadata.get("request_id") == owner_app.group(2)
     )
+
+
+def _owner_capture_identity(session_id: str) -> tuple[str, dict[str, str]]:
+    """Use one provider document per cron job without merging Hermes run sessions."""
+    cron = _CRON_SESSION_RE.fullmatch(str(session_id or "").strip())
+    if not cron:
+        return session_id, {}
+    job_id = cron.group(1)
+    return f"cron_{job_id}", {
+        "execution_session_id": session_id,
+        "cron_job_id": job_id,
+        "source_kind": "cron",
+    }
 
 
 def _evidence_provenance(
@@ -2774,6 +2800,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
             self._session_turns = []
 
         owner_capture = self._container_tag == _OWNER_CANONICAL_CONTAINER
+        capture_identity = capture_session_id
+        capture_metadata: dict[str, str] = {}
+        if owner_capture:
+            capture_identity, capture_metadata = _owner_capture_identity(capture_session_id)
         if owner_capture:
             clean_user = _clean_text_for_capture(user_content)
             if messages is not None:
@@ -2810,7 +2840,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             return
         metadata = {
             "type": "owner_conversation" if owner_capture else "user_conversation",
-            "session_id": capture_session_id,
+            "session_id": capture_identity if owner_capture else capture_session_id,
             "message_count": len(cleaned),
         }
         if owner_capture:
@@ -2818,12 +2848,13 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 "authority": "non-authoritative",
                 "provenance": "user-authored role-delimited statement",
             })
+            metadata.update(capture_metadata)
         self._client.add_memory(
             self._format_conversation(cleaned),
             metadata=metadata,
             entity_context=self._entity_context,
             container_tag=_OWNER_CONVERSATION_CONTAINER if owner_capture else None,
-            custom_id=(f"hermes-owner-conversation:{capture_session_id}" if owner_capture else f"hermes-session:{capture_session_id}"),
+            custom_id=(f"hermes-owner-conversation:{capture_identity}" if owner_capture else f"hermes-session:{capture_session_id}"),
             task_type="memory",
         )
 
