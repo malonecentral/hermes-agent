@@ -143,15 +143,68 @@ async def _async_get_state(entity_id: str) -> Dict[str, Any]:
 def _build_service_payload(
     entity_id: Optional[str] = None,
     data: Optional[Dict[str, Any]] = None,
+    area_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build the JSON payload for a HA service call."""
     payload: Dict[str, Any] = {}
     if data:
         payload.update(data)
-    # entity_id parameter takes precedence over data["entity_id"]
+    # An explicit target parameter takes precedence over target data.
     if entity_id:
         payload["entity_id"] = entity_id
+    elif area_id:
+        payload["target"] = {"area_id": [area_id]}
     return payload
+
+
+def _normalize_name(value: str) -> str:
+    """Normalize a human-facing HA name for exact comparisons."""
+    return " ".join(value.casefold().split())
+
+
+async def _async_resolve_area_id(area: str) -> Optional[str]:
+    """Resolve one exact HA area name, failing closed on ambiguity."""
+    import aiohttp
+
+    hass_url, hass_token = _get_config()
+    headers = _get_headers(hass_token)
+    wanted = _normalize_name(area)
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{hass_url}/api/areas",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status != 404:
+                resp.raise_for_status()
+                areas = await resp.json()
+                matches = {
+                    str(item.get("id", "")).strip()
+                    for item in areas
+                    if isinstance(item, dict)
+                    and _normalize_name(str(item.get("name", ""))) == wanted
+                    and str(item.get("id", "")).strip()
+                }
+                return next(iter(matches)) if len(matches) == 1 else None
+
+        async with session.get(
+            f"{hass_url}/api/states",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            resp.raise_for_status()
+            states = await resp.json()
+
+    accepted = {wanted, _normalize_name(f"{area} lights")}
+    matches = {
+        str(state.get("entity_id", "")).strip()
+        for state in states
+        if isinstance(state, dict)
+        and str(state.get("entity_id", "")).startswith("light.")
+        and _normalize_name(str(state.get("attributes", {}).get("friendly_name", "")))
+        in accepted
+    }
+    return next(iter(matches)) if len(matches) == 1 else None
 
 
 def _parse_service_response(
@@ -180,13 +233,22 @@ async def _async_call_service(
     service: str,
     entity_id: Optional[str] = None,
     data: Optional[Dict[str, Any]] = None,
+    area: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Call a Home Assistant service."""
     import aiohttp
 
     hass_url, hass_token = _get_config()
     url = f"{hass_url}/api/services/{domain}/{service}"
-    payload = _build_service_payload(entity_id, data)
+    area_id = None
+    if area:
+        area_id = await _async_resolve_area_id(area)
+        if not area_id:
+            raise ValueError(f"Home Assistant area {area!r} did not resolve uniquely")
+        # The legacy fallback returns an aggregate light entity.
+        if area_id.startswith("light."):
+            entity_id, area_id = area_id, None
+    payload = _build_service_payload(entity_id, data, area_id)
 
     async with aiohttp.ClientSession() as session:
         async with session.post(
@@ -281,8 +343,12 @@ def _handle_call_service(args: dict, **kw) -> str:
         except json.JSONDecodeError as e:
             return tool_error(f"Invalid JSON string in 'data' parameter: {e}")
 
+    area = args.get("area")
+    if entity_id and area:
+        return tool_error("Specify either entity_id or area, not both")
+
     try:
-        result = _run_async(_async_call_service(domain, service, entity_id, data))
+        result = _run_async(_async_call_service(domain, service, entity_id, data, area))
         return json.dumps({"result": result})
     except Exception as e:
         logger.error("ha_call_service error: %s", e)
@@ -428,8 +494,10 @@ HA_LIST_SERVICES_SCHEMA = {
 HA_CALL_SERVICE_SCHEMA = {
     "name": "ha_call_service",
     "description": (
-        "Call a Home Assistant service to control a device. Use ha_list_services "
-        "to discover available services and their parameters for each domain."
+        "Call a Home Assistant service to control a device or one explicitly named "
+        "room. For requests such as 'turn off the office lights', pass area='office' "
+        "directly; do not enumerate or call each bulb. Use ha_list_services to "
+        "discover available services and their parameters for each domain."
     ),
     "parameters": {
         "type": "object",
@@ -454,6 +522,13 @@ HA_CALL_SERVICE_SCHEMA = {
                 "description": (
                     "Target entity ID (e.g. 'light.living_room'). "
                     "Some services (like scene.turn_on) may not need this."
+                ),
+            },
+            "area": {
+                "type": "string",
+                "description": (
+                    "Exact Home Assistant area/room name (e.g. 'office'). Use this "
+                    "instead of entity_id for an explicitly named room command."
                 ),
             },
             "data": {

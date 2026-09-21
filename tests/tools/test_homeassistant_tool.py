@@ -75,6 +75,10 @@ class TestBuildServicePayload:
         payload = _build_service_payload(entity_id="light.bedroom")
         assert payload == {"entity_id": "light.bedroom"}
 
+    def test_area_id_targets_room(self):
+        payload = _build_service_payload(area_id="office")
+        assert payload == {"target": {"area_id": ["office"]}}
+
 
     def test_entity_id_param_takes_precedence_over_data(self):
         payload = _build_service_payload(
@@ -154,6 +158,7 @@ class TestDomainBlocklist:
             "turn_on",
             "light.test",
             None,
+            None,
         )
 
     def test_blocked_domains_include_shell_command(self):
@@ -161,6 +166,25 @@ class TestDomainBlocklist:
 
     def test_blocked_domains_include_hassio(self):
         assert "hassio" in _BLOCKED_DOMAINS
+
+    @patch("tools.homeassistant_tool._async_call_service", new_callable=AsyncMock)
+    def test_room_area_reaches_service_call_layer(self, mock_call_service):
+        mock_call_service.return_value = {"success": True}
+        result = json.loads(_handle_call_service({
+            "domain": "light", "service": "turn_off", "area": "office"
+        }))
+        assert result["result"]["success"] is True
+        mock_call_service.assert_awaited_once_with(
+            "light", "turn_off", None, None, "office"
+        )
+
+    def test_entity_and_area_together_are_rejected(self):
+        result = json.loads(_handle_call_service({
+            "domain": "light", "service": "turn_off",
+            "entity_id": "light.office", "area": "office",
+        }))
+        assert "error" in result
+        assert "either entity_id or area" in result["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +218,7 @@ class TestEntityIdValidation:
         mock_call_service.assert_awaited_once_with(
             "scene",
             "turn_on",
+            None,
             None,
             None,
         )
