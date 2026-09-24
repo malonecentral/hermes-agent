@@ -260,10 +260,15 @@ def _owner_capture_custom_id(item: dict) -> bool:
     value = item.get("_source_custom_id")
     if not isinstance(value, str):
         return False
-    hermes = re.fullmatch(r"hermes-owner-conversation:([^\s:]+)", value)
+    hermes = re.fullmatch(
+        r"hermes-owner-conversation:([^\s:]+)(?::([0-9a-f]{24}))?", value
+    )
     if hermes:
         capture_session_id = hermes.group(1)
         if metadata.get("session_id") != capture_session_id:
+            return False
+        capture_event_id = hermes.group(2)
+        if capture_event_id is not None and metadata.get("capture_event_id") != capture_event_id:
             return False
         execution_session_id = metadata.get("execution_session_id")
         if execution_session_id is None:
@@ -294,6 +299,12 @@ def _owner_capture_identity(session_id: str) -> tuple[str, dict[str, str]]:
         "cron_job_id": job_id,
         "source_kind": "cron",
     }
+
+
+def _owner_capture_event_id(session_id: str, turn_number: int, user_content: str) -> str:
+    """Return a retry-stable identity for one completed Owner turn."""
+    envelope = f"{session_id}\0{max(0, int(turn_number))}\0{user_content}".encode("utf-8")
+    return hashlib.sha256(envelope).hexdigest()[:24]
 
 
 def _evidence_provenance(
@@ -2802,22 +2813,13 @@ class SupermemoryMemoryProvider(MemoryProvider):
         owner_capture = self._container_tag == _OWNER_CANONICAL_CONTAINER
         capture_identity = capture_session_id
         capture_metadata: dict[str, str] = {}
+        clean_user = ""
+        capture_event_id = ""
         if owner_capture:
             capture_identity, capture_metadata = _owner_capture_identity(capture_session_id)
         if owner_capture:
             clean_user = _clean_text_for_capture(user_content)
-            if messages is not None:
-                completed = []
-                for message in messages:
-                    role = str(message.get("role") or "")
-                    content = message.get("content")
-                    if not isinstance(content, str):
-                        continue
-                    if role == "user":
-                        completed.append(_clean_text_for_capture(content))
-                worthy = [user for user in completed if _is_capture_worthy_owner_statement(user)]
-            else:
-                worthy = [clean_user] if _is_capture_worthy_owner_statement(clean_user) else []
+            worthy = [clean_user] if _is_capture_worthy_owner_statement(clean_user) else []
             cleaned = [{"role": "user", "content": user} for user in worthy]
         elif messages is not None:
             cleaned = self._clean_conversation(messages)
@@ -2844,9 +2846,13 @@ class SupermemoryMemoryProvider(MemoryProvider):
             "message_count": len(cleaned),
         }
         if owner_capture:
+            capture_event_id = _owner_capture_event_id(
+                capture_session_id, self._turn_count, clean_user
+            )
             metadata.update({
                 "authority": "non-authoritative",
                 "provenance": "user-authored role-delimited statement",
+                "capture_event_id": capture_event_id,
             })
             metadata.update(capture_metadata)
         self._client.add_memory(
@@ -2854,7 +2860,10 @@ class SupermemoryMemoryProvider(MemoryProvider):
             metadata=metadata,
             entity_context=self._entity_context,
             container_tag=_OWNER_CONVERSATION_CONTAINER if owner_capture else None,
-            custom_id=(f"hermes-owner-conversation:{capture_identity}" if owner_capture else f"hermes-session:{capture_session_id}"),
+            custom_id=(
+                f"hermes-owner-conversation:{capture_identity}:{capture_event_id}"
+                if owner_capture else f"hermes-session:{capture_session_id}"
+            ),
             task_type="memory",
         )
 

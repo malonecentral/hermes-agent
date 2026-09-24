@@ -2090,7 +2090,8 @@ def test_owner_primary_routes_automatic_capture_to_conversations(monkeypatch, tm
     call = p._client.add_calls[0]
     assert call["container_tag"] == "owner_conversations"
     assert call["container_tag"] != "owner_primary"
-    assert call["custom_id"] == "hermes-owner-conversation:owner-session"
+    assert call["custom_id"].startswith("hermes-owner-conversation:owner-session:")
+    assert call["custom_id"].rsplit(":", 1)[1] == call["metadata"]["capture_event_id"]
     assert call["task_type"] == "memory"
     assert "[role: user]" in call["content"]
     assert "[role: assistant-context]" not in call["content"]
@@ -2098,6 +2099,41 @@ def test_owner_primary_routes_automatic_capture_to_conversations(monkeypatch, tm
     assert call["metadata"]["message_count"] == 1
     assert call["metadata"]["provenance"] == "user-authored role-delimited statement"
     assert call["metadata"]["authority"] == "non-authoritative"
+
+
+def test_owner_capture_submits_only_current_turn_with_retry_stable_event_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({"container_tag": "owner_primary", "auto_capture": True}, str(tmp_path))
+    p = SupermemoryMemoryProvider()
+    p.initialize("owner-session", hermes_home=str(tmp_path), platform="cli")
+    assert isinstance(p._client, FakeClient)
+    history = [
+        {"role": "user", "content": "Dennis prefers the earlier appointment."},
+        {"role": "assistant", "content": "Noted."},
+        {"role": "user", "content": "Dennis now prefers the later appointment."},
+        {"role": "assistant", "content": "Updated."},
+    ]
+
+    p.on_turn_start(2, history[-2]["content"])
+    p.sync_turn(history[-2]["content"], history[-1]["content"],
+                session_id="owner-session", messages=history)
+    first = p._client.add_calls[-1]
+    p.sync_turn(history[-2]["content"], history[-1]["content"],
+                session_id="owner-session", messages=history)
+    replay = p._client.add_calls[-1]
+
+    assert first["content"] == (
+        "[role: user]\nDennis now prefers the later appointment.\n[user:end]"
+    )
+    assert "earlier appointment" not in first["content"]
+    assert first["metadata"]["message_count"] == 1
+    assert replay["custom_id"] == first["custom_id"]
+
+    p.on_turn_start(3, history[-2]["content"])
+    p.sync_turn(history[-2]["content"], history[-1]["content"],
+                session_id="owner-session", messages=history)
+    assert p._client.add_calls[-1]["custom_id"] != first["custom_id"]
 
 
 def test_owner_cron_capture_reuses_job_identity_and_preserves_execution_metadata(monkeypatch, tmp_path):
@@ -2118,14 +2154,15 @@ def test_owner_cron_capture_reuses_job_identity_and_preserves_execution_metadata
         )
 
     first, second = p._client.add_calls
-    assert first["custom_id"] == "hermes-owner-conversation:cron_74188853b55f"
-    assert second["custom_id"] == first["custom_id"]
+    assert first["custom_id"].startswith("hermes-owner-conversation:cron_74188853b55f:")
+    assert second["custom_id"] != first["custom_id"]
     assert first["metadata"] == {
         "type": "owner_conversation",
         "session_id": "cron_74188853b55f",
         "message_count": 1,
         "authority": "non-authoritative",
         "provenance": "user-authored role-delimited statement",
+        "capture_event_id": first["custom_id"].rsplit(":", 1)[1],
         "execution_session_id": "cron_74188853b55f_20260921_100045",
         "cron_job_id": "74188853b55f",
         "source_kind": "cron",
@@ -2137,17 +2174,30 @@ def test_owner_cron_capture_identity_validator_requires_matching_job_metadata():
     from plugins.memory.supermemory import _owner_capture_custom_id
 
     item = {
-        "_source_custom_id": "hermes-owner-conversation:cron_74188853b55f",
+        "_source_custom_id": "hermes-owner-conversation:cron_74188853b55f:0123456789abcdef01234567",
         "metadata": {
             "session_id": "cron_74188853b55f",
             "execution_session_id": "cron_74188853b55f_20260921_100045",
             "cron_job_id": "74188853b55f",
             "source_kind": "cron",
+            "capture_event_id": "0123456789abcdef01234567",
         },
     }
     assert _owner_capture_custom_id(item) is True
+    item["metadata"]["capture_event_id"] = "fedcba9876543210fedcba98"
+    assert _owner_capture_custom_id(item) is False
+    item["metadata"]["capture_event_id"] = "0123456789abcdef01234567"
     item["metadata"]["cron_job_id"] = "other"
     assert _owner_capture_custom_id(item) is False
+
+
+def test_owner_capture_identity_validator_accepts_legacy_session_id():
+    from plugins.memory.supermemory import _owner_capture_custom_id
+
+    assert _owner_capture_custom_id({
+        "_source_custom_id": "hermes-owner-conversation:legacy-session",
+        "metadata": {"session_id": "legacy-session"},
+    }) is True
 
 
 def test_capture_owner_app_turn_uses_request_scoped_id_and_existing_filters(monkeypatch, tmp_path):
