@@ -92,14 +92,16 @@ def field(value: Any, name: str, default=None):
 
 def search_documents_v4(client, query: str, *, container_tag: str, limit: int,
                         filters: dict | None = None, timeout: float | None = None,
-                        search_mode: str = "documents"):
+                        search_mode: str = "documents", threshold: float | None = None):
     if search_mode != "documents":
         raise ValueError("canonical document search requires documents mode")
-    kwargs = {"q": query, "container_tag": container_tag}
+    kwargs: dict[str, Any] = {"q": query, "container_tag": container_tag}
     if filters:
         kwargs["filters"] = filters
     kwargs.update(limit=limit, search_mode=search_mode, rerank=False,
                   rewrite_query=False, aggregate=False, include={"documents": True})
+    if threshold is not None:
+        kwargs["threshold"] = threshold
     if timeout is not None:
         kwargs["timeout"] = max(0.001, timeout)
     return client.search.memories(**kwargs)

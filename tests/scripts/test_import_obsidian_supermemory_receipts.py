@@ -71,6 +71,18 @@ def _proofs(importer, tmp_path):
     return docs, inventory, observations, key_path, key, fingerprint, storage, vector, now
 
 
+def test_sparse_heading_fallback_probes_preserve_canonical_token_order(importer):
+    doc = importer.item(
+        "Jarvis/Logs/Quick Log/Active/locker-code-current.md",
+        b"---\nschema_version: 1\n---\n# Current locker code\n\nDistinctive personal retrieval phrase remains searchable.\n",
+    )
+    probes = importer.indexed_content_probes(doc)
+    canonical_tokens = importer._proof_tokens(doc["content"])
+    assert probes
+    assert all(importer._contains_token_run(canonical_tokens, importer._proof_tokens(probe))
+               for probe in probes)
+
+
 def test_hmac_receipts_are_private_aggregate_and_deterministic(importer, tmp_path):
     docs, inventory, observations, _, key, fingerprint, storage, vector, now = _proofs(importer, tmp_path)
     again = importer.build_vector_readiness_receipt(docs, observations, generation="generation-1", generated_at=now, key=key)
@@ -185,34 +197,36 @@ def test_arbitrary_digest_cannot_be_supplied_to_builder(importer, tmp_path):
     assert "f" * 64 not in json.dumps(receipt)
 
 
-def test_same_boilerplate_chunk_cannot_prove_two_documents(importer, tmp_path):
+def test_same_boilerplate_chunk_is_safe_with_distinct_hydrated_parents(importer, tmp_path):
     common = b"standard repeated boilerplate language appears identically in every canonical document"
     docs = {doc["relative_path"]: doc for doc in (
         importer.item("Skills/A.md", common), importer.item("Skills/B.md", common))}
     observations = _observations(importer, docs)
     key_path = tmp_path / "key"; importer.generate_receipt_key(key_path)
-    with pytest.raises(ValueError, match="corpus-unique"):
-        importer.build_vector_readiness_receipt(docs, observations, generation="g",
-            generated_at=datetime.now(timezone.utc), key=importer.read_receipt_key(key_path))
+    receipt = importer.build_vector_readiness_receipt(docs, observations, generation="g",
+        generated_at=datetime.now(timezone.utc), key=importer.read_receipt_key(key_path))
+    assert receipt["verified_document_count"] == 2
+    assert receipt["method_version"] == 2
 
 
-def test_unique_chunk_proves_only_its_current_document(importer, tmp_path):
+def test_shared_chunk_remains_bound_by_hydrated_parent_identity(importer, tmp_path):
     docs = _docs(importer); observations = _observations(importer, docs)
     first, second = sorted(docs)
     observations[first][0]["chunk"] = observations[second][0]["chunk"]
     key_path = tmp_path / "key"; importer.generate_receipt_key(key_path)
-    with pytest.raises(ValueError):
-        importer.build_vector_readiness_receipt(docs, observations, generation="g",
-            generated_at=datetime.now(timezone.utc), key=importer.read_receipt_key(key_path))
+    receipt = importer.build_vector_readiness_receipt(docs, observations, generation="g",
+        generated_at=datetime.now(timezone.utc), key=importer.read_receipt_key(key_path))
+    assert receipt["verified_document_count"] == 2
 
 
-def test_small_document_without_unique_run_fails_closed(importer, tmp_path):
+def test_small_document_is_safe_when_bound_to_hydrated_parent(importer, tmp_path):
     doc = importer.item("Skills/Tiny.md", b"tiny")
     docs = {doc["relative_path"]: doc}; observations = _observations(importer, docs)
     key_path = tmp_path / "key"; importer.generate_receipt_key(key_path)
-    with pytest.raises(ValueError, match="corpus-unique"):
-        importer.build_vector_readiness_receipt(docs, observations, generation="g",
-            generated_at=datetime.now(timezone.utc), key=importer.read_receipt_key(key_path))
+    receipt = importer.build_vector_readiness_receipt(docs, observations, generation="g",
+        generated_at=datetime.now(timezone.utc), key=importer.read_receipt_key(key_path))
+    assert receipt["verified_document_count"] == 1
+    assert receipt["method"] == "hydrated-parent-bound-contiguous-current-token-run"
 
 
 @pytest.mark.parametrize("mutation", ["conflicting_custom", "conflicting_document", "aggregate", "duplicate_chunk",

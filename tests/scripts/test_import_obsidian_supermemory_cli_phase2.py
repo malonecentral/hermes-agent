@@ -178,6 +178,103 @@ def test_sync_canonical_adds_then_reports_verified_noop(
                 if call[0] in {"add", "delete"}]
 
 
+def test_sync_canonical_resumes_accepted_add_before_deriving_fresh_plan(
+        importer, tmp_path, monkeypatch, capsys):
+    source = tmp_path / "source"; _source(source)
+    private = tmp_path / "private"; private.mkdir(mode=0o700)
+    importer.generate_receipt_key(private / "readiness/receipt-hmac.key")
+    client = StatefulClient()
+    monkeypatch.setattr(importer, "_client", lambda _: client)
+    _install_search(importer, monkeypatch, client)
+    common = ["--source-root", str(source), "--private-root", str(private)]
+    original = importer.DurableReconciliationExecutor
+    interrupted = {"done": False}
+
+    class InterruptAfterAcceptedAdd(original):
+        def __init__(self, *args, **kwargs):
+            def fault(point):
+                if point == "after_add" and not interrupted["done"]:
+                    interrupted["done"] = True
+                    raise RuntimeError("lost scheduled worker")
+            super().__init__(*args, fault_injector=fault, **kwargs)
+
+    monkeypatch.setattr(importer, "DurableReconciliationExecutor", InterruptAfterAcceptedAdd)
+    with pytest.raises(SystemExit) as failure:
+        _run_command(importer, monkeypatch, capsys, ["sync-canonical", *common])
+    assert failure.value.code == 1
+    first = json.loads(capsys.readouterr().out)
+    assert first["resume"] is True
+    assert len([call for call in client.documents.calls if call[0] == "add"]) == 1
+
+    monkeypatch.setattr(importer, "DurableReconciliationExecutor", original)
+    result = _run_command(importer, monkeypatch, capsys, ["sync-canonical", *common])
+    assert result["readiness"] is True and result["resumed"] is True
+    assert result["transaction_id"] == first["transaction_id"]
+    assert len([call for call in client.documents.calls if call[0] == "add"]) == 1
+    journal = importer.private_json_read(
+        private, f'transactions/{result["transaction_id"]}/forward-journal.json')
+    assert journal["records"][0]["stage"] == "done"
+    manifest = importer.private_json_read(private, "manifest/current.json")
+    assert manifest["transaction_id"] == result["transaction_id"]
+    assert not (private / "transactions/active-sync.json").exists()
+
+
+def test_sync_canonical_retires_terminal_converged_stale_transaction_then_replans(
+        importer, tmp_path, monkeypatch, capsys):
+    source = tmp_path / "source"; _source(source)
+    private = tmp_path / "private"; private.mkdir(mode=0o700)
+    importer.generate_receipt_key(private / "readiness/receipt-hmac.key")
+    client = StatefulClient()
+    monkeypatch.setattr(importer, "_client", lambda _: client)
+    _install_search(importer, monkeypatch, client)
+    common = ["--source-root", str(source), "--private-root", str(private)]
+
+    first = _run_command(importer, monkeypatch, capsys, ["sync-canonical", *common])
+    transaction_id = first["transaction_id"]
+    plan = importer.private_json_read(private, f"transactions/{transaction_id}/plan.json")
+    importer.private_json_write(private, "transactions/active-sync.json", {
+        "transaction_id": transaction_id, "plan_digest": plan["plan_digest"],
+    })
+    note = next(source.rglob("*.md"))
+    note.write_text(note.read_text() + "\nNew authoritative detail.\n")
+
+    result = _run_command(importer, monkeypatch, capsys, ["sync-canonical", *common])
+
+    assert result["readiness"] is True
+    assert result["transaction_id"] != transaction_id
+    retirement = importer.private_json_read(
+        private, f"transactions/{transaction_id}/retirement.json")
+    assert retirement["reason"] == "terminal_provider_converged_source_changed"
+    assert retirement["provider_verified_count"] == 1
+    assert retirement["evidence_sha256"]
+    assert not (private / "transactions/active-sync.json").exists()
+    assert len([call for call in client.documents.calls if call[0] == "delete"]) == 1
+
+
+def test_stale_unattended_transaction_fails_closed_when_nonterminal(
+        importer, tmp_path, monkeypatch):
+    source = tmp_path / "source"; _source(source)
+    private = tmp_path / "private"; private.mkdir(mode=0o700)
+    client = StatefulClient()
+    _, current = importer._scan_at(source)
+    inventory = importer.provider_inventory(client)
+    approved = importer.reconciliation_plan(importer.classify_inventory(current, inventory))
+    plan = importer.transaction_plan_from_inventory(current, inventory, approved)
+    transaction_id = "stale_nonterminal"
+    payload = {"transaction_id": transaction_id, "records": list(plan),
+               "plan_digest": importer.transaction_plan_digest(plan), "unattended": True}
+    importer.private_json_write(private, f"transactions/{transaction_id}/plan.json", payload)
+    importer.private_json_write(private, "transactions/active-sync.json", {
+        "transaction_id": transaction_id, "plan_digest": payload["plan_digest"],
+    })
+    note = next(source.rglob("*.md")); note.write_text(note.read_text() + "changed")
+
+    with pytest.raises(importer.ReconciliationRequired, match="source changed"):
+        importer.unfinished_unattended_transaction(private, importer._scan_at(source)[1], client)
+    assert (private / "transactions/active-sync.json").exists()
+    assert not (private / f"transactions/{transaction_id}/retirement.json").exists()
+
+
 def test_topology_collision_fails_before_scan_or_provider(importer, monkeypatch):
     effects = []
     monkeypatch.setattr(importer, "_scan_at", lambda _: effects.append("scan"))

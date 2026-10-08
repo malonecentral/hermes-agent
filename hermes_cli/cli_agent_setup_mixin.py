@@ -120,6 +120,13 @@ class CLIAgentSetupMixin:
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
         resolved_credential_pool = runtime.get("credential_pool")
+        runtime_max_tokens = runtime.get("max_output_tokens")
+        if not isinstance(runtime_max_tokens, int) or runtime_max_tokens <= 0:
+            runtime_max_tokens = None
+        previous_max_tokens = getattr(self, "max_tokens", None)
+        if not getattr(self, "_max_tokens_is_explicit", False):
+            self.max_tokens = runtime_max_tokens
+        max_tokens_changed = self.max_tokens != previous_max_tokens
         # A callable api_key is a bearer-token provider (Azure Foundry
         # Entra ID — ``azure_identity_adapter.build_token_provider``).
         # The OpenAI SDK accepts ``Callable[[], str]`` for ``api_key`` and
@@ -212,7 +219,12 @@ class CLIAgentSetupMixin:
 
         # AIAgent/OpenAI client holds auth at init time, so rebuild if key,
         # routing, or the effective model changed.
-        if (credentials_changed or routing_changed or model_changed) and self.agent is not None:
+        if (
+            credentials_changed
+            or routing_changed
+            or model_changed
+            or max_tokens_changed
+        ) and self.agent is not None:
             self.agent = None
             self._active_agent_route_signature = None
 

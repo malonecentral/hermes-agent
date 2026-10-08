@@ -30,8 +30,8 @@ from .canonical_policy import (
 SHA256 = re.compile(r"[0-9a-f]{64}")
 STORAGE_SCHEMA = "hermes.storage-reconciliation/v2"
 VECTOR_SCHEMA = "hermes.vector-readiness/v2"
-VECTOR_METHOD = "normalized-contiguous-current-token-run"
-VECTOR_METHOD_VERSION = 1
+VECTOR_METHOD = "hydrated-parent-bound-contiguous-current-token-run"
+VECTOR_METHOD_VERSION = 2
 UNIQUE_RUN_TOKENS = 6
 UNIQUE_RUN_INFORMATIVE_TOKENS = 4
 UNIQUE_RUN_INFORMATIVE_CHARS = 28
@@ -389,10 +389,8 @@ def build_vector_readiness_receipt(current: Mapping[str, Mapping[str, Any]], obs
     if set(observations) != set(current):
         raise ValueError("vector observations do not exactly cover canonical source")
     proof_rows = []
-    unique_runs = _unique_run_index(current)
     parent_ids: set[str] = set()
     chunk_ids: set[str] = set()
-    used_runs: set[tuple[str, ...]] = set()
     for path in sorted(current):
         doc = current[path]; results = observations[path]
         if not isinstance(results, list) or len(results) != 1:
@@ -429,21 +427,30 @@ def build_vector_readiness_receipt(current: Mapping[str, Mapping[str, Any]], obs
                 or aggregated not in (None, False) or task_type != "superrag" or status != "done"):
             raise ValueError("vector identity, schema, provenance, or container is invalid")
         body_tokens = _tokens(str(doc.get("content", ""))); chunk_tokens = _tokens(chunk)
-        if not any(body_tokens[i:i + len(chunk_tokens)] == chunk_tokens
-                   for i in range(len(body_tokens) - len(chunk_tokens) + 1)):
-            raise ValueError("vector chunk is not a current contiguous token run")
-        proof_run = next((tuple(chunk_tokens[i:i + UNIQUE_RUN_TOKENS])
-                          for i in range(len(chunk_tokens) - UNIQUE_RUN_TOKENS + 1)
-                          if unique_runs.get(tuple(chunk_tokens[i:i + UNIQUE_RUN_TOKENS])) == frozenset({path})
-                          and tuple(chunk_tokens[i:i + UNIQUE_RUN_TOKENS]) not in used_runs), None)
+        if not body_tokens or not chunk_tokens:
+            raise ValueError("vector chunk has no current-content proof")
+        # Provider chunks may prefix the indexed body with the canonical identity
+        # envelope. Bind a substantive contiguous body run rather than requiring
+        # the entire returned chunk to equal raw source text. For a short body,
+        # require every body token; otherwise require the same six-token quality
+        # floor used by deterministic probes. The hydrated parent identity above
+        # makes corpus uniqueness unnecessary while still rejecting metadata-only
+        # or stale chunks.
+        width = min(UNIQUE_RUN_TOKENS, len(body_tokens))
+        proof_run = next((tuple(body_tokens[i:i + width])
+                          for i in range(len(body_tokens) - width + 1)
+                          if (width < UNIQUE_RUN_TOKENS
+                              or _qualifying_run(tuple(body_tokens[i:i + width])))
+                          and any(chunk_tokens[j:j + width] == body_tokens[i:i + width]
+                                  for j in range(len(chunk_tokens) - width + 1))), None)
         if proof_run is None:
-            raise ValueError("vector chunk has no unused corpus-unique content proof")
+            raise ValueError("vector chunk is not a substantive current contiguous token run")
         proof_rows.append({"current_body_sha256": hashlib.sha256(str(doc["content"]).encode()).hexdigest(),
                            "observed_chunk_digest": hashlib.sha256("\u001f".join(proof_run).encode()).hexdigest(),
                            "parent_id_digest": hashlib.sha256(parent_id.encode()).hexdigest()})
         parent_ids.add(parent_id)
         chunk_ids.add(chunk_id)
-        used_runs.add(proof_run)
+
     payload = _base(VECTOR_SCHEMA, fingerprint, generation, generated_at) | {
         "method": VECTOR_METHOD, "method_version": VECTOR_METHOD_VERSION,
         "expected_document_count": len(current), "verified_document_count": len(proof_rows),

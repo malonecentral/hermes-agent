@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import logging
 import os
 import plistlib
 import re
@@ -635,6 +636,8 @@ def owner_canonical_inventory(client: Supermemory) -> tuple[dict[str, Any], ...]
     """Exhaustively list only the configured Owner canonical destination."""
     collected: list[dict[str, Any]] = []
     page = 1
+    totals: tuple[int, int] | None = None
+    seen_ids: set[str] = set()
     while True:
         response = client.documents.list(container_tags=[CONTAINER], include_content=False,
                                          limit=100, page=page, timeout=30.0)
@@ -645,9 +648,19 @@ def owner_canonical_inventory(client: Supermemory) -> tuple[dict[str, Any], ...]
         current = _page_integer(_alias(pagination, 'current_page', 'currentPage'))
         total = _page_integer(_alias(pagination, 'total_pages', 'totalPages'))
         total_items = _page_integer(_alias(pagination, 'total_items', 'totalItems'))
-        if current != page or total < 0 or total_items < 0 or (total == 0 and rows):
+        if (current != page or not 0 <= total <= 10000 or total_items < 0
+                or (total == 0 and (page != 1 or total_items != 0 or rows))
+                or (total > 0 and (page > total or (not rows and total_items != 0)))
+                or (totals is not None and totals != (total, total_items))):
             raise ReconciliationRequired('Owner canonical pagination could not prove inventory')
-        collected.extend(dict(row) if isinstance(row, dict) else row.model_dump() for row in rows)
+        totals = (total, total_items)
+        for raw in rows:
+            row = normalize_provider_object(raw)
+            ident = row.get('id')
+            if type(ident) is not str or not ident or ident in seen_ids:
+                raise ReconciliationRequired('Owner canonical inventory identity is invalid')
+            seen_ids.add(ident)
+            collected.append(row)
         if total == 0 or page == total:
             break
         if page > total or not rows:
@@ -656,6 +669,149 @@ def owner_canonical_inventory(client: Supermemory) -> tuple[dict[str, Any], ...]
     if len(collected) != total_items:
         raise ReconciliationRequired('Owner canonical pagination item count is inconsistent')
     return tuple(collected)
+
+
+# Only this literal destination is disposable. Never derive reset scope from
+# configuration, source metadata, a prefix, or a caller-provided container.
+RESET_CONTAINER = 'owner_canonical'
+_RESET_ROW_FIELDS = frozenset({
+    'id', 'custom_id', 'metadata', 'container_tags', 'container_tag', 'task_type',
+    'status', 'type', 'content', 'raw', 'source', 'summary', 'title', 'url', 'filepath',
+    'created_at', 'createdAt', 'updated_at', 'updatedAt', 'connection_id', 'connectionId',
+    'dreaming_status', 'dreamingStatus', 'og_image', 'ogImage',
+})
+_RESET_STATUSES = frozenset({'queued', 'extracting', 'chunking', 'embedding', 'indexing',
+                             'done', 'failed', 'error'})
+
+
+def _reset_record(remote: Any, *, hydrated: bool = False) -> dict[str, Any]:
+    """Prove canonical Owner provenance, including failed/unfinished imports."""
+    row = normalize_provider_object(remote)
+    if (set(row) - _RESET_ROW_FIELDS or type(row.get('status')) is not str
+            or row['status'] not in _RESET_STATUSES
+            or row.get('type', 'text') != 'text'
+            or row.get('task_type', 'superrag') != 'superrag'
+            or not {'container_tags', 'container_tag'} & row.keys()
+            or not _explicit_container_claim_agrees(row, RESET_CONTAINER)):
+        raise ReconciliationRequired('Owner canonical reset row is unknown or ambiguous')
+    # The shared orphan proof requires completed ingestion. Reset also handles
+    # the known processing/failure states checked above; provenance is identical.
+    rel = _trusted_orphan_path({**row, 'status': 'done'}, RESET_CONTAINER)
+    if rel is None or canonical_scope_from_path(rel) != OWNER_CONTAINER:
+        raise ReconciliationRequired('Owner canonical reset row is not proven canonical Owner')
+    result = {key: row[key] for key in ('id', 'custom_id', 'metadata')}
+    result['container_tags'] = [RESET_CONTAINER]
+    if hydrated:
+        _require_superrag_task(row)
+        content = row.get('content')
+        envelope_end = '[/canonical-identity]\n\n'
+        if (type(content) is not str or not content.startswith('[canonical-identity]\n')
+                or envelope_end not in content):
+            raise ReconciliationRequired('Owner canonical reset recovery content is unavailable')
+        doc = item(rel, content.split(envelope_end, 1)[1].encode('utf-8'))
+        if content != doc['content'] or not _exact_json_equal(row['metadata'], metadata(doc)):
+            raise ReconciliationRequired('Owner canonical reset content or metadata is inconsistent')
+        result.update(content=content, task_type='superrag')
+    return result
+
+
+def reset_owner_canonical(
+        client: Supermemory, current: dict[str, dict[str, Any]], private_root: Path, *,
+        base_url: str, execute: bool = False, confirm: str | None = None,
+        rescan: Callable[[], dict[str, dict[str, Any]]] | None = None) -> dict[str, Any]:
+    """Preview or explicitly reset the disposable projection; never auto-resume.
+
+    A partial/uncertain run keeps its snapshot and write-ahead journal. Recovery
+    requires a fresh preview and confirmation for the remaining live inventory,
+    followed by rebuild from source. No stale token or journal authorizes retries.
+    Supermemory has no compare-and-delete: final get/delete must stay adjacent.
+    """
+    if CONTAINER != RESET_CONTAINER or OWNER_EXPLICIT_CONTAINER == RESET_CONTAINER:
+        raise ReconciliationRequired('Owner canonical reset destination is not isolated')
+    if (execute and (not confirm or rescan is None)) or (not execute and confirm is not None):
+        raise ReconciliationRequired('Owner canonical reset requires explicit execution and confirmation')
+
+    def source_proof(docs: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        if any(container_for_doc(doc) != RESET_CONTAINER for doc in docs.values()):
+            raise ReconciliationRequired('Owner canonical reset source is not Owner-only')
+        return source_fingerprint_from_documents(docs, owner_canonical_container=RESET_CONTAINER)
+
+    fingerprint = source_proof(current)
+    # Exhaust every page before hydration, journaling, or any delete. Validate
+    # every row before considering the inventory safe as a whole.
+    listed = sorted((_reset_record(row) for row in owner_canonical_inventory(client)),
+                    key=lambda row: row['id'])
+    if len({row['custom_id'] for row in listed}) != len(listed):
+        raise ReconciliationRequired('Owner canonical reset has duplicate canonical identities')
+    records = []
+    for row in listed:
+        remote = _reset_record(client.documents.get(row['id'], timeout=15.0), hydrated=True)
+        if not _exact_json_equal(row, {key: remote[key] for key in row}):
+            raise ReconciliationRequired('Owner canonical reset inventory changed during hydration')
+        records.append(remote)
+    binding = {
+        'operation': 'reset-owner-canonical/v1', 'container': RESET_CONTAINER,
+        'endpoint_sha256': hashlib.sha256(base_url.encode('utf-8')).hexdigest(),
+        'inventory_ids': [row['id'] for row in records], 'inventory_count': len(records),
+        'inventory_digest': canonical_digest(records),
+        'source_fingerprint': fingerprint, 'source_count': len(current),
+    }
+    token = 'RESET-OWNER-CANONICAL:' + canonical_digest(binding)
+    summary = {'container': RESET_CONTAINER, 'inventory_count': len(records),
+               'source_count': len(current), 'source_fingerprint': fingerprint['digest'],
+               'confirmation_token': token, 'readiness': False}
+    if not execute:
+        return {**summary, 'filesystem_mutated': False, 'backend_mutated': False}
+    if not hmac.compare_digest(confirm, token):
+        raise ReconciliationRequired('Owner canonical reset confirmation token mismatch; preview again')
+    if not _exact_json_equal(source_proof(rescan()), fingerprint):
+        raise ReconciliationRequired('Owner canonical reset source changed; preview again')
+
+    journal_id = secrets.token_hex(16)
+    child = f'owner-canonical-resets/{journal_id}.json'
+    journal = {'schema_version': 1, 'journal_id': journal_id, 'binding': binding,
+               'confirmation_token': token, 'created_at': datetime.now(timezone.utc).isoformat(),
+               'recovery': 'Preview remaining inventory, confirm a new reset, then rebuild from source',
+               'records': [{'snapshot': row, 'stage': 'planned'} for row in records],
+               'complete': False, 'verified_empty': False}
+
+    def checkpoint() -> None:
+        digest = private_json_write(private_root, child, journal)
+        if not _exact_json_equal(private_json_read(
+                private_root, child, expected_sha256=digest), journal):
+            raise PrivateArtifactError('Owner canonical reset journal read-back failed')
+
+    checkpoint()  # All logical recovery content is durable before the first delete.
+    private_json_write(private_root, 'readiness/owner-canonical-readiness.json', {
+        'schema_version': INDEX_SCHEMA_VERSION, 'container': RESET_CONTAINER,
+        'readiness': False, 'reset_journal_id': journal_id,
+    })
+    # Re-list after the durable snapshot to catch pagination/provider drift.
+    before = sorted((_reset_record(row) for row in owner_canonical_inventory(client)),
+                    key=lambda row: row['id'])
+    if not _exact_json_equal(before, listed):
+        raise ReconciliationRequired('Owner canonical reset inventory changed; preview again')
+    if not _exact_json_equal(source_proof(rescan()), fingerprint):
+        raise ReconciliationRequired('Owner canonical reset source changed; preview again')
+    for record in journal['records']:
+        record['stage'] = 'delete_intent'
+        checkpoint()
+        row = record['snapshot']
+        remote = _reset_record(client.documents.get(row['id'], timeout=15.0), hydrated=True)
+        if not _exact_json_equal(remote, row):
+            raise ReconciliationRequired('Owner canonical reset identity changed before delete')
+        client.documents.delete(row['id'], timeout=30.0)
+        record['stage'] = 'delete_returned'
+        checkpoint()
+    if owner_canonical_inventory(client):
+        raise ReconciliationRequired('Owner canonical reset could not verify empty destination')
+    for record in journal['records']:
+        record['stage'] = 'verified_absent'
+    journal.update(complete=True, verified_empty=True)
+    checkpoint()
+    return {**summary, 'journal_id': journal_id, 'verified_empty': True,
+            'deleted_count': len(records), 'filesystem_mutated': True,
+            'backend_mutated': bool(records)}
 
 
 def rebuild_owner_canonical(
@@ -1930,7 +2086,7 @@ class DurableReconciliationExecutor:
                 if status == 'done':
                     self._validate_post(hydrated, doc, record['target_container'], expected)
                     return self._advance(state, index, 'done')
-                if status == 'processing':
+                if status in {'queued', 'extracting', 'chunking', 'embedding', 'indexing', 'processing'}:
                     if state['records'][index]['stage'] != 'processing':
                         state = self._advance(state, index, 'processing')
                 else:
@@ -3163,6 +3319,7 @@ def indexed_content_probes(doc: dict[str, Any]) -> list[str]:
     entity_name = str(doc.get('identity', {}).get('entity_name') or '').strip().casefold()
     candidates = []
     title_only = []
+    ordered_lines = []
     for raw_line in body.splitlines():
         line = re.sub(
             r'^\s*(?:#{1,6}\s+|>\s*|[-*+]\s+|\d+[.)]\s+|\[[ xX]\]\s*)?',
@@ -3170,6 +3327,7 @@ def indexed_content_probes(doc: dict[str, Any]) -> list[str]:
         ).strip()
         if not line or line == '[redacted]':
             continue
+        ordered_lines.append(line)
         if raw_line.lstrip().startswith('#') or line.casefold() == entity_name:
             title_only.append(line)
         else:
@@ -3177,7 +3335,10 @@ def indexed_content_probes(doc: dict[str, Any]) -> list[str]:
     # Prefer body prose, but retain indexed headings as deterministic fallback
     # probes for sparse or unusually chunked documents.
     lines = candidates + title_only
-    all_words = re.findall(r"[^\s]+", ' '.join(lines))
+    # Cross-line windows must retain canonical source order. Reordering headings
+    # behind prose is useful for probe priority, but using that reordered list to
+    # build windows invents token runs that sparse documents never contained.
+    all_words = re.findall(r"[^\s]+", ' '.join(ordered_lines))
     probe_width = 8
     line_sample_count = min(16, len(lines))
     line_indexes = sorted({
@@ -3303,7 +3464,7 @@ def verify_indexed_documents(client: Supermemory, current: dict[str, dict[str, A
             for probe in indexed_content_probes(doc):
                 response = search_documents_v4(
                     client, probe, container_tag=container_for_doc(doc),
-                    limit=1, timeout=30.0,
+                    limit=1, timeout=30.0, threshold=0.0,
                     filters={'AND': [{'key': 'source', 'value': 'obsidian'},
                                      {'key': 'relative_path', 'value': rel}]},
                 )
@@ -3725,13 +3886,26 @@ def legacy_main() -> None:
 PHASE2_COMMANDS = frozenset({
     'dry-run', 'plan', 'verify-only', 'sync-canonical', 'reconcile', 'rollback', 'key-init', 'key-rotate',
     'install', 'reload-instructions', 'legacy-reconcile', 'rebuild-owner-canonical',
+    'reset-owner-canonical',
 })
 
 
+def _reset_argument_error(message: str) -> None:
+    # argparse normally echoes bad values, which may be private paths/identities.
+    raise SystemExit('Invalid owner canonical reset arguments; use reset-owner-canonical --help')
+
+
+class _Phase2ArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs['allow_abbrev'] = False
+        super().__init__(*args, **kwargs)
+
+
 def _phase2_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description='Secure canonical-memory reconciliation')
-    sub = parser.add_subparsers(dest='command', required=True)
-    common = argparse.ArgumentParser(add_help=False)
+    parser = _Phase2ArgumentParser(description='Secure canonical-memory reconciliation')
+    sub = parser.add_subparsers(
+        dest='command', required=True, parser_class=_Phase2ArgumentParser)
+    common = _Phase2ArgumentParser(add_help=False)
     common.add_argument('--source-root', type=Path, required=True)
     common.add_argument('--private-root', type=Path, required=True)
     common.add_argument('--manifest', type=Path)
@@ -3751,6 +3925,19 @@ def _phase2_parser() -> argparse.ArgumentParser:
     rebuild.add_argument('--expected-source-count', required=True, type=int)
     rebuild.add_argument('--expected-source-fingerprint', required=True, type=_plan_digest_argument)
     rebuild.add_argument('--confirm', required=True)
+    reset: argparse.ArgumentParser = sub.add_parser('reset-owner-canonical', description=(
+        'Preview an exhaustive reset of exactly owner_canonical. Rerun with --execute '
+        'and the returned --confirm token. Quiesce canonical writers first. '
+        'Interrupted resets require a fresh preview/token for the remaining inventory; '
+        'private owner-canonical-resets journals retain logical recovery snapshots.'))
+    reset.error = _reset_argument_error
+    reset.add_argument('--source-root', type=Path, required=True)
+    reset.add_argument('--private-root', type=Path, required=True)
+    reset.add_argument('--base-url', default=BASE_URL)
+    reset.add_argument('--execute', action='store_true')
+    reset.add_argument('--confirm', help='Exact token returned by a fresh reset preview')
+    reset.set_defaults(owner_canonical_container=RESET_CONTAINER,
+                       owner_explicit_container='owner_explicit', manifest=None)
     reconcile = sub.add_parser('reconcile', parents=[common])
     reconcile.add_argument('--execute', action='store_true', required=True)
     reconcile.add_argument('--transaction-id', required=True, type=_transaction_id_argument)
@@ -3834,10 +4021,10 @@ def _preflight_phase2_paths(args: argparse.Namespace) -> None:
         raise SystemExit('private root must already exist')
 
 
-def _client(base_url: str) -> Supermemory:
+def _client(base_url: str, *, max_retries: int = 1) -> Supermemory:
     # Credentials are obtained only from private configuration and are never
     # accepted on argv or included in summaries.
-    return Supermemory(api_key=api_key(), base_url=base_url, timeout=30.0, max_retries=1)
+    return Supermemory(api_key=api_key(), base_url=base_url, timeout=30.0, max_retries=max_retries)
 
 
 def _scan_at(root: Path) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
@@ -3914,6 +4101,132 @@ def transaction_plan_from_inventory(
     return _validated_transaction_plan(bound)
 
 
+def _transaction_plan_matches_current(
+        plan: tuple[dict[str, Any], ...], current: dict[str, dict[str, Any]]) -> bool:
+    """Purely reject stale recovery plans before selecting one for execution."""
+    for record in plan:
+        doc = current.get(record['relative_path'])
+        if record['action'] == 'delete':
+            if doc is not None:
+                return False
+            continue
+        expected = record['expected_post_identity']
+        if (not isinstance(doc, dict) or doc.get('custom_id') != record['custom_id']
+                or doc.get('sha256') != record['expected_sha256']
+                or doc.get('bytes') != record['expected_bytes']
+                or container_for_doc(doc) != record['target_container']
+                or expected['sha256'] != doc['sha256']
+                or expected['bytes'] != doc['bytes']):
+            return False
+    return True
+
+
+def unfinished_unattended_transaction(
+        root: Path, current: dict[str, dict[str, Any]],
+        client: Supermemory) -> tuple[str, tuple[dict[str, Any], ...]] | None:
+    """Return the explicitly active resumable scheduled transaction, if any.
+
+    Scheduled reconciliation must consult its durable journal before deriving a
+    fresh plan from eventually-consistent provider inventory.  Otherwise a
+    replacement whose add was accepted but not yet visible can be mistaken for
+    a new add, while an accepted add that later becomes visible can strand the
+    old journal and skip atomic manifest publication.
+    """
+    marker_child = 'transactions/active-sync.json'
+    marker_path = root / marker_child
+    if not marker_path.exists():
+        return None
+    marker = private_json_read(root, marker_child)
+    if set(marker) != {'transaction_id', 'plan_digest'}:
+        raise TransactionJournalError('active unattended sync marker is invalid')
+    transaction_id = marker['transaction_id']; _validate_transaction_id(transaction_id)
+    plan_child = f'transactions/{transaction_id}/plan.json'
+    payload = private_json_read(root, plan_child)
+    plan = _validated_transaction_plan(payload.get('records'))
+    digest = transaction_plan_digest(plan)
+    if (payload.get('unattended') is not True or payload.get('transaction_id') != transaction_id
+            or payload.get('plan_digest') != digest or marker['plan_digest'] != digest):
+        raise TransactionJournalError('active unattended sync binding is invalid')
+    if not _transaction_plan_matches_current(plan, current):
+        # A completed transaction can become stale after its provider mutation
+        # and before (or after) publication when Obsidian changes again. Retire
+        # it only when the immutable journal is terminal and the provider still
+        # proves the exact planned post-state. Nonterminal or ambiguous state
+        # remains bound to the marker and fails closed.
+        journal_child = f'transactions/{transaction_id}/forward-journal.json'
+        snapshot_child = f'transactions/{transaction_id}/snapshot.json'
+        try:
+            journal_raw = private_json_read(root, journal_child)
+            snapshot_digest = journal_raw.get('snapshot_digest')
+            journal = validate_transaction_journal(
+                journal_raw, plan, expected_transaction_id=transaction_id,
+                expected_snapshot_digest=snapshot_digest)
+            if any(row['stage'] != 'done' for row in journal['records']):
+                raise ReconciliationRequired('active unattended sync source changed')
+            snapshot = private_json_read(root, snapshot_child, expected_sha256=snapshot_digest)
+            inventory = provider_inventory(client)
+            provider_proofs = []
+            for record in plan:
+                matches = [(container, row) for container, rows in inventory.items() for row in rows
+                           if _alias(row, 'custom_id', 'customId') == record['custom_id']]
+                expected = record['expected_post_identity']
+                if expected is None:
+                    if matches:
+                        raise ReconciliationRequired('active unattended sync source changed')
+                    provider_proofs.append({'custom_id': record['custom_id'], 'absent': True})
+                    continue
+                if len(matches) != 1:
+                    raise ReconciliationRequired('active unattended sync source changed')
+                container, listed = matches[0]
+                hydrated = normalize_provider_object(
+                    client.documents.get(str(_field(listed, 'id')), timeout=15.0))
+                hydrated['_inventory_container'] = container
+                _require_superrag_task(hydrated)
+                actual = provider_identity(hydrated, container)
+                anchored = dict(expected); anchored['document_id'] = actual['document_id']
+                if not _exact_json_equal(actual, anchored) or status_name(hydrated) != 'done':
+                    raise ReconciliationRequired('active unattended sync source changed')
+                content = hydrated.get('content'); marker_end = '[/canonical-identity]\n\n'
+                if type(content) is not str or content.count(marker_end) != 1:
+                    raise ReconciliationRequired('active unattended sync source changed')
+                logical_text = content.split(marker_end, 1)[1]
+                candidates = (logical_text, logical_text.rstrip(' \t\r\n'), logical_text + '\n')
+                if not any(hashlib.sha256(value.encode('utf-8')).hexdigest() == expected['sha256']
+                           and len(value.encode('utf-8')) == expected['bytes']
+                           for value in candidates):
+                    raise ReconciliationRequired('active unattended sync source changed')
+                provider_proofs.append(actual)
+            evidence = {
+                'marker': marker,
+                'plan_sha256': hashlib.sha256(_json_bytes(payload)).hexdigest(),
+                'journal_sha256': hashlib.sha256(_json_bytes(journal_raw)).hexdigest(),
+                'snapshot_sha256': snapshot_digest,
+                'snapshot_transaction_id': snapshot.get('transaction_id'),
+                'provider_proofs': provider_proofs,
+            }
+            retirement = {
+                'schema_version': 1, 'transaction_id': transaction_id,
+                'plan_digest': digest,
+                'reason': 'terminal_provider_converged_source_changed',
+                'retired_at': datetime.now(timezone.utc).isoformat(),
+                'provider_verified_count': len(provider_proofs),
+                'evidence_sha256': _canonical_digest(evidence),
+                'evidence': evidence,
+            }
+            retirement_child = f'transactions/{transaction_id}/retirement.json'
+            retirement_digest = private_json_write(root, retirement_child, retirement)
+            if private_json_read(root, retirement_child,
+                                 expected_sha256=retirement_digest) != retirement:
+                raise ReconciliationRequired('active unattended sync retirement archive failed')
+            _private_unlink(root, marker_child)
+            return None
+        except ReconciliationRequired:
+            raise
+        except Exception:
+            raise ReconciliationRequired('active unattended sync source changed') from None
+    return transaction_id, plan
+
+
 def _receipt_inventory(client: Supermemory, current: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     inventory = provider_inventory(client)
     rows = []
@@ -3956,14 +4269,36 @@ def _vector_observations(client: Supermemory,
                 if not (isinstance(results, list) and results == []
                         and type(total) in (int, float) and total == 0):
                     break
+            chunk = str(_field(results[0], 'chunk', '')) if isinstance(results, list) and results else ''
             if (isinstance(results, list) and len(results) == 1 and total == 1
-                    and indexed_chunk_proves_probe(str(_field(results[0], 'chunk', '')),
-                                                   probe, doc['content'])):
+                    and indexed_chunk_proves_probe(chunk, probe, doc['content'])):
                 accepted = results
                 break
         if accepted is None:
             raise ReconciliationRequired('vector proof failed for one or more documents')
-        observations[rel] = accepted
+        # Search parents may omit stable identity/task fields in the production
+        # SDK shape. Hydrate the already-validated sole parent and attach that
+        # exact provider object to the observation used for signed readiness.
+        result = normalize_provider_object(accepted[0])
+        parents = list(_field(accepted[0], 'documents', []) or [])
+        if len(parents) != 1:
+            raise ReconciliationRequired('vector proof parent is unavailable')
+        parent_reference = str(_field(parents[0], 'id', '') or '')
+        if not parent_reference:
+            raise ReconciliationRequired('vector proof parent identity is unavailable')
+        hydrated = normalize_provider_object(client.documents.get(parent_reference, timeout=15.0))
+        parent_id = str(hydrated.get('id') or '')
+        if not parent_id:
+            raise ReconciliationRequired('vector proof hydrated parent identity is unavailable')
+        hydrated['_inventory_container'] = container_for_doc(doc)
+        _require_superrag_task(hydrated)
+        validate_backend_document(hydrated, doc)
+        result['documents'] = [hydrated]
+        result['document_id'] = parent_id
+        result.pop('documentId', None)
+        result['is_aggregated'] = False
+        result.pop('isAggregated', None)
+        observations[rel] = [result]
     return observations
 
 
@@ -4370,7 +4705,7 @@ def secure_install(tracked: Path, stable: Path, backup_root: Path, expected_sha2
             'launch_agent_reloaded': False}
 
 
-def _phase2_main(argv: list[str]) -> None:
+def _phase2_main_unlocked(argv: list[str]) -> None:
     if argv and argv[0] == 'legacy-reconcile':
         old_argv = sys.argv
         try:
@@ -4379,7 +4714,12 @@ def _phase2_main(argv: list[str]) -> None:
         finally:
             sys.argv = old_argv
         return
-    args = _phase2_parser().parse_args(argv)
+    parser = _phase2_parser()
+    if argv and argv[0] == 'reset-owner-canonical':
+        parser.error = _reset_argument_error
+    args = parser.parse_args(argv)
+    if args.command == 'reset-owner-canonical' and bool(args.confirm) != args.execute:
+        _reset_argument_error('execution and confirmation must be supplied together')
     if args.command == 'rebuild-owner-canonical':
         args.owner_canonical_container = args.rebuild_owner_canonical_container
         args.owner_explicit_container = args.rebuild_owner_explicit_container
@@ -4423,6 +4763,17 @@ def _phase2_main(argv: list[str]) -> None:
     if args.command == 'reconcile':
         recover_publication(root)
     scanned, current = _scan_at(args.source_root)
+    if args.command == 'reset-owner-canonical':
+        def owner_source() -> dict[str, dict[str, Any]]:
+            return {rel: doc for rel, doc in _scan_at(args.source_root)[1].items()
+                    if container_for_doc(doc) == RESET_CONTAINER}
+
+        owner = {rel: doc for rel, doc in current.items() if container_for_doc(doc) == RESET_CONTAINER}
+        result = reset_owner_canonical(
+            _client(args.base_url, max_retries=0), owner, root, base_url=args.base_url,
+            execute=args.execute, confirm=args.confirm, rescan=owner_source)
+        print(json.dumps({'mode': args.command, **result}))
+        return
     if args.command == 'rebuild-owner-canonical':
         owner = {rel: doc for rel, doc in current.items() if container_for_doc(doc) == CONTAINER}
         result = rebuild_owner_canonical(
@@ -4443,6 +4794,36 @@ def _phase2_main(argv: list[str]) -> None:
                           'provider_client_created': False, 'backend_mutated': False}))
         return
     client = _client(args.base_url)
+    resumed = unfinished_unattended_transaction(root, current, client) if args.command == 'sync-canonical' else None
+    if resumed is not None:
+        transaction_id, plan = resumed
+        try:
+            state = DurableReconciliationExecutor(client, root).execute(current, plan, transaction_id)
+            generated_at = datetime.now(timezone.utc)
+            generation = f'{transaction_id}:{state["verification_digest"]}'
+            storage_rows = _receipt_inventory(client, current)
+            observations = _vector_observations(client, current)
+            manifest = {'schema_version': INDEX_SCHEMA_VERSION, 'transaction_id': transaction_id,
+                        'generation': generation,
+                        'documents': sorted(storage_rows, key=lambda row: row['relative_path'])}
+            storage_digest, vector_digest = publish_readiness_pair(
+                root, current, storage_rows, observations, generation, generated_at,
+                manifest=manifest, manifest_child=manifest_path.relative_to(root).as_posix())
+        except Exception:
+            print(json.dumps({'mode': args.command, 'transaction_id': transaction_id,
+                              'readiness': False, 'resume': True}))
+            raise SystemExit(1) from None
+        actions: dict[str, int] = {}
+        for row in plan:
+            actions[row['action']] = actions.get(row['action'], 0) + 1
+        print(json.dumps({'mode': args.command, 'actions': actions,
+                          'change_count': len(plan), 'transaction_id': transaction_id,
+                          'storage_receipt_sha256': storage_digest,
+                          'vector_receipt_sha256': vector_digest, 'readiness': True,
+                          'resumed': True, 'filesystem_mutated': True,
+                          'backend_mutated': True}))
+        _private_unlink(root, 'transactions/active-sync.json')
+        return
     inventory = provider_inventory(client)
     classification = classify_inventory(current, inventory)
     approved = reconciliation_plan(classification)
@@ -4516,6 +4897,11 @@ def _phase2_main(argv: list[str]) -> None:
             digest = private_json_write(root, plan_child, payload)
             if private_json_read(root, plan_child, expected_sha256=digest) != payload:
                 raise PrivateArtifactError('unattended sync plan read-back mismatch')
+        active = {'transaction_id': transaction_id, 'plan_digest': proposed_digest}
+        active_digest = private_json_write(root, 'transactions/active-sync.json', active)
+        if private_json_read(root, 'transactions/active-sync.json',
+                             expected_sha256=active_digest) != active:
+            raise PrivateArtifactError('active unattended sync marker read-back mismatch')
         try:
             state = DurableReconciliationExecutor(client, root).execute(current, plan, transaction_id)
             generated_at = datetime.now(timezone.utc)
@@ -4536,6 +4922,7 @@ def _phase2_main(argv: list[str]) -> None:
                           'storage_receipt_sha256': storage_digest,
                           'vector_receipt_sha256': vector_digest, 'readiness': True,
                           'filesystem_mutated': True, 'backend_mutated': True}))
+        _private_unlink(root, 'transactions/active-sync.json')
         return
     if args.confirm != args.transaction_id:
         raise SystemExit('reconcile confirmation token mismatch')
@@ -4589,8 +4976,44 @@ def _phase2_main(argv: list[str]) -> None:
                       'readiness': True}))
 
 
+_PHASE2_CANONICAL_WRITERS = frozenset({
+    'rebuild-owner-canonical', 'sync-canonical', 'reconcile', 'rollback',
+})
+
+
+def _phase2_main(argv: list[str]) -> None:
+    """Run every phase-2 canonical writer under the shared process lock."""
+    command = argv[0] if argv else ''
+    writes_canonical = (command in _PHASE2_CANONICAL_WRITERS
+                        or (command == 'reset-owner-canonical' and '--execute' in argv[1:]))
+    if not writes_canonical:
+        _phase2_main_unlocked(argv)
+        return
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK.open('a+', encoding='utf-8') as lock_handle:
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit('canonical writer already running') from None
+        _phase2_main_unlocked(argv)
+
+
 def main() -> None:
-    _phase2_main(sys.argv[1:])
+    argv = sys.argv[1:]
+    if not argv or argv[0] != 'reset-owner-canonical':
+        _phase2_main(argv)
+        return
+    # SDK/httpx debug logs can include request bodies, IDs, and credentials.
+    # Suppress them for this CLI boundary and never print provider exceptions.
+    previous_logging = logging.root.manager.disable
+    logging.disable(sys.maxsize)
+    try:
+        _phase2_main(argv)
+    except (Exception, KeyboardInterrupt):
+        raise SystemExit('Owner canonical reset stopped; preview again before retrying. '
+                         'If execution began, inspect the private reset journals.') from None
+    finally:
+        logging.disable(previous_logging)
 
 
 if __name__ == '__main__':

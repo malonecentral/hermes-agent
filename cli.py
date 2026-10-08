@@ -5416,6 +5416,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.max_tokens = _mt if isinstance(_mt, int) else None
         else:
             self.max_tokens = None
+        # Preserve whether the output cap came from the documented global
+        # override. Runtime provider caps are resolved later and must be able
+        # to change when an interactive session switches providers.
+        self._max_tokens_is_explicit = self.max_tokens is not None
         # Auto-detect model from local server if still on default
         if self.model == _DEFAULT_CONFIG_MODEL:
             _base_url = (_model_config.get("base_url") or "") if isinstance(_model_config, dict) else ""
@@ -11857,6 +11861,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
                 return
 
+        from hermes_cli.config import load_config
+        from hermes_constants import resolve_reasoning_config
+        self.reasoning_config = resolve_reasoning_config(load_config(), self.model)
+        if self.agent is not None:
+            self.agent.reasoning_config = self.reasoning_config
+
         from hermes_cli.model_switch import format_model_for_display
         _display_old = format_model_for_display(old_model)
         _display_new = format_model_for_display(result.new_model)
@@ -12250,6 +12260,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Store a note to prepend to the next user message so the model
         # knows a switch occurred (avoids injecting system messages mid-history
         # which breaks providers and prompt caching).
+        from hermes_cli.config import load_config
+        from hermes_constants import resolve_reasoning_config
+        self.reasoning_config = resolve_reasoning_config(load_config(), self.model)
+        if self.agent is not None:
+            self.agent.reasoning_config = self.reasoning_config
+
         from hermes_cli.model_switch import format_model_for_display
         _display_old = format_model_for_display(old_model)
         _display_new = format_model_for_display(result.new_model)

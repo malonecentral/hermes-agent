@@ -26,12 +26,14 @@ class _RuntimeCLI(CLIAgentSetupMixin):
         self.api_mode = "chat_completions"
         self.acp_command = None
         self.acp_args = []
-        self.agent = None
+        self.agent: object | None = None
         self._fallback_model = []
         self._explicit_api_key = None
         self._explicit_base_url = None
         self._credential_pool = None
         self.service_tier = None
+        self.max_tokens = None
+        self._max_tokens_is_explicit = False
 
     def _normalize_model_for_provider(self, _provider: str) -> bool:
         return False
@@ -47,6 +49,7 @@ providers:
   qwen-token-plan:
     base_url: https://qwen-token-plan.example/v1
     api_key: test-key
+    max_output_tokens: 8192
     models:
       qwen3.8-max-preview:
         supports_vision: true
@@ -81,6 +84,7 @@ def test_real_cli_args_keep_transport_and_capability_identities_separate():
 
     assert cli.provider == "custom"
     assert cli.requested_provider == REQUESTED_PROVIDER
+    assert cli.max_tokens == 8192
     assert runtime["provider"] == "custom"
     assert runtime["requested_provider"] == REQUESTED_PROVIDER
     assert decide_image_input_mode(
@@ -96,6 +100,27 @@ def test_real_cli_args_keep_transport_and_capability_identities_separate():
     cli.agent = sentinel_agent
     assert cli._ensure_runtime_credentials() is True
     assert cli.agent is sentinel_agent
+
+
+def test_runtime_output_cap_rebuilds_live_agent_when_provider_cap_changes(monkeypatch):
+    cli, _route = _resolve_cli_route()
+    sentinel_agent = SimpleNamespace()
+    cli.agent = sentinel_agent
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "custom",
+            "base_url": cli.base_url,
+            "api_key": cli.api_key,
+            "api_mode": cli.api_mode,
+            "max_output_tokens": 4096,
+        },
+    )
+
+    assert cli._ensure_runtime_credentials() is True
+    assert cli.max_tokens == 4096
+    assert cli.agent is None
 
 
 def test_named_identity_reaches_agent_and_vision_tool_native_gates():

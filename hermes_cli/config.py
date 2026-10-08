@@ -1709,7 +1709,7 @@ def _normalize_custom_provider_entry(
         "key_cmd",
         "api_mode", "transport", "model", "default_model", "models",
         "models_discovered",
-        "context_length", "rate_limit_delay",
+        "context_length", "rate_limit_delay", "max_output_tokens", "max_tokens",
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers", "capabilities",
         "ssl_ca_cert", "ssl_verify",
@@ -1849,6 +1849,12 @@ def _normalize_custom_provider_entry(
     context_length = entry.get("context_length")
     if isinstance(context_length, int) and context_length > 0:
         normalized["context_length"] = context_length
+
+    for output_cap_key in ("max_output_tokens", "max_tokens"):
+        output_cap = entry.get(output_cap_key)
+        if isinstance(output_cap, int) and not isinstance(output_cap, bool) and output_cap > 0:
+            normalized["max_output_tokens"] = output_cap
+            break
 
     rate_limit_delay = entry.get("rate_limit_delay")
     if isinstance(rate_limit_delay, (int, float)) and rate_limit_delay >= 0:
