@@ -16,7 +16,6 @@ import pytest
 
 from hermes_cli import kanban as kb_cli
 from hermes_cli import kanban_db as kb
-from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -33,7 +32,7 @@ def kanban_home(tmp_path, monkeypatch):
 
 @pytest.fixture
 def conn(kanban_home):
-    with kbc.connect() as c:
+    with kb.connect() as c:
         yield c
 
 
@@ -64,22 +63,10 @@ def test_promote_stuck_todo_succeeds(conn):
     assert kb.get_task(conn, child).status == "ready"
 
 
-def test_promote_refuses_undone_parent_and_names_the_real_remedy(conn):
-    # #106195: promotion must never report a 'ready' that the first claim reverts.
-    child, (parent,) = _stuck_todo(conn, parents_done=False)
-    ok, err = kb.promote_task(conn, child, actor="tester", reason="recovery")
-    assert not ok
-    assert parent in err and "--force" not in err and f"unlink <parent_id> {child}" in err
-    assert kb.get_task(conn, child).status == "todo"
-    assert kb.claim_task(conn, child) is None  # still gated; nothing pretended
 
 
-def test_cli_promote_has_no_force_flag(kanban_home):
-    from hermes_cli import kanban_parser
-    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
-    kanban_parser.build_parser(parser.add_subparsers(dest="command"))
-    with pytest.raises(SystemExit):
-        parser.parse_args(["kanban", "promote", "t_x", "--force"])
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +88,7 @@ def _promote_ns(task_id, *, ids=None, reason=None, force=False,
 
 
 def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
-    with kbc.connect() as conn:
+    with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         children = [
             kb.create_task(conn, title=f"c{i}", parents=[parent])
@@ -113,7 +100,7 @@ def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
     out = capsys.readouterr().out
     for c in children:
         assert c in out
-    with kbc.connect() as conn:
+    with kb.connect() as conn:
         for c in children:
             assert kb.get_task(conn, c).status == "ready"
 

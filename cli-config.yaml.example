@@ -111,8 +111,14 @@ model:
   #
   # context_length: 131072
   #
-  # Output-token limits are provider-owned, not user configuration. Native
-  # protocols requiring a limit receive an internal value from Hermes.
+  # max_tokens: OUTPUT cap — maximum tokens the model may generate per response.
+  #   Unrelated to how long your conversation history can be.
+  #   The OpenAI-standard name "max_tokens" is a misnomer; Anthropic's native
+  #   API has since renamed it "max_output_tokens" for clarity.
+  #   Leave unset to use the model's native output ceiling (recommended).
+  #   Set only if you want to deliberately limit individual response length.
+  #
+# max_tokens: 8192
 
   # ── Custom request headers (optional) ─────────────────────────────────────
   #
@@ -295,14 +301,6 @@ model:
 #
 #   # Data policy: "allow" (default) or "deny" to exclude providers that may store data
 #   # data_collection: "deny"
-#
-#   # Per-model overrides: same keys, applied only when the agent is on that model
-#   # (spelling-tolerant match; unset keys fall through to the flat values above).
-#   # models:
-#   #   "openai/gpt-6-astra":
-#   #     only: ["openai"]
-#   #   "anthropic/claude-fable-5.1":
-#   #     only: ["anthropic"]
 
 # =============================================================================
 # OpenRouter Response Caching (only applies when using OpenRouter)
@@ -910,10 +908,30 @@ memory:
   nudge_interval: 10        # Nudge every 10 user turns (0 = disabled)
 
 # =============================================================================
-# Session Continuity (Messaging Platforms)
+# Session Reset Policy (Messaging Platforms)
 # =============================================================================
-# Conversations persist across inactivity and daily boundaries. Use /new or
-# /reset explicitly; context compression manages long conversations.
+# Controls when messaging sessions (Telegram, Discord, WhatsApp, Slack) are
+# automatically cleared. Default is "none": sessions never auto-reset —
+# conversation context lives until you /reset or /new manually, or context
+# compression kicks in. Opt in to automatic resets if you prefer sessions to
+# clear on a schedule (long-lived context increases API cost per message,
+# though prompt caching and compression keep this manageable).
+#
+# When an automatic reset triggers, the agent first saves important
+# information to its persistent memory — but the conversation context is
+# wiped. The agent starts fresh but retains learned facts via its memory
+# system.
+#
+# Modes:
+#   "none"  - Never auto-reset (default); context lives until /reset or compression
+#   "idle"  - Reset after N minutes of inactivity
+#   "daily" - Reset at a fixed hour each day
+#   "both"  - Reset on EITHER inactivity timeout or daily boundary
+#
+session_reset:
+  mode: none           # "none", "idle", "daily", or "both"
+  idle_minutes: 1440   # Inactivity timeout in minutes (used by "idle"/"both")
+  at_hour: 4           # Daily reset hour, 0-23 local time (used by "daily"/"both")
 
 # Maximum number of simultaneously active chat sessions across CLI, TUI,
 # dashboard chat, and messaging gateway. Set to null, 0, or omit to allow
@@ -929,32 +947,6 @@ max_concurrent_sessions: null
 # room from sharing context, interrupts, and token costs. Set false only if you
 # explicitly want one shared "room brain" per group/channel.
 group_sessions_per_user: true
-
-# =============================================================================
-# Session Storage Retention (state.db)
-# =============================================================================
-# ~/.hermes/state.db keeps every session, message, and tool call, plus the
-# FTS5 search indexes. Since #54189, auto-pruning is ON by default so the file
-# stays bounded: at CLI/gateway/cron startup (at most once per
-# min_interval_hours) Hermes deletes ENDED sessions whose last activity is
-# older than retention_days. Open, pinned, and in-progress sessions are never
-# deleted. Stale automation sessions (cron/kanban/subagent/one-shot CLI) whose
-# process died without closing them are first *closed*, then aged through a
-# further full retention window before removal.
-#
-# After a prune that removed rows, VACUUM reclaims disk space only when both
-# the time throttle (min_vacuum_interval_days) has elapsed AND more than 25%
-# of the file's pages are reclaimable — a dense database never pays for a full
-# rewrite to reclaim a few MB.
-#
-# Uncomment to change the defaults shown; set auto_prune: false to keep every
-# ended session forever (the pre-#54189 behavior).
-# sessions:
-#   auto_prune: true
-#   retention_days: 90
-#   vacuum_after_prune: true
-#   min_vacuum_interval_days: 30
-#   min_interval_hours: 24
 
 # Optional direct endpoint for autonomous Bot Mode rooms spanning gateways.
 # Leave unset for the safe default: Desktop coordinates cross-gateway rooms and
@@ -1662,9 +1654,6 @@ delegation:
   #                                           # delegation.model to an inexpensive one — children carry the
   #                                           # vast majority of tokens, so this is where spend is cut while
   #                                           # planning quality stays with the frontier parent.
-  # fallback_providers:                       # Fallback chain for delegated children (same entry format as the
-  #   - provider: "openrouter"                # top-level list). Pinned children use only a declared child chain;
-  #     model: "deepseek/deepseek-chat"       # unpinned children inherit when unset. [] disables fallback (#65038).
 
 # =============================================================================
 # Honcho Integration (Cross-Session User Modeling)
@@ -1966,9 +1955,6 @@ telemetry:
 # Update Behavior
 # =============================================================================
 updates:
-  # Disable passive CLI/banner update checks with `hermes config set updates.check false`.
-  # Explicit `hermes update --check` and `hermes update` remain available.
-  check: true
   # Create a full HERMES_HOME zip before every `hermes update`.
   # Backups land in ~/.hermes/backups/ and can be restored with `hermes import`.
   # Off by default because large homes can add minutes to every update.

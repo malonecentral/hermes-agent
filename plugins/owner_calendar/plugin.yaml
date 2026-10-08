@@ -1,0 +1,8 @@
+name: owner_calendar
+version: 1.0.0
+description: "Read one bounded America/Phoenix day from Dennis's app-owned Apple Calendar provider."
+kind: standalone
+platforms:
+  - macos
+provides_tools:
+  - read_owner_calendar

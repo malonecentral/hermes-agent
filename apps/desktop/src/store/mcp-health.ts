@@ -49,10 +49,8 @@ let timer: ReturnType<typeof setInterval> | null = null
 // Bumped on profile switch; in-flight sweeps compare and bail so a slow
 // profile-A probe can't record (or notify) into profile B's state.
 let sweepEpoch = 0
-// At most one sweep runs and one follow-up is remembered. Reconnect storms
-// still request a fresh pass, but cannot append an unbounded backlog.
-let sweepInFlight: Promise<void> | null = null
-let sweepQueued = false
+// Sweeps are chained, never concurrent — sequential probes, no parallel bursts.
+let sweepChain: Promise<void> = Promise.resolve()
 let offGatewayState: (() => void) | null = null
 let offProfile: (() => void) | null = null
 
@@ -145,24 +143,7 @@ async function sweep(): Promise<void> {
 }
 
 function queueSweep(): void {
-  if (sweepInFlight) {
-    sweepQueued = true
-
-    return
-  }
-
-  sweepInFlight = sweep()
-
-  const settled = () => {
-    sweepInFlight = null
-
-    if (sweepQueued) {
-      sweepQueued = false
-      queueSweep()
-    }
-  }
-
-  sweepInFlight.then(settled, settled)
+  sweepChain = sweepChain.then(sweep, sweep)
 }
 
 function arm(): void {
@@ -175,8 +156,6 @@ function arm(): void {
 }
 
 function disarm(): void {
-  sweepQueued = false
-
   if (timer !== null) {
     clearInterval(timer)
     timer = null

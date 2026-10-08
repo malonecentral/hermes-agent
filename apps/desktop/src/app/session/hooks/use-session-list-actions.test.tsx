@@ -98,8 +98,7 @@ vi.mock('@/store/gateway', async importOriginal => ({
 // the whole projects store (gateway / fs / git) into this hook's test.
 const removed = vi.hoisted(() => ({ ids: new Set<string>() }))
 
-vi.mock('@/store/session-removal', async importActual => ({
-  ...(await importActual<Record<string, unknown>>()),
+vi.mock('@/store/projects', () => ({
   $removedSessionIds: { get: () => removed.ids }
 }))
 

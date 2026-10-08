@@ -45,7 +45,6 @@ import {
   inlineErrorMessage,
   isProviderSetupError,
   isSessionBusyError,
-  isSessionNotOwnedError,
   isTargetSessionBusy,
   releaseSubmitInFlight,
   SessionRecoveryAborted,
@@ -856,9 +855,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         const message = inlineErrorMessage(err, copy.promptFailed)
         const occurredAt = Date.now() / 1000
-        // Another surface owns the session (#106217): a deterministic gateway
-        // refusal, so the error card drops Retry and offers a new session.
-        const notOwned = isSessionNotOwnedError(err)
 
         updateSessionState(
           sessionId,
@@ -871,7 +867,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
                 role: 'assistant',
                 parts: [],
                 error: message || copy.promptFailed,
-                ...(notOwned && { errorSurface: { layer: 'gateway', code: 'SESSION_NOT_OWNED', retryable: false } }),
                 branchGroupId: state.pendingBranchGroup ?? undefined,
                 completedAt: occurredAt,
                 timestamp: occurredAt

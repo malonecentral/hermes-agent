@@ -41,7 +41,6 @@ import {
   buildTextSendPayload,
   createBoundedMessageStore,
   extractBridgeEvent,
-  getMessageContent,
   inboundReadReceiptKeys,
   inferMediaType,
   mediaPayloadForFile,
@@ -224,6 +223,28 @@ function emitDebugEvent(payload) {
   try {
     console.log(JSON.stringify({ event: 'debug', ...payload }));
   } catch {}
+}
+
+function getMessageContent(msg) {
+  const content = msg?.message || {};
+  if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;
+  if (content.viewOnceMessage?.message) return content.viewOnceMessage.message;
+  if (content.viewOnceMessageV2?.message) return content.viewOnceMessageV2.message;
+  if (content.documentWithCaptionMessage?.message) return content.documentWithCaptionMessage.message;
+  if (content.templateMessage?.hydratedTemplate) return content.templateMessage.hydratedTemplate;
+  if (content.buttonsMessage) return content.buttonsMessage;
+  if (content.listMessage) return content.listMessage;
+  return content;
+}
+
+function getContextInfo(messageContent) {
+  if (!messageContent || typeof messageContent !== 'object') return {};
+  for (const value of Object.values(messageContent)) {
+    if (value && typeof value === 'object' && value.contextInfo) {
+      return value.contextInfo;
+    }
+  }
+  return {};
 }
 
 mkdirSync(SESSION_DIR, { recursive: true });

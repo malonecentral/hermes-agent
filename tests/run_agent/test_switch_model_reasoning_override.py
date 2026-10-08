@@ -50,11 +50,11 @@ class TestSwitchModelReasoningOverride:
         agent = self._make_fake_agent()
 
         fake_cfg = {
-            "model": {"default": "claude-opus-4.5"},
+            "model": {"default": "qwen3.5:4b"},
             "agent": {
                 "reasoning_effort": "medium",
                 "reasoning_overrides": {
-                    "claude-opus-4.5": "xhigh",
+                    "qwen3.5:4b": "none",
                 },
             },
         }
@@ -63,10 +63,10 @@ class TestSwitchModelReasoningOverride:
             try:
                 switch_model(
                     agent,
-                    new_model="claude-opus-4.5",
-                    new_provider="anthropic",
-                    base_url="https://api.anthropic.com",
-                    api_mode="anthropic_messages",
+                    new_model="qwen3.5:4b",
+                    new_provider="local-qwen",
+                    base_url="http://mcomen.malonecentral.com:11434/v1",
+                    api_mode="chat_completions",
                 )
             except Exception:
                 # Client creation may fail in test env; check _primary_runtime was set
@@ -83,16 +83,16 @@ class TestSwitchModelReasoningOverride:
 
         agent = MagicMock()
         agent._primary_runtime = {
-            "model": "claude-opus-4.5",
-            "provider": "anthropic",
-            "base_url": "https://api.anthropic.com",
-            "api_mode": "anthropic_messages",
+            "model": "qwen3.5:4b",
+            "provider": "local-qwen",
+            "base_url": "http://mcomen.malonecentral.com:11434/v1",
+            "api_mode": "chat_completions",
             "api_key": "key",
             "client_kwargs": {},
             "use_prompt_caching": True,
             "use_native_cache_layout": False,
-            "reasoning_config": {"enabled": True, "effort": "xhigh"},
-            "compressor_model": "claude-opus-4.5",
+            "reasoning_config": {"enabled": False},
+            "compressor_model": "qwen3.5:4b",
             "compressor_base_url": "",
             "compressor_api_key": "",
             "compressor_provider": "",
@@ -122,5 +122,5 @@ class TestSwitchModelReasoningOverride:
 
         result = restore_primary_runtime(agent)
         assert result is True
-        assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
+        assert agent.reasoning_config == {"enabled": False}
 

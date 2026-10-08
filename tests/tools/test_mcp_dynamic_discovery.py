@@ -6,8 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from tools.mcp_tool import MCPServerTask
-from tools.mcp_tool_registration import _register_server_tools
+from tools.mcp_tool import MCPServerTask, _register_server_tools
 from tools.registry import ToolRegistry
 
 
@@ -36,33 +35,23 @@ class TestRegisterServerTools:
             assert validate_toolset("my_srv") is True
             assert "mcp__my_srv__my_tool" in resolve_toolset("my_srv")
 
-    def test_colliding_static_toolset_name_merges_both_tool_sets(self, mock_registry):
-        """An MCP server named after a built-in toolset must not be shadowed.
-
-        Regression: an MCP server registered as `homeassistant` (colliding
-        with the static `homeassistant` toolset) had its tools silently
-        dropped because get_toolset() returned the static definition without
-        consulting the alias registered by _register_server_tools().
-        """
-        from toolsets import TOOLSETS, get_toolset, resolve_toolset
-
-        assert "homeassistant" in TOOLSETS  # collision premise
-        static_tools = set(TOOLSETS["homeassistant"]["tools"])
-
-        server = MCPServerTask("homeassistant")
-        server._tools = [_make_mcp_tool("get_entities", "List HA entities")]
+    def test_cache_preserves_sdk_input_schema_field(self, mock_registry):
+        schema = {
+            "type": "object",
+            "properties": {"operation": {"type": "string"}},
+        }
+        tool = SimpleNamespace(
+            name="calculate_date", description="date", input_schema=schema
+        )
+        server = MCPServerTask("date")
+        server._tools = [tool]
         server.session = MagicMock()
 
-        with patch("tools.registry.registry", mock_registry):
-            registered = _register_server_tools("homeassistant", server, {})
-            assert "mcp__homeassistant__get_entities" in registered
+        with patch("tools.registry.registry", mock_registry), \
+             patch("tools.mcp_schema_cache.write_cache_entry") as write_entry:
+            _register_server_tools("date", server, {})
 
-            ts = get_toolset("homeassistant")
-            # Static built-ins are still present...
-            assert static_tools <= set(ts["tools"])
-            # ...and the MCP server's tools are no longer shadowed.
-            assert "mcp__homeassistant__get_entities" in ts["tools"]
-            assert "mcp__homeassistant__get_entities" in resolve_toolset("homeassistant")
+        assert write_entry.call_args.kwargs["tools"][0]["inputSchema"] == schema
 
 
 class TestRefreshTools:

@@ -19,6 +19,7 @@ import {
   SIDEBAR_SESSIONS_PAGE_SIZE
 } from '@/store/layout'
 import { messagingTotalsKey, normalizeProfileKey, sidebarProfileForScope } from '@/store/profile'
+import { $removedSessionIds } from '@/store/projects'
 import {
   $messagingSessions,
   $selectedStoredSessionId,
@@ -37,7 +38,6 @@ import {
   setSessions,
   setSessionsLoading
 } from '@/store/session'
-import { $removedSessionIds } from '@/store/session-removal'
 import { $sessionTiles, $workingSessionIds, getRecentlySettledSessionIds } from '@/store/session-states'
 
 import { refreshCronJobs as refreshCronJobsStore } from '../../cron/cron-actions'

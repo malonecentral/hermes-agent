@@ -21,11 +21,9 @@ import {
   ensureGatewayForAgent,
   ensureGatewayForProfile,
   openGatewayForAgent,
-  openGatewayForProfile,
-  openSecondaryCount
+  openGatewayForProfile
 } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
-import { $poolLimits } from '@/store/pool-limits'
 import { notifyRemoteOverrideAuthFailure } from '@/store/profile-remote-override'
 import { clearComposerSelectionOwner, setComposerSelectionOwner, setConnection } from '@/store/session'
 import type { SessionOwnerRoute } from '@/store/session-request-router'
@@ -319,14 +317,14 @@ function profilePickConnectionId(profile?: string): null | string {
  * the owner hint, the optimistic row and every later session-scoped RPC name
  * the same registry entry. A legacy profile-only activation yields null.
  */
-export function resolveNewChatOwnerRoute(forProfile?: string): AgentProfileRoute | null {
+export function resolveNewChatOwnerRoute(): AgentProfileRoute | null {
   const explicit = $newChatRoute.get()
 
-  if (explicit && (!forProfile || normalizeProfileKey(explicit.profile) === normalizeProfileKey(forProfile))) {
+  if (explicit) {
     return explicit
   }
 
-  const intentProfile = forProfile ? normalizeProfileKey(forProfile) : $newChatProfile.get()
+  const intentProfile = $newChatProfile.get()
 
   const connectionId = (
     (intentProfile
@@ -422,17 +420,6 @@ export function prewarmProfileBackend(name: string): void {
   const now = Date.now()
 
   if (now - (prewarmedAt.get(key) ?? 0) < PREWARM_MIN_INTERVAL_MS) {
-    return
-  }
-
-  // Prewarm/cap harmony (#91545): the pool caps spawned backends at the
-  // configured max, and a spawn over the cap LRU-evicts the warmest idle
-  // backend. A hover sweep across the rail therefore evicted backends for
-  // profiles the user was about to click — prewarming caused the exact churn
-  // it exists to prevent. Skip speculative spawns once every pool slot is
-  // occupied by an open socket; the real click still spawns on demand, it
-  // just doesn't get a head start.
-  if (openSecondaryCount() + 1 > $poolLimits.get().maxBackends) {
     return
   }
 
@@ -603,10 +590,7 @@ export async function openGatewayAgent(connectionId: string, profile: string): P
     return
   }
 
-  await openGatewayForAgent(connection, normalizeProfileKey(profile), {
-    activationLease: true,
-    spawnPriority: 'foreground'
-  })
+  await openGatewayForAgent(connection, normalizeProfileKey(profile), { activationLease: true })
 }
 
 // Activate a connection-scoped agent's gateway — the (connectionId, profile)

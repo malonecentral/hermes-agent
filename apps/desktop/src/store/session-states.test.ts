@@ -320,7 +320,6 @@ describe('SessionTile workspace scope', () => {
 
     $selectedStoredSessionId.set('bot-chat')
     openSessionTile('bot-chat', 'center', undefined, undefined, scope)
-    $layoutTree.set(group(['workspace', tilePane('bot-chat')], { active: 'workspace', id: 'main' }))
 
     expect($sessionTiles.get()).toEqual([
       expect.objectContaining({
@@ -336,9 +335,10 @@ describe('SessionTile workspace scope', () => {
     // The tile was opened when seg-2 was the tip; the conversation has since
     // rotated to seg-3 (projected row carries the full chain). Opening the
     // new tip must front that tile, not open the same chat twice.
-    setSessions([{ _lineage_ids: ['seg-1', 'seg-2', 'seg-3'], _lineage_root_id: 'seg-1', id: 'seg-3' } as never])
+    setSessions([
+      { _lineage_ids: ['seg-1', 'seg-2', 'seg-3'], _lineage_root_id: 'seg-1', id: 'seg-3' } as never
+    ])
     openSessionTile('seg-2')
-    $layoutTree.set(group(['workspace', tilePane('seg-2')], { active: 'workspace', id: 'main' }))
 
     expect(focusOpenSession('seg-3')).toBe('tile')
     expect($sessionTiles.get().map(t => t.storedSessionId)).toEqual(['seg-2'])
@@ -489,7 +489,6 @@ describe('focusWorkspaceOwnerSessionTile', () => {
     openSessionTile('thread', 'center', 'workspace', undefined, botA)
     rememberActivePane(workspaceScopeKey('bots', 'bot:a'), tilePane('closed-bot-chat'))
     $sessionTiles.set($sessionTiles.get().filter(t => t.storedSessionId !== 'closed-bot-chat'))
-    $layoutTree.set(group(['workspace', tilePane('thread')], { active: 'workspace', id: 'main' }))
 
     expect(focusWorkspaceOwnerSessionTile('bot:a')).toBe('thread')
   })
@@ -536,7 +535,6 @@ describe('focusWorkspaceOwnerSessionTile', () => {
 
     it('a throwing probe keeps the tile — reconciliation must not break the click', () => {
       openSessionTile('bot-chat', 'center', 'workspace', undefined, botA)
-      $layoutTree.set(group(['workspace', tilePane('bot-chat')], { active: 'workspace', id: 'main' }))
 
       expect(
         focusWorkspaceOwnerSessionTile('bot:a', () => {
@@ -546,9 +544,8 @@ describe('focusWorkspaceOwnerSessionTile', () => {
       expect($sessionTiles.get().map(t => t.storedSessionId)).toEqual(['bot-chat'])
     })
 
-    it('fronts a visible tile without a probe', () => {
+    it('no probe keeps the old behavior byte for byte', () => {
       openSessionTile('bot-chat', 'center', 'workspace', undefined, botA)
-      $layoutTree.set(group(['workspace', tilePane('bot-chat')], { active: 'workspace', id: 'main' }))
 
       expect(focusWorkspaceOwnerSessionTile('bot:a')).toBe('bot-chat')
       expect($sessionTiles.get().map(t => t.storedSessionId)).toEqual(['bot-chat'])
@@ -1038,7 +1035,7 @@ describe('$focusedStoredSessionId in Bot Mode (#96062)', () => {
     expect($focusedStoredSessionId.get()).toBeNull()
   })
 
-  it('sessions-sidebar focus follows the visible main tab instead of a hidden primary selection', () => {
+  it('sessions mode keeps collapsing to the primary selection (derivation gated to Bot Mode)', () => {
     $selectedStoredSessionId.set('primary-1')
     $layoutTree.set(
       split('row', [
@@ -1048,8 +1045,10 @@ describe('$focusedStoredSessionId in Bot Mode (#96062)', () => {
     )
     noteActiveTreeGroup('grp-sessions')
 
+    // The main-zone tile must NOT answer here: in sessions mode the sidebar
+    // highlight follows the primary selection exactly as it always has.
     expect($workspaceMode.get()).toBe('sessions')
-    expect($focusedStoredSessionId.get()).toBe('stacked')
+    expect($focusedStoredSessionId.get()).toBe('primary-1')
   })
 })
 

@@ -18,8 +18,6 @@ export type ChatMessage = {
   id: string
   role: SessionMessage['role']
   parts: ChatMessagePart[]
-  /** Result body only; the system text remains the compact completion label. */
-  asyncResult?: string
   timestamp?: number
   completedAt?: number
   pending?: boolean
@@ -117,13 +115,6 @@ export type GatewayEventPayload = {
   // secret.request (skill credential capture)
   env_var?: string
   prompt?: string
-  // vault.unlock.request (external password-manager unlock)
-  backend?: string
-  display_name?: string
-  /** vault.save_login.request / vault.code.request */
-  origin?: string
-  site?: string
-  hint?: string
   // terminal.read.request / preview.read.request (GUI agent reading the
   // in-app terminal pane or the browser/preview pane)
   start?: number

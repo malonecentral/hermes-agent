@@ -3,12 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { clearAllPrompts, setApprovalRequest } from '@/store/prompts'
 import { $activeSessionId } from '@/store/session'
-import {
-  onScrollToBottomRequest,
-  publishThreadMessagesBelow,
-  resetThreadScroll,
-  setThreadAtBottom
-} from '@/store/thread-scroll'
+import { onScrollToBottomRequest, resetThreadScroll, setThreadAtBottom } from '@/store/thread-scroll'
 
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
 
@@ -33,12 +28,11 @@ describe('ScrollToBottomButton', () => {
     expect(screen.queryByRole('button')).toBeNull()
   })
 
-  it('shows the messages below the viewport when scrolled up with no approval', () => {
+  it('is a plain jump-to-bottom control when scrolled up with no approval', () => {
     setThreadAtBottom(false)
-    publishThreadMessagesBelow(12, { paneVisible: true })
     render(<ScrollToBottomButton sessionId={null} />)
 
-    expect(screen.getByRole('button', { name: 'Scroll to bottom · 12 messages' }).textContent).toBe('12 messages')
+    expect(screen.getByRole('button', { name: 'Scroll to bottom' })).toBeTruthy()
     expect(screen.queryByText('Approval needed')).toBeNull()
   })
 

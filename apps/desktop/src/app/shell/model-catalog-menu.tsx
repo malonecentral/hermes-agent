@@ -21,10 +21,10 @@ import { Skeleton } from '@/components/ui/skeleton'
 import type { HermesGateway } from '@/hermes'
 import { getLocalModelsStatus } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { catalogProviderMatches, modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
+import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { displayModelName, modelDisplayParts } from '@/lib/model-status-label'
 import { DEFAULT_REASONING_EFFORT, reasoningEffortLabel } from '@/lib/reasoning-effort'
-import { foldIncludes, normalize } from '@/lib/text'
+import { normalize } from '@/lib/text'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { $localModelsEnabled } from '@/store/local-models-flag'
@@ -43,6 +43,14 @@ import { $defaultReasoningEffort } from '@/store/session'
 import type { LocalModelLoadProgress, ModelOptionProvider, ModelOptionsResponse } from '@/types/hermes'
 
 import { type FastControl, ModelEditSubmenu, resolveFastControl } from './model-edit-submenu'
+
+/** Whether a catalog row represents the session's current provider. Custom
+ *  providers report the canonical `custom:<key>` identity from `model.options`
+ *  while the row's slug is the bare config key, so exact slug equality never
+ *  matches — check the row's alias set too (#87035). */
+function isCurrentProvider(provider: ModelOptionProvider, currentProvider: string): boolean {
+  return provider.slug === currentProvider || (provider.aliases?.includes(currentProvider) ?? false)
+}
 
 // Lets the host dropdown (model-pill, a kanban field trigger, …) hand the panel
 // a way to dismiss itself so clicking a model row commits + closes, while the
@@ -257,7 +265,7 @@ export function ModelCatalogMenu({
   // In-flight downloads render inside the Local provider group when it
   // exists, else as their own trailing 'Local' group (first download —
   // nothing staged yet, so the catalog has no local provider row).
-  const shownDownloads = q ? downloads.filter(job => foldIncludes(job.target || '', q)) : downloads
+  const shownDownloads = q ? downloads.filter(job => (job.target || '').toLowerCase().includes(q)) : downloads
   const hasLocalGroup = pickerProviders.some(provider => provider.slug === LOCAL_PROVIDER_SLUG)
 
   // Resolve visibility HERE, against the catalog we actually fetched: an empty
@@ -277,7 +285,7 @@ export function ModelCatalogMenu({
   // sitting under zero model matches would otherwise become the "first match"
   // Enter commits.
   const shownMoaPresets = useMemo(
-    () => (q ? moaPresets.filter(preset => foldIncludes(`moa ${preset}`, q)) : moaPresets),
+    () => (q ? moaPresets.filter(preset => `moa ${preset}`.toLowerCase().includes(q)) : moaPresets),
     [moaPresets, q]
   )
 
@@ -344,10 +352,14 @@ export function ModelCatalogMenu({
   const rowIsCurrent = (row: KbRow) =>
     row.kind === 'moa'
       ? current.provider === 'moa' && row.preset === current.model
-      : catalogProviderMatches(row.provider, current.provider) &&
+      : isCurrentProvider(row.provider, current.provider) &&
         (row.family.id === current.model || row.family.fastId === current.model)
 
-  const autoIndex = q ? (kbRows.length > 0 ? 0 : -1) : kbRows.findIndex(row => rowIsCurrent(row))
+  const autoIndex = q
+    ? kbRows.length > 0
+      ? 0
+      : -1
+    : kbRows.findIndex(row => rowIsCurrent(row) || (row.kind === 'family' && row.family.fastId === current.model))
 
   const kbIndex = kbOverride !== null && kbOverride < kbRows.length ? kbOverride : autoIndex
   const kbActiveKey = kbIndex >= 0 ? kbRows[kbIndex].key : null
@@ -375,7 +387,7 @@ export function ModelCatalogMenu({
       return
     }
 
-    if (!rowIsCurrent(row)) {
+    if (!rowIsCurrent(row) && row.family.fastId !== current.model) {
       void selectFamily(row.family, row.provider)
     }
 
@@ -469,7 +481,7 @@ export function ModelCatalogMenu({
                   textValue=""
                 >
                   <span className="truncate">
-                    <HighlightMatches foldSeparators query={search} text={group.provider.name} />
+                    <HighlightMatches query={search} text={group.provider.name} />
                   </span>
                   <DisclosureCaret
                     className="shrink-0 text-(--ui-text-tertiary) opacity-0 transition group-hover/label:opacity-100"
@@ -482,7 +494,7 @@ export function ModelCatalogMenu({
                     // The active id may be the base or its -fast sibling; either
                     // way this one family row represents both.
                     const activeId =
-                      catalogProviderMatches(group.provider, current.provider) &&
+                      isCurrentProvider(group.provider, current.provider) &&
                       (current.model === family.id || current.model === family.fastId)
                         ? current.model
                         : null
@@ -542,7 +554,7 @@ export function ModelCatalogMenu({
                           {...kbRowProps(`${group.provider.slug}:${family.id}`)}
                         >
                           <span className="min-w-0 flex-1 truncate">
-                            <HighlightMatches foldSeparators query={search} text={name} />
+                            <HighlightMatches query={search} text={name} />
                             {meta ? <span className="text-(--ui-text-tertiary)"> {meta}</span> : null}
                           </span>
                           {loadProgress ? (
@@ -628,7 +640,7 @@ export function ModelCatalogMenu({
                 {...kbRowProps(`moa:${preset}`)}
               >
                 <span className="min-w-0 flex-1 truncate">
-                  MoA: <HighlightMatches foldSeparators query={search} text={preset} />
+                  MoA: <HighlightMatches query={search} text={preset} />
                 </span>
                 {isCurrentMoa ? <Codicon className="ml-auto text-foreground" name="check" size="0.75rem" /> : null}
               </DropdownMenuItem>
@@ -717,10 +729,9 @@ function groupModels(
     }
 
     const matches = (family: ModelFamily) =>
-      foldIncludes(
-        `${family.id} ${family.fastId ?? ''} ${provider.name} ${provider.slug} ${displayModelName(family.id)}`,
-        q
-      )
+      `${family.id} ${family.fastId ?? ''} ${provider.name} ${provider.slug} ${displayModelName(family.id)}`
+        .toLowerCase()
+        .includes(q)
 
     let shown: Set<string>
 
@@ -740,7 +751,7 @@ function groupModels(
     // stable curated order, so selecting a model can't shuffle the list. While
     // SEARCHING the pin is skipped: a query means "show me matches".
     const activeId =
-      !q && catalogProviderMatches(provider, current.provider) && current.model
+      !q && isCurrentProvider(provider, current.provider) && current.model
         ? allFamilies.find(family => family.id === current.model || family.fastId === current.model)?.id
         : undefined
 

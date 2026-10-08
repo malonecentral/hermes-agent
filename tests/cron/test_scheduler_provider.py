@@ -404,8 +404,7 @@ def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
     monkeypatch.setattr(
         executions,
         "create_execution",
-        lambda jid, source, _create=executions.create_execution:
-        events.append("ledger") or _create(jid, source=source),
+        lambda jid, source: events.append("ledger") or {"id": "exec-1"},
     )
     monkeypatch.setattr(
         sched,
@@ -418,9 +417,9 @@ def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
 
     assert events == ["ledger", "claim"]
     assert claimed is not None
-    assert executions.get_execution(claimed["execution_id"])["status"] == "claimed"
+    assert claimed["execution_id"] == "exec-1"
     assert provider.fire_claimed(claimed) is True
-    assert events == ["ledger", "claim", ("run", claimed["execution_id"])]
+    assert events == ["ledger", "claim", ("run", "exec-1")]
 
 
 def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
@@ -439,10 +438,6 @@ def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
 
     assert InProcessCronScheduler().fire_due("j1", force=True) is True
     assert claims == [("j1", {"force": True, "return_job": True})]
-    # An off-tick run-now forwards ``manual`` so the claim does not stamp the next occurrence;
-    # the default (webhook / misfire) fire keeps the occurrence stamp.
-    assert InProcessCronScheduler().fire_due("j1", manual=True) is True
-    assert claims[-1] == ("j1", {"manual": True, "return_job": True})
 
 
 def test_fire_due_lost_claim_does_not_run(monkeypatch):

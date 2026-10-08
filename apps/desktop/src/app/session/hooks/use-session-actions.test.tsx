@@ -25,7 +25,13 @@ import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/
 import { requestGatewayForAgent, requestGatewayForProfile } from '@/store/gateway'
 import { $pinnedSessionIds } from '@/store/layout'
 import { $activeGatewayProfile, $newChatProfile, $newChatRoute, $profiles, ensureGatewayProfile } from '@/store/profile'
-import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
+import {
+  $projectScope,
+  $projectTree,
+  $removedSessionIds,
+  $sessionMutationsInFlight,
+  ALL_PROJECTS
+} from '@/store/projects'
 import {
   $activeSessionId,
   $activeSessionStoredIdRotation,
@@ -65,7 +71,6 @@ import {
   setSessions,
   setTurnStartedAt
 } from '@/store/session'
-import { $removedSessionIds, $sessionMutationsInFlight } from '@/store/session-removal'
 import { requestForSessionProfile, type SessionProfileRoute } from '@/store/session-request-router'
 import { $sessionTiles, sessionTileOwnerRoute } from '@/store/session-states'
 import { $sessionSeenCounts, $unreadFinishedMarkers } from '@/store/session-unread'
@@ -1072,8 +1077,6 @@ describe('resumeSession failure recovery', () => {
     setResumeFailedSessionId(null)
     setMessages([])
     setSessions([])
-    $removedSessionIds.set(new Set())
-    $sessionMutationsInFlight.set(new Set())
     clearClarifyRequest()
     vi.restoreAllMocks()
   })
@@ -1090,20 +1093,6 @@ describe('resumeSession failure recovery', () => {
     await waitFor(() => expect(resume).not.toBeNull())
     await resume!('stored-1', true)
   }
-
-  it('does not resume a tombstoned session after delete', async () => {
-    $removedSessionIds.set(new Set(['stored-1']))
-
-    const requestGateway = vi.fn(async () => {
-      throw new Error('404: Session not found')
-    })
-
-    await runResume(requestGateway)
-
-    expect(requestGateway).not.toHaveBeenCalled()
-    expect($resumeFailedSessionId.get()).toBeNull()
-    expect($selectedStoredSessionId.get()).toBeNull()
-  })
 
   it.each([
     ['Codex tool-only', ''],

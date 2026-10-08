@@ -205,7 +205,6 @@ export async function openSessionInNewWindow(sessionId: string, opts?: { watch?:
     import('./profile'),
     import('./session')
   ])
-
   const profile = normalizeProfileKey(rememberedSessionProfile($sessions.get(), sessionId, $activeGatewayProfile.get()))
 
   await runWindowOpen(

@@ -50,12 +50,36 @@ Config file: `$HERMES_HOME/supermemory.json`
 | `container_tag` | `hermes` | Container tag used for search and writes. Supports `{identity}` template for profile-scoped tags (e.g. `hermes-{identity}` → `hermes-coder`). |
 | `auto_recall` | `true` | Inject relevant memory context before turns |
 | `auto_capture` | `true` | Store cleaned user-assistant turns after each response |
-| `max_recall_results` | `10` | Max recalled items to format into context |
+| `temporal_filters_schema_v4_ready` | `false` | Request temporal filtering; it activates only when the local import receipt is schema v4, reconciled, has the expected backend count, and every eligible row is terminal `done`/v4 with zero failures or pending work. A v3 or incomplete receipt stays off. |
+| `context_char_budget` | `12000` | Maximum final memory-envelope characters; runtime context measurement may lower it. |
+| `context_byte_budget` | `24000` | Maximum UTF-8 bytes in the final memory envelope. Truncation is deterministic and preserves the envelope and authority labels. |
+| `reranker_input_token_budget` | `8192` | Measured Qwen reranker context. The request builder reserves 768 tokens for the runner template and bounds each query/document pair by UTF-8 bytes (safe for byte-fallback/pathological Unicode). This is independent of the final context budget. |
+| `max_recall_results` | `5` | Max recalled items to format into context (hard configuration clamp: 20); no authority-specific quota is applied. |
 | `profile_frequency` | `50` | Include profile facts on first turn and every N turns |
 | `capture_mode` | `all` | Skip tiny or trivial turns by default |
-| `search_mode` | `hybrid` | Search mode: `hybrid` (profile + memories), `memories` (memories only), `documents` (documents only) |
+| `search_mode` | `hybrid` | Conversation search mode: `hybrid`, `memories`, or `documents`. |
+| `canonical_document_search_mode` | `documents` | Canonical retrieval uses `/v4/search` in document-only mode; other values normalize to `documents`. Independent of conversation search. |
 | `entity_context` | built-in default | Extraction guidance passed to Supermemory |
 | `api_timeout` | `5.0` | Timeout for SDK and ingest requests |
+| `owner_canonical_container` | `owner_primary` | Validated Owner canonical-document topology tag. Contract-only in A1; current retrieval behavior is unchanged. |
+| `owner_explicit_container` | `owner_primary` | Validated Owner explicit-memory topology tag. Contract-only in A1. |
+| `family_shared_container` | `family_shared` | Validated Family Shared canonical-document topology tag. Contract-only in A1. |
+| `owner_conversation_container` | `owner_conversations` | Validated Owner conversation topology tag. Contract-only in A1. |
+| `routing_projection_enabled` | `false` | A2 feature flag. When enabled, retrieval uses the validated projected containers below; when disabled, the legacy routing path is unchanged. |
+| `requester_conversation_projection` | `false` | Enables requester-specific Family conversation routing when trusted identity projection and a namespace key are configured. |
+| `requester_conversation_capture` | `false` | Reserved compatibility flag; the plugin always forces it off. Family requester conversation capture is owned by the private executor. |
+| `requester_identity_server` | empty | MCP server name whose request-local `jarvisRequester.person_id` projection is supplied by the authenticated registry integration. Display names and local registry files are never accepted. |
+| `requester_conversation_namespace_key` | empty | At least 32 UTF-8 bytes used as the HMAC-SHA256 namespace key for opaque stable container tags. Keep `$HERMES_HOME/supermemory.json` owner-only. Missing/invalid keys disable the capability. |
+
+With `routing_projection_enabled: true`, Owner recall independently queries the
+projected private-canonical, Family Shared canonical, explicit-memory, and Owner
+conversation containers. Only rows validated against the container queried and
+their expected source shape enter the common Qwen reranker. Explicit memories
+remain non-authoritative and are admitted after scoring only when they clear the
+same post-Qwen relevance threshold as other noncanonical evidence and carry
+locally assigned `explicit_memory` provenance; provider response text or
+metadata cannot create that trust. Family projected recall remains canonical
+Family Shared plus an optional authenticated requester-conversation projection.
 
 ### Environment Variables
 
@@ -93,6 +117,8 @@ Supermemory app, so you can filter, browse, and bulk-manage them per source agen
 When enabled, Hermes can:
 
 - prefetch relevant memory context before each turn
+- retrieve up to 20 candidates independently per authorized source. Legacy routing searches two canonical containers plus Owner conversation (at most 60 candidates). A2 projected routing additionally searches the explicit-memory container (at most 80 candidates). After source-shape, provenance, ACL, entity, temporal, and deduplication guards, one Qwen request scores the full eligible pool. The existing single-candidate bypass, Qwen score behavior, `max_recall_results`, and final context byte/character budgets are preserved.
+- emit structured `supermemory_stage` receipts containing stage names, outcomes, counts, limits, and durations; receipts contain no queries, content, credentials, or source/requester/session identifiers.
 - buffer the full conversation and ingest it as **one session** at session end (or on `/reset`, branch, compression, or shutdown)
 - ingest the full session to the conversations endpoint for richer profile/graph updates
 - route every SDK, probe, and conversation-ingest request through the configured hosted or self-hosted endpoint

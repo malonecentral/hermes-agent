@@ -57,12 +57,11 @@ describe('statusbar item visibility', () => {
       item('gateway-health', 'Gateway')
     ])
 
-    for (const label of ['Cron', 'Webhooks', 'Agents', 'Terminal']) {
+    for (const label of ['Cron', 'Webhooks', 'Agents', 'Terminal', 'Approvals']) {
       expect(screen.queryByText(label)).toBeNull()
     }
 
     expect(screen.getByText('Gateway')).toBeTruthy()
-    expect(screen.getByText('Approvals')).toBeTruthy()
   })
 
   it('shows an item once the user enables it from the bar context menu', async () => {

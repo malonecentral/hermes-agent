@@ -230,9 +230,7 @@ export function PetTab({ image, onImage }: PetTabProps) {
           className="overflow-y-auto"
           onScroll={onScroll}
           style={{
-            // Leave room for the selection ring outside boundary tiles.
-            maxHeight: 220,
-            padding: 2
+            maxHeight: 220
           }}
         >
           <div className="grid grid-cols-3 gap-1.5">

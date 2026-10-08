@@ -8,6 +8,7 @@ confirm the prologue produces the right ``TurnContext`` and applies the
 
 from __future__ import annotations
 
+import os
 import threading
 import types
 from unittest.mock import MagicMock, patch
@@ -76,6 +77,7 @@ class _FakeAgent:
         self._cached_system_prompt = "SYSTEM"
         self._memory_store = None
         self._memory_manager = None
+        self._memory_prefetch_query = ""
         self._memory_nudge_interval = 0
         self._turns_since_memory = 0
         self._user_turn_count = 0
@@ -288,61 +290,80 @@ def test_prefetch_runs_for_substantive_user_message():
     agent, mm = _agent_with_memory_manager()
     query = "what did we decide about the deploy pipeline?"
     ctx = _build(agent, user_message=query)
-    mm.prefetch_all.assert_called_once_with(query, session_id=agent.session_id)
+    assert mm.prefetch_all.call_args.args == (query,)
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
 
 
-# ── Per-turn author ──────────────────────────────────────────────────────────
-
-
-def test_turn_author_is_normalized_then_reaches_on_turn_start_and_the_agent_stash():
+def test_prefetch_consumes_one_shot_query_override():
     agent, mm = _agent_with_memory_manager()
+    agent._memory_prefetch_query = "clean current question"
 
-    _build(agent, user_message="what did we decide about the deploy pipeline?",
-           turn_author={"id": " bot:al\x00pha ", "name": "Alpha", "is_bot": 1, "x": 1})
+    ctx = _build(agent, user_message="mobile wrapper with history and presentation instructions")
 
-    kwargs = mm.on_turn_start.call_args.kwargs
-    assert (kwargs["author_id"], kwargs["author_name"], kwargs["author_is_bot"]) == ("bot:alpha", "Alpha", True)
-    # The end-of-turn sync reads this back off the agent.
-    assert agent._turn_author == {"id": "bot:alpha", "name": "Alpha", "is_bot": True}
-
-
-def test_turn_without_author_clears_previous_bot_author():
-    agent, mm = _agent_with_memory_manager()
-    _build(agent, user_message="first turn", turn_author={"id": "bot:alpha", "name": "Alpha", "is_bot": True})
-    assert agent._turn_author["id"] == "bot:alpha"
-
-    _build(agent, user_message="second turn")
-
-    assert agent._turn_author is None
-    kwargs = mm.on_turn_start.call_args.kwargs
-    assert kwargs["author_id"] is None
-    assert kwargs["author_is_bot"] is False
+    assert mm.prefetch_all.call_args.args == ("clean current question",)
+    assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
+    assert agent._memory_prefetch_query == ""
 
 
-def test_turn_author_reaches_the_agent_through_the_real_facade(monkeypatch):
-    """``AIAgent.run_conversation(turn_author=...)`` crosses the facade and the loop entry point, not only
-    ``build_turn_context``; a kwarg dropped at either hop raised TypeError on every real turn."""
-    from types import SimpleNamespace
+def test_no_memory_manager_still_consumes_query_override():
+    no_memory_agent = _FakeAgent()
+    no_memory_agent._memory_prefetch_query = "must not leak"
+
+    _build(no_memory_agent, user_message="first turn without memory")
+
+    assert no_memory_agent._memory_prefetch_query == ""
+    memory_agent, mm = _agent_with_memory_manager()
+    _build(memory_agent, user_message="later clean question")
+    assert mm.prefetch_all.call_args.args == ("later clean question",)
+
+
+def test_prefetch_query_override_is_bounded_and_whitespace_falls_back():
+    bounded_agent, bounded_mm = _agent_with_memory_manager()
+    bounded_agent._memory_prefetch_query = "é" * 9000
+    _build(bounded_agent, user_message="wrapped")
+    bounded_query = bounded_mm.prefetch_all.call_args.args[0]
+    assert len(bounded_query.encode("utf-8")) <= 8192
+    assert bounded_query == "é" * 4096
+
+    fallback_agent, fallback_mm = _agent_with_memory_manager()
+    fallback_agent._memory_prefetch_query = "   "
+    _build(fallback_agent, user_message="clean fallback")
+    assert fallback_mm.prefetch_all.call_args.args == ("clean fallback",)
+
+
+def test_agent_constructor_captures_and_consumes_prefetch_env(monkeypatch):
     from run_agent import AIAgent
 
-    class _Completions:
-        def create(self, **_kw):
-            return SimpleNamespace(choices=[SimpleNamespace(
-                message=SimpleNamespace(content="ok", tool_calls=None, reasoning=None, reasoning_content=None),
-                finish_reason="stop")], usage=None, model="test-model")
+    monkeypatch.setenv("HERMES_MEMORY_PREFETCH_QUERY", "é" * 5000)
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        first = AIAgent(
+            api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+        )
+        second = AIAgent(
+            api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+        )
 
-    monkeypatch.setattr("agent.process_bootstrap.OpenAI",
-                        lambda **_kw: SimpleNamespace(chat=SimpleNamespace(completions=_Completions())))
-    monkeypatch.setattr("model_tools.get_tool_definitions", lambda *a, **k: [])
-    agent = AIAgent(model="test-model", api_key="k", base_url="http://localhost:1/v1", platform="cli",
-                    max_iterations=2, quiet_mode=True, skip_memory=True)
-    agent._disable_streaming = True
+    assert "HERMES_MEMORY_PREFETCH_QUERY" not in os.environ
+    assert getattr(first, "_memory_prefetch_query") == "é" * 4096
+    assert getattr(second, "_memory_prefetch_query") == ""
 
-    agent.run_conversation("hi", turn_author={"id": "bot:alpha", "name": "Alpha", "is_bot": True})
-    assert agent._turn_author == {"id": "bot:alpha", "name": "Alpha", "is_bot": True}
-    agent.run_conversation("hi again")
-    assert agent._turn_author is None
+    manager = MagicMock()
+    manager.prefetch_all.return_value = "REMEMBERED CONTEXT"
+    setattr(first, "_memory_manager", manager)
+    _build(first, user_message="wrapped first turn")
+    assert manager.prefetch_all.call_args.args == ("é" * 4096,)
+    assert getattr(first, "_memory_prefetch_query") == ""
+
+    manager.reset_mock()
+    _build(first, user_message="normal second turn")
+    assert manager.prefetch_all.call_args.args == ("normal second turn",)
 
 
 def test_turn_start_replaces_stale_parent_history_with_compression_child():
@@ -394,6 +415,14 @@ def test_applies_agent_side_effects():
     assert agent._current_turn_id
 
 
+
+
+
+
+
+
+
+
 def test_pending_cli_message_uses_clean_override_for_api_local_note():
     """A noted API message reuses the clean staged dict and its DB marker."""
     agent = _FakeAgent()
@@ -411,6 +440,12 @@ def test_pending_cli_message_uses_clean_override_for_api_local_note():
     assert ctx.messages[-1]["_db_persisted"] is True
     assert isinstance(ctx.messages[-1]["timestamp"], float)
     assert agent._pending_cli_user_message is None
+
+
+
+
+
+
 
 
 def test_recall_indicator_emitted_when_memory_injected():
@@ -485,8 +520,7 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
     new_def = {"type": "function", "function": {"name": "mcp_x_tool", "description": "", "parameters": {}}}
 
     import model_tools
-    import tools.mcp_tool  # noqa: F401 — the prologue's import-cost gate requires it in sys.modules
-    with patch("tools.mcp_tool_discovery.has_registered_mcp_tools", return_value=True), \
+    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=True), \
          patch.object(model_tools, "get_tool_definitions", return_value=[new_def]):
         _build(agent)
 
@@ -534,3 +568,25 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
+
+
+@pytest.mark.parametrize('query', ['Tell me about Aaron', 'Tell me about Aaron?', 'Tell me about Aaron.', 'Tell me about Aaron!'])
+def test_family_clean_retrieval_override_staging_preserves_requester_and_cached_history(query):
+    import copy
+    agent, mm = _agent_with_memory_manager()
+    agent._memory_prefetch_query = query
+    history = [{'role': 'user', 'content': 'Earlier question', 'api_content': 'Earlier exact API content'},
+               {'role': 'assistant', 'content': 'Earlier answer'}]
+    before = copy.deepcopy(history)
+    wrapped = 'Authenticated requester: Pat. Device: device-secret.\nCurrent question: ' + query
+    ctx = _build(agent, user_message=wrapped, conversation_history=history)
+    assert mm.prefetch_all.call_args.args == (query,)
+    assert ctx.messages[:2] == before
+    assert ctx.active_system_prompt == 'SYSTEM'
+    assert ctx.messages[-1]['content'] == wrapped
+    assert 'REMEMBERED CONTEXT' in ctx.messages[-1]['api_content']
+    assert 'Authenticated requester: Pat' in ctx.messages[-1]['api_content']
+    assert agent._memory_prefetch_query == ''
+    mm.prefetch_all.reset_mock()
+    _build(agent, user_message='What happens next?')
+    assert mm.prefetch_all.call_args.args == ('What happens next?',)

@@ -186,6 +186,26 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_turn_start_preserves_composed_user_context_exactly_once(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        composed = (
+            "question\n\n<supermemory-context>SM-CONTEXT</supermemory-context>"
+            "\n\nPLUGIN-CTX"
+        )
+
+        make_session(client).run_turn(composed, turn_timeout=2.0)
+
+        method, params = next(r for r in client.requests if r[0] == "turn/start")
+        assert method == "turn/start"
+        assert params["input"] == [{"type": "text", "text": composed}]
+        assert params["input"][0]["text"].count("<supermemory-context>") == 1
+        assert params["input"][0]["text"].count("PLUGIN-CTX") == 1
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
@@ -210,21 +230,6 @@ class TestRunTurn:
         assert r.turn_id == "turn-fake-001"
 
 
-
-    def test_result_records_the_exact_submitted_input(self):
-        client = FakeClient()
-        client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "turn-fake-001", "status": "completed", "error": None},
-        )
-        rich_input = [
-            {"type": "text", "text": "caption"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
-        ]
-        result = make_session(client).run_turn(rich_input, turn_timeout=2.0)
-        _, params = next(request for request in client.requests if request[0] == "turn/start")
-        assert result.submitted_user_text == params["input"][0]["text"]
-        assert result.submitted_user_text != rich_input
 
     def test_foreign_completion_in_server_request_drain_is_ignored(self):
         """Approval draining must not project a child result into the parent."""

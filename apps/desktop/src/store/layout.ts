@@ -40,7 +40,6 @@ const SIDEBAR_ALL_PROFILES_AGENTS_GROUPED_STORAGE_KEY = 'hermes.desktop.sidebarA
 const SIDEBAR_SORT_KEY_STORAGE_KEY = 'hermes.desktop.sidebarSortKey'
 const SIDEBAR_ROW_META_STORAGE_KEY = 'hermes.desktop.sidebarRowMeta'
 const SIDEBAR_CARD_ROWS_STORAGE_KEY = 'hermes.desktop.sidebarCardRows'
-const SIDEBAR_SHOW_ALL_SESSIONS_STORAGE_KEY = 'hermes.desktop.sidebarShowAllSessions'
 const SIDEBAR_STATUS_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarStatusFilter'
 const SIDEBAR_SHOW_ARCHIVED_STORAGE_KEY = 'hermes.desktop.sidebarShowArchived'
 const SIDEBAR_PROJECT_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarProjectFilter'
@@ -207,9 +206,6 @@ export const $dismissedWorktreeIds = persistentAtom(
   [] as string[],
   Codecs.stringArray
 )
-// Only successful git removals may reappear on discovery. Explicit hides,
-// including legacy dismissals without provenance, remain hidden.
-export const $removedWorktreeIds = persistentAtom('hermes.desktop.removedWorktrees', [] as string[], Codecs.stringArray)
 export const $sidebarPinsOpen = atom(true)
 export const $sidebarRecentsOpen = atom(true)
 // Cron-job sessions live in their own section below recents, collapsed by
@@ -321,13 +317,6 @@ export const $sidebarRowMeta = persistentAtom<SidebarRowMeta[]>(
  *  grouping is active. Off by default; dense tree surfaces never use it. */
 export const $sidebarCardRows = persistentAtom(SIDEBAR_CARD_ROWS_STORAGE_KEY, false, Codecs.bool)
 
-/** Project overview: two complete recency groups instead of three preview rows. */
-export const $sidebarShowAllSessions = persistentAtom(SIDEBAR_SHOW_ALL_SESSIONS_STORAGE_KEY, false, Codecs.bool)
-
-export function setSidebarShowAllSessions(on: boolean) {
-  $sidebarShowAllSessions.set(on)
-}
-
 export function setSidebarCardRows(on: boolean) {
   $sidebarCardRows.set(on)
 }
@@ -395,20 +384,12 @@ export const $sidebarFiltersActive: ReadableAtom<boolean> = computed(
  *  offering. Broader than `$sidebarFiltersActive`, which only knows about what
  *  hides rows, not about how they're grouped, sorted or labelled. */
 export const $sidebarViewCustomized: ReadableAtom<boolean> = computed(
-  [
-    $sidebarGrouping,
-    $sidebarOrdering,
-    $sidebarRowMeta,
-    $sidebarCardRows,
-    $sidebarShowAllSessions,
-    $sidebarFiltersActive
-  ],
-  (grouping, ordering, rowMeta, cardRows, showAllSessions, filtersActive) =>
+  [$sidebarGrouping, $sidebarOrdering, $sidebarRowMeta, $sidebarCardRows, $sidebarFiltersActive],
+  (grouping, ordering, rowMeta, cardRows, filtersActive) =>
     grouping !== SIDEBAR_DEFAULT_GROUPING ||
     ordering !== SIDEBAR_DEFAULT_ORDERING ||
     !sameRowMeta(rowMeta, SIDEBAR_DEFAULT_ROW_META) ||
     cardRows ||
-    showAllSessions ||
     filtersActive
 )
 
@@ -486,9 +467,8 @@ export function filterVisibleProjects<T extends { id: string; isAuto?: boolean }
   return projects.filter(project => !(project.isAuto && dismissed.has(project.id)))
 }
 
-export function dismissWorktree(id: string, { removed = false }: { removed?: boolean } = {}): void {
-  const removedIds = $removedWorktreeIds.get().filter(worktreeId => worktreeId !== id)
-  $removedWorktreeIds.set(removed ? [...removedIds, id] : removedIds)
+// Hide a worktree row after it's been removed via git.
+export function dismissWorktree(id: string): void {
   const current = $dismissedWorktreeIds.get()
 
   if (!current.includes(id)) {
@@ -499,7 +479,6 @@ export function dismissWorktree(id: string, { removed = false }: { removed?: boo
 // A hidden worktree becomes visible again as soon as the user explicitly starts
 // or opens work there (for example, selecting an already-checked-out branch).
 export function restoreWorktree(id: string): void {
-  $removedWorktreeIds.set($removedWorktreeIds.get().filter(worktreeId => worktreeId !== id))
   const current = $dismissedWorktreeIds.get()
 
   if (current.includes(id)) {
@@ -712,7 +691,6 @@ export function resetSidebarView() {
   setSidebarOrdering(SIDEBAR_DEFAULT_ORDERING)
   $sidebarRowMeta.set(SIDEBAR_DEFAULT_ROW_META)
   $sidebarCardRows.set(false)
-  $sidebarShowAllSessions.set(false)
   clearSidebarFilters()
 }
 
