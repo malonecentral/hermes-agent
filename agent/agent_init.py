@@ -2523,6 +2523,22 @@ def init_agent(
         if not isinstance(_custom_providers, list):
             _custom_providers = []
 
+    # A route's context window is never an output allowance. Clamp a caller
+    # that supplied the context size as ``max_tokens`` to the selected custom
+    # provider's registered response ceiling, while preserving smaller caps.
+    try:
+        from hermes_cli.config import get_custom_provider_max_output_tokens
+
+        _route_output_cap = get_custom_provider_max_output_tokens(
+            agent.model, agent.base_url, custom_providers=_custom_providers
+        )
+        if _route_output_cap is not None and (
+            agent.max_tokens is None or agent.max_tokens > _route_output_cap
+        ):
+            agent.max_tokens = _route_output_cap
+    except Exception:
+        pass
+
     # ``model.context_length`` describes the configured default model. A
     # process launched directly with ``--model`` / ``-m`` has already replaced
     # ``agent.model`` before this initializer loads config, so carrying the

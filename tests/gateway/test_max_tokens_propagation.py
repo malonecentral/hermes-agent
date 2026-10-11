@@ -95,3 +95,49 @@ def test_per_provider_max_output_tokens_fallback(isolated_home):
     assert kw["max_tokens"] == 12000
 
 
+def test_selected_custom_provider_cap_is_not_its_context_window(isolated_home):
+    """The selected route retains its response cap beside a larger context."""
+    write_cfg, fresh_gateway = isolated_home
+    write_cfg(
+        """
+        model:
+          default: jarvis-regular
+          provider: mcllm
+        providers:
+          mcllm:
+            api: http://localhost:18081/v1
+            api_key: sk-test
+            default_model: jarvis-regular
+            context_length: 65536
+            max_output_tokens: 8192
+            models:
+              jarvis-regular:
+                context_length: 65536
+        """
+    )
+    grun = fresh_gateway()
+    runtime = grun._resolve_runtime_agent_kwargs_for_provider("mcllm")
+    assert runtime["max_tokens"] == 8192
+
+    from run_agent import AIAgent
+
+    agent = AIAgent(
+        model="jarvis-regular",
+        max_tokens=65536,
+        api_key=runtime["api_key"],
+        base_url=runtime["base_url"],
+        provider=runtime["provider"],
+        requested_provider="mcllm",
+        api_mode=runtime["api_mode"],
+        enabled_toolsets=[],
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    wire = agent._build_api_kwargs(
+        [{"role": "user", "content": "short safe test"}], tools_for_api=[]
+    )
+    assert agent.max_tokens == 8192
+    assert wire["max_tokens"] == 8192
+
+

@@ -2197,6 +2197,46 @@ def get_custom_provider_context_length(
     return None
 
 
+def get_custom_provider_max_output_tokens(
+    model: str,
+    base_url: str,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[int]:
+    """Return the configured output ceiling for the selected custom route."""
+    if not model or not base_url:
+        return None
+    if custom_providers is None:
+        try:
+            custom_providers = get_compatible_custom_providers(config)
+        except Exception:
+            if config is None:
+                return None
+            raw = config.get("custom_providers")
+            custom_providers = raw if isinstance(raw, list) else []
+    if not isinstance(custom_providers, list):
+        return None
+    target_url = normalize_route_base_url(base_url)
+    if not target_url:
+        return None
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        if normalize_route_base_url(entry.get("base_url")) != target_url:
+            continue
+        # The provider ceiling applies to every alias served by this route.
+        # A gateway's public alias need not be repeated in the provider's
+        # concrete-model catalogue, so model membership is not a gate here.
+        for key in ("max_output_tokens", "max_tokens"):
+            try:
+                value = int(entry.get(key))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+    return None
+
+
 def get_custom_provider_model_capability(
     model: str,
     base_url: str,
