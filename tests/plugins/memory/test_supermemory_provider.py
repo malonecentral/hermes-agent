@@ -2101,6 +2101,43 @@ def test_owner_primary_routes_automatic_capture_to_conversations(monkeypatch, tm
     assert call["metadata"]["authority"] == "non-authoritative"
 
 
+def test_owner_capture_skips_tool_using_engineering_turns(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({"container_tag": "owner_primary", "auto_capture": True}, str(tmp_path))
+    p = SupermemoryMemoryProvider()
+    p.initialize("owner-session", hermes_home=str(tmp_path), platform="cli")
+    marker = (
+        "\n\n[Recent voice conversation, for context only. Do just the request above: "
+        "earlier requests marked \"handled separately\" were passed on before.]\n"
+        "Assistant: tool_calls ran the deploy.\n"
+    )
+    p.sync_turn(
+        "The patio lights should stay at forty percent." + marker,
+        "Done.",
+        session_id="owner-session",
+        messages=[
+            {"role": "user", "content": "The patio lights should stay at forty percent."},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1", "function": {"name": "ha_call_service"}}]},
+            {"role": "tool", "content": "{\"ok\": true}", "tool_call_id": "call-1"},
+            {"role": "assistant", "content": "Done."},
+        ],
+    )
+    assert p._client.add_calls == []
+
+    p.sync_turn(
+        "I prefer the office lamp at forty percent." + marker,
+        "Noted.",
+        session_id="owner-session",
+    )
+    call = p._client.add_calls[-1]
+    assert call["content"] == (
+        "[role: user]\nI prefer the office lamp at forty percent.\n[user:end]"
+    )
+    assert "tool_calls" not in call["content"]
+    assert "Recent voice conversation" not in call["content"]
+
+
 def test_owner_capture_submits_only_current_turn_with_retry_stable_event_id(monkeypatch, tmp_path):
     monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
     monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)

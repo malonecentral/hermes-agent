@@ -122,6 +122,14 @@ _TRIVIAL_RE = re.compile(
 _CONTEXT_STRIP_RE = re.compile(
     r"<supermemory-context>[\s\S]*?</supermemory-context>\s*", re.DOTALL
 )
+_INJECTED_CONTEXT_MARKERS = (
+    "[Recent voice conversation, for context only.",
+    "[Recent conversation, for context only.",
+)
+_TOOL_CAPTURE_RE = re.compile(
+    r"\b(?:tool_calls|tool_call_id|function_call)\b|\[role: tool\]|<tool_call>",
+    re.IGNORECASE,
+)
 _CONTAINERS_STRIP_RE = re.compile(
     r"<supermemory-containers>[\s\S]*?</supermemory-containers>\s*", re.DOTALL
 )
@@ -1418,6 +1426,28 @@ def _clean_text_for_capture(text: str) -> str:
     text = _CONTEXT_STRIP_RE.sub("", text or "")
     text = _CONTAINERS_STRIP_RE.sub("", text)
     return text.strip()
+
+
+def _user_statement_for_capture(text: str) -> str:
+    """Keep the user's own words. Injected context is not a memory."""
+    statement = _clean_text_for_capture(text)
+    for marker in _INJECTED_CONTEXT_MARKERS:
+        index = statement.find(marker)
+        if index >= 0:
+            statement = statement[:index]
+    return statement.strip()
+
+
+def _turn_has_tool_activity(messages: Optional[List[Dict[str, Any]]]) -> bool:
+    """Engineering tool traffic is not durable user evidence."""
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "") in {"tool", "function"}:
+            return True
+        if message.get("tool_calls") or message.get("function_call"):
+            return True
+    return False
 
 
 def _is_trivial_message(text: str) -> bool:
@@ -2818,7 +2848,11 @@ class SupermemoryMemoryProvider(MemoryProvider):
         if owner_capture:
             capture_identity, capture_metadata = _owner_capture_identity(capture_session_id)
         if owner_capture:
-            clean_user = _clean_text_for_capture(user_content)
+            if _turn_has_tool_activity(messages):
+                return
+            clean_user = _user_statement_for_capture(user_content)
+            if _TOOL_CAPTURE_RE.search(clean_user):
+                return
             worthy = [clean_user] if _is_capture_worthy_owner_statement(clean_user) else []
             cleaned = [{"role": "user", "content": user} for user in worthy]
         elif messages is not None:
@@ -2891,8 +2925,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
             unavailable.append("missing stable identifiers")
         if unavailable:
             raise OwnerAppCaptureUnavailable(", ".join(unavailable))
-        user = _clean_text_for_capture(user_content)
-        if not _is_capture_worthy_owner_statement(user):
+        user = _user_statement_for_capture(user_content)
+        if _TOOL_CAPTURE_RE.search(user) or not _is_capture_worthy_owner_statement(user):
             return False
         messages = [{"role": "user", "content": user}]
         self._client.add_memory(
