@@ -544,7 +544,7 @@ def _cwd_marker(session_id: str) -> str:
 # name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
-    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_)"
+    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_|HERMES_DELEGATED_CHILD_CONTEXT)"
 )
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -595,7 +595,8 @@ def _export_dump_excluding_session_vars(
         # would make the FIRST command's value override a later outer
         # harness value arriving via the process env, exactly like the
         # session-var leak this dump already guards against.
-        "AI_AGENT HERMES_AGENT "
+        "AI_AGENT HERMES_AGENT HERMES_DELEGATED_CHILD_CONTEXT "
+        "${!_HERMES_RUNTIME_PASSTHROUGH_*} "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         "export -p; "
         ") || true; } "
@@ -889,7 +890,14 @@ class BaseEnvironment(ABC):
         _snap_tmp = '"$__hermes_snap_tmp"'
 
         parts = []
-        passthrough_names = self._snapshot_excluded_passthrough_names()
+        # Delegation authority belongs to the incoming invocation, never the
+        # shared shell snapshot. Restore it even for legacy snapshots so a
+        # child cannot poison the next Owner command, and a real child keeps
+        # its restriction when sourcing an Owner snapshot.
+        passthrough_names = tuple(sorted({
+            *self._snapshot_excluded_passthrough_names(),
+            "HERMES_DELEGATED_CHILD_CONTEXT",
+        }))
 
         # A shared snapshot may contain the previous profile's value. Save
         # the current process environment before sourcing it, then restore the
@@ -897,8 +905,12 @@ class BaseEnvironment(ABC):
         # Values stay in environment memory and never enter the shell command
         # string, so secrets are not exposed through process arguments/logs.
         saved_names: list[tuple[str, str, str]] = []
+        # Legacy snapshots can contain exported helper variables. A fresh
+        # invocation namespace prevents them from overwriting saved authority
+        # (or profile values); dump exclusion also prevents future persistence.
+        invocation_nonce = uuid.uuid4().hex
         for name in passthrough_names:
-            marker = f"_HERMES_RUNTIME_PASSTHROUGH_{name}"
+            marker = f"_HERMES_RUNTIME_PASSTHROUGH_{invocation_nonce}_{name}"
             present = f"{marker}_PRESENT"
             value = f"{marker}_VALUE"
             saved_names.append((name, present, value))
