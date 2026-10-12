@@ -167,6 +167,44 @@ class TestProfileScopedMcp:
         )
         assert resp.json()["ok"] is True
 
+    def test_mcp_test_resolves_selected_profile_secret_not_dashboard_env(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        """A dashboard probe must not send the dashboard profile's MCP key.
+
+        The handler executes in a long-lived dashboard process, whose
+        process-global environment belongs to the dashboard profile.  The
+        selected profile's `${...}` header must instead resolve from its
+        profile-local secret scope.
+        """
+        import hermes_cli.mcp_config as mcp_config
+
+        default_env = isolated_profiles["default"] / ".env"
+        default_env.write_text("MCP_TEST_KEY=dashboard-key\n", encoding="utf-8")
+        (isolated_profiles["worker_beta"] / ".env").write_text(
+            "MCP_TEST_KEY=selected-profile-key\n", encoding="utf-8"
+        )
+        (isolated_profiles["worker_beta"] / "config.yaml").write_text(
+            "mcp_servers:\n  scoped-srv:\n    url: http://example.test/mcp\n"
+            "    headers:\n      x-api-key: ${MCP_TEST_KEY}\n",
+            encoding="utf-8",
+        )
+
+        observed = {}
+
+        def fake_probe(name, config, connect_timeout=30, details=None):
+            observed.update(mcp_config._resolve_mcp_server_config(config)["headers"])
+            return [("tool-a", "desc")]
+
+        monkeypatch.setattr(mcp_config, "_probe_single_server", fake_probe)
+        resp = client.post(
+            "/api/mcp/servers/scoped-srv/test", params={"profile": "worker_beta"}
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert observed == {"x-api-key": "selected-profile-key"}
+
     def test_mcp_test_reports_optional_schema_chars(
         self, client, isolated_profiles, monkeypatch
     ):

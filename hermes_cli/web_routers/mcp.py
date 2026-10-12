@@ -13,6 +13,7 @@ import asyncio  # noqa: F401 — used by handlers
 import logging
 import secrets  # noqa: F401
 import threading  # noqa: F401
+from contextlib import contextmanager
 from typing import Any, Dict, Optional  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Request  # noqa: F401
@@ -56,6 +57,30 @@ _MAX_PENDING_MCP_OAUTH_FLOWS = LateState("_MAX_PENDING_MCP_OAUTH_FLOWS")
 # Config read-modify-write serialization for off-loop handlers (defined in
 # web_server.py; LateState supports ``with``-blocks, so this is the live lock).
 _CONFIG_MUTATION_LOCK = LateState("_CONFIG_MUTATION_LOCK")
+
+
+@contextmanager
+def _mcp_profile_scope(profile: Optional[str]):
+    """Scope config resolution and credentials to one dashboard profile.
+
+    Dashboard processes retain their own profile's environment for their full
+    lifetime. A selected profile's MCP config must therefore read `${VAR}` from
+    an immutable profile-local secret mapping, never by reloading that profile
+    into process-global ``os.environ``.
+    """
+    with _config_profile_scope(profile) as profile_home:
+        secret_token = None
+        if profile_home is not None:
+            from agent.secret_scope import build_profile_secret_scope, set_secret_scope
+
+            secret_token = set_secret_scope(build_profile_secret_scope(profile_home))
+        try:
+            yield
+        finally:
+            if secret_token is not None:
+                from agent.secret_scope import reset_secret_scope
+
+                reset_secret_scope(secret_token)
 
 
 @router.get("/api/mcp/servers")
@@ -165,7 +190,7 @@ async def test_mcp_server(name: str, profile: Optional[str] = None):
     )
 
     def _read():
-        with _profile_scope(profile):
+        with _mcp_profile_scope(profile):
             return _get_mcp_servers()
 
     servers = await asyncio.to_thread(_read)
@@ -179,17 +204,15 @@ async def test_mcp_server(name: str, profile: Optional[str] = None):
     needs_oauth_token = servers[name].get("auth") == "oauth"
 
     def _probe_scoped():
-        # Home-only scope (contextvar), NOT _profile_scope. A probe blocks for
-        # as long as the server takes to spawn/connect — a stdio `npx` cold
-        # start is many seconds — and _profile_scope holds a process-global
-        # skills lock for its ENTIRE body. Holding that across the probe
-        # serialized every other endpoint (config/skills/toolsets all take the
-        # same lock), so a slow server made unrelated requests time out at 15s.
-        # The probe touches no skills globals; it only needs the HERMES_HOME
-        # override for .env interpolation + OAuth token resolution, which the
-        # contextvar provides (copied into this to_thread worker; and
-        # _run_on_mcp_loop re-wraps it onto the MCP event-loop thread).
-        with _config_profile_scope(profile):
+        # Config-only scope, NOT _profile_scope. A probe blocks for as long as
+        # the server takes to spawn/connect, while _profile_scope holds a
+        # process-global skills lock for its entire body. The probe touches no
+        # skills globals, but it *does* resolve MCP header placeholders and
+        # OAuth state. Install the selected profile's immutable secret mapping
+        # as well as its HERMES_HOME override: loading a selected profile's
+        # dotenv into the long-lived dashboard process would otherwise either
+        # use the dashboard profile's key or leak it to concurrent requests.
+        with _mcp_profile_scope(profile):
             tools = _probe_single_server(name, servers[name], details=details)
             token_present = _oauth_tokens_present(name) if needs_oauth_token else True
             return tools, token_present
